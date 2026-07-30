@@ -1,0 +1,689 @@
+"""
+db.py
+
+Local persistent storage for the Fleet Planner app, backed by SQLite.
+One file, lives on the planner's PC (default: next to the app, or in
+%APPDATA%\\FleetPlanner on Windows once packaged).
+
+Everything here is master data that's set up once and edited only when
+something actually changes (a new driver joins, a supplier's rate changes,
+a vehicle goes to the workshop, etc.) -- never re-entered per planning day.
+"""
+import sqlite3
+import os
+import json
+from datetime import datetime
+
+from app.rules_parser import parse_rule_line
+
+DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fleetplanner.db")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS drivers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS driver_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id   INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    line_text   TEXT NOT NULL,
+    rule_type   TEXT NOT NULL,
+    parsed_json TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS suppliers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS supplier_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    line_text   TEXT NOT NULL,
+    rule_type   TEXT NOT NULL,
+    parsed_json TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL
+);
+
+-- Vehicles (in-house fleet)
+CREATE TABLE IF NOT EXISTS vehicles (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    plate       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    vehicle_type TEXT NOT NULL,
+    capacity_notes TEXT,
+    in_workshop INTEGER NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+-- Off-day schedule tracking, one row per driver per planned day
+CREATE TABLE IF NOT EXISTS off_day_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id       INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    date            TEXT NOT NULL,
+    scheduled_off   INTEGER NOT NULL DEFAULT 0,
+    overridden      INTEGER NOT NULL DEFAULT 0,
+    note            TEXT,
+    UNIQUE(driver_id, date)
+);
+
+-- Comp days owed when a scheduled off day is overridden by the planner
+CREATE TABLE IF NOT EXISTS comp_days (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id       INTEGER NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+    earned_date     TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'owed',  -- 'owed' | 'applied'
+    applied_date    TEXT,
+    note            TEXT
+);
+
+-- Simple local key/value store, used for the two API keys. Stored only
+-- on this PC, never sent anywhere except directly to Anthropic/Google
+-- when the app itself makes a request.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT
+);
+
+-- Every AI suggestion the planner acts on gets logged here, in full,
+-- forever. This table is NEVER sent to Claude directly -- it just grows
+-- as a local record. Only the small digest below is ever included in a
+-- daily AI Review call, which is what keeps cost and speed flat over time.
+CREATE TABLE IF NOT EXISTS decision_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_date       TEXT NOT NULL,
+    affected_jobs   TEXT,          -- comma-separated SR numbers
+    suggestion_type TEXT,
+    reasoning       TEXT,
+    action          TEXT NOT NULL, -- 'accepted' | 'rejected'
+    logged_at       TEXT NOT NULL
+);
+
+-- A single-row table holding the current compact "preferences digest" --
+-- a short, fixed-size summary of the planner's demonstrated real-world
+-- choices, periodically refreshed from decision_log. This is the ONLY
+-- thing from the planner's history that ever gets sent to Claude, which
+-- is what keeps daily token cost constant no matter how many years of
+-- decisions have accumulated in decision_log.
+CREATE TABLE IF NOT EXISTS preference_digest (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    digest_text         TEXT NOT NULL DEFAULT '',
+    last_refreshed_at   TEXT,
+    covered_through_date TEXT
+);
+
+-- Short-code location lookup: maps a code as it actually appears in the
+-- daily Excel file (e.g. "CPK", "BQT STORE", "DICC") to a real address
+-- Google Maps can resolve precisely. Locations NOT in this table (e.g.
+-- a bare area name like "Dubai - AL MIZHAR", or a one-off customer
+-- address that came in late) still get looked up by their raw text --
+-- they just get flagged as an approximate/area-level estimate rather
+-- than an exact one, so the planner and the AI both know which travel
+-- times to trust more.
+CREATE TABLE IF NOT EXISTS locations (
+    short_code      TEXT PRIMARY KEY COLLATE NOCASE,
+    full_address    TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+"""
+
+
+def get_connection(db_path=None):
+    conn = sqlite3.connect(db_path or DEFAULT_DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db(db_path=None):
+    conn = get_connection(db_path)
+    conn.executescript(_SCHEMA)
+    _run_migrations(conn)
+    conn.commit()
+    conn.close()
+
+
+# Columns added after the initial release of each table. Each entry is
+# (table, column_definition_sql). Adding a new column here is safe to run
+# against an existing database -- it's skipped automatically if already
+# present, so people don't have to delete their database file every time
+# a small field gets added (only real structural changes still need that).
+_MIGRATIONS = [
+    ("drivers", "excluded_from_planning INTEGER NOT NULL DEFAULT 0"),
+    ("drivers", "exclusion_reason TEXT"),
+    ("suppliers", "excluded_from_planning INTEGER NOT NULL DEFAULT 0"),
+    ("suppliers", "exclusion_reason TEXT"),
+    ("vehicles", "excluded_from_planning INTEGER NOT NULL DEFAULT 0"),
+    ("vehicles", "exclusion_reason TEXT"),
+    # Structured hard-rule fields for drivers -- exact format, reliably
+    # enforced, instead of free-text lines that can silently fail to match.
+    ("drivers", "working_hours_per_day REAL"),
+    ("drivers", "shift_start TEXT"),
+    ("drivers", "off_days TEXT"),                    # comma-separated lowercase weekday names
+    ("drivers", "max_overtime_hours_per_month REAL"), # NULL = unlimited overtime
+    ("drivers", "total_hours_per_month_target REAL"), # mainly informational, for temp drivers
+    ("drivers", "license_types TEXT"),                # comma-separated vehicle types
+]
+
+
+def _run_migrations(conn):
+    for table, column_def in _MIGRATIONS:
+        column_name = column_def.split()[0]
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    conn.executescript("""
+    -- Structured rate/availability offering, one row per vehicle type a
+    -- supplier provides. Replaces the old "pre-named unit" model -- the
+    -- app now generates unit numbering/naming dynamically at planning
+    -- time based on how many separate hires a day actually needs.
+    CREATE TABLE IF NOT EXISTS supplier_offerings (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        supplier_id             INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+        vehicle_type            TEXT NOT NULL,
+        rate_per_hour           REAL,
+        max_available_per_day   INTEGER
+    );
+
+    -- Every job's FINAL assignment, saved once the planner finalizes a
+    -- day. This is the historical record everything cross-day depends on:
+    -- monthly overtime caps, monthly hour targets, and giving suppliers
+    -- equal business opportunity over time.
+    CREATE TABLE IF NOT EXISTS finalized_jobs (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_date           TEXT NOT NULL,
+        sr                  TEXT,
+        driver_id           INTEGER,
+        vehicle_id          INTEGER,
+        supplier_id         INTEGER,
+        supplier_label      TEXT,   -- e.g. "AL LAITH PASSENGER TRANSPORT 1"
+        start_dt            TEXT,
+        end_dt              TEXT,
+        hours               REAL,
+        finalized_at        TEXT NOT NULL
+    );
+    """)
+
+
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- drivers
+
+def add_driver(conn, name):
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO drivers (name, active, created_at, updated_at) VALUES (?, 1, ?, ?)",
+        (name.strip(), now, now),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def delete_driver(conn, driver_id):
+    conn.execute("DELETE FROM drivers WHERE id = ?", (driver_id,))
+    conn.commit()
+
+
+def list_drivers(conn, active_only=True):
+    q = "SELECT * FROM drivers"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY excluded_from_planning, name COLLATE NOCASE"
+    return conn.execute(q).fetchall()
+
+
+def set_driver_excluded(conn, driver_id, excluded, reason=""):
+    conn.execute(
+        "UPDATE drivers SET excluded_from_planning = ?, exclusion_reason = ?, updated_at = ? WHERE id = ?",
+        (1 if excluded else 0, reason, _now(), driver_id),
+    )
+    conn.commit()
+
+
+def set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_start=None,
+                           off_days=None, max_overtime_hours_per_month=None,
+                           total_hours_per_month_target=None, license_types=None):
+    """
+    off_days: list of lowercase weekday strings, or None
+    license_types: list of vehicle-type strings, or None
+    All numeric args: None means "not set" (no cap / not applicable).
+    """
+    conn.execute(
+        "UPDATE drivers SET working_hours_per_day = ?, shift_start = ?, off_days = ?, "
+        "max_overtime_hours_per_month = ?, total_hours_per_month_target = ?, license_types = ?, "
+        "updated_at = ? WHERE id = ?",
+        (
+            working_hours_per_day, shift_start,
+            ",".join(off_days) if off_days else None,
+            max_overtime_hours_per_month, total_hours_per_month_target,
+            ",".join(license_types) if license_types else None,
+            _now(), driver_id,
+        ),
+    )
+    conn.commit()
+
+
+def get_driver_month_to_date_hours(conn, driver_id, year, month):
+    """Sums this driver's finalized hours for the given calendar month --
+    used to enforce the monthly overtime cap. Returns 0.0 if no history yet."""
+    prefix = f"{year:04d}-{month:02d}"
+    row = conn.execute(
+        "SELECT COALESCE(SUM(hours), 0) AS total FROM finalized_jobs "
+        "WHERE driver_id = ? AND plan_date LIKE ?",
+        (driver_id, f"{prefix}%"),
+    ).fetchone()
+    return row["total"]
+
+
+def get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day):
+    """
+    Sums OVERTIME specifically (hours beyond working_hours_per_day on each
+    individual finalized day), not just total hours -- a driver working
+    exactly their normal hours every day should show zero overtime even
+    with a high month-to-date total. Groups finalized_jobs by day first.
+    """
+    prefix = f"{year:04d}-{month:02d}"
+    rows = conn.execute(
+        "SELECT plan_date, SUM(hours) AS day_total FROM finalized_jobs "
+        "WHERE driver_id = ? AND plan_date LIKE ? GROUP BY plan_date",
+        (driver_id, f"{prefix}%"),
+    ).fetchall()
+    total_overtime = 0.0
+    for r in rows:
+        total_overtime += max(0.0, r["day_total"] - working_hours_per_day)
+    return total_overtime
+
+
+# ------------------------------------------------------------ driver rules
+
+def get_driver_rules(conn, driver_id):
+    return conn.execute(
+        "SELECT * FROM driver_rules WHERE driver_id = ? ORDER BY sort_order",
+        (driver_id,),
+    ).fetchall()
+
+
+def add_driver_rule(conn, driver_id, line_text):
+    rule_type, parsed_value = parse_rule_line(line_text)
+    max_order = conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) FROM driver_rules WHERE driver_id = ?",
+        (driver_id,),
+    ).fetchone()[0]
+    cur = conn.execute(
+        "INSERT INTO driver_rules (driver_id, line_text, rule_type, parsed_json, sort_order) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (driver_id, line_text.strip(), rule_type, json.dumps(parsed_value), max_order + 1),
+    )
+    _touch_driver(conn, driver_id)
+    conn.commit()
+    return cur.lastrowid, rule_type, parsed_value
+
+
+def update_driver_rule(conn, rule_id, new_text):
+    rule_type, parsed_value = parse_rule_line(new_text)
+    conn.execute(
+        "UPDATE driver_rules SET line_text = ?, rule_type = ?, parsed_json = ? WHERE id = ?",
+        (new_text.strip(), rule_type, json.dumps(parsed_value), rule_id),
+    )
+    conn.commit()
+    return rule_type, parsed_value
+
+
+def delete_driver_rule(conn, rule_id):
+    conn.execute("DELETE FROM driver_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+
+
+def _touch_driver(conn, driver_id):
+    conn.execute("UPDATE drivers SET updated_at = ? WHERE id = ?", (_now(), driver_id))
+
+
+# --------------------------------------------------------------- suppliers
+
+def add_supplier(conn, name):
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO suppliers (name, active, created_at, updated_at) VALUES (?, 1, ?, ?)",
+        (name.strip(), now, now),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def delete_supplier(conn, supplier_id):
+    conn.execute("DELETE FROM suppliers WHERE id = ?", (supplier_id,))
+    conn.commit()
+
+
+def list_suppliers(conn, active_only=True):
+    q = "SELECT * FROM suppliers"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY excluded_from_planning, name COLLATE NOCASE"
+    return conn.execute(q).fetchall()
+
+
+def set_supplier_excluded(conn, supplier_id, excluded, reason=""):
+    conn.execute(
+        "UPDATE suppliers SET excluded_from_planning = ?, exclusion_reason = ?, updated_at = ? WHERE id = ?",
+        (1 if excluded else 0, reason, _now(), supplier_id),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------- supplier offerings
+
+def add_supplier_offering(conn, supplier_id, vehicle_type, rate_per_hour, max_available_per_day):
+    cur = conn.execute(
+        "INSERT INTO supplier_offerings (supplier_id, vehicle_type, rate_per_hour, max_available_per_day) "
+        "VALUES (?, ?, ?, ?)",
+        (supplier_id, vehicle_type.strip(), rate_per_hour, max_available_per_day),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def delete_supplier_offering(conn, offering_id):
+    conn.execute("DELETE FROM supplier_offerings WHERE id = ?", (offering_id,))
+    conn.commit()
+
+
+def get_supplier_offerings(conn, supplier_id):
+    return conn.execute(
+        "SELECT * FROM supplier_offerings WHERE supplier_id = ? ORDER BY vehicle_type", (supplier_id,)
+    ).fetchall()
+
+
+def list_all_supplier_offerings(conn):
+    """Every offering across every non-excluded supplier, joined with the
+    supplier name -- what the allocation engine actually needs."""
+    return conn.execute(
+        "SELECT so.*, s.name AS supplier_name FROM supplier_offerings so "
+        "JOIN suppliers s ON s.id = so.supplier_id "
+        "WHERE s.excluded_from_planning = 0 "
+        "ORDER BY s.name, so.vehicle_type"
+    ).fetchall()
+
+
+# ----------------------------------------------------------- finalized jobs
+
+def save_finalized_jobs(conn, plan_date, job_rows):
+    """
+    job_rows: list of dicts with keys sr, driver_id, vehicle_id, supplier_id,
+    supplier_label, start_dt (iso str), end_dt (iso str), hours.
+    Replaces any previously finalized rows for this plan_date (re-finalizing
+    a day overwrites, rather than duplicating).
+    """
+    conn.execute("DELETE FROM finalized_jobs WHERE plan_date = ?", (plan_date,))
+    now = _now()
+    for r in job_rows:
+        conn.execute(
+            "INSERT INTO finalized_jobs (plan_date, sr, driver_id, vehicle_id, supplier_id, "
+            "supplier_label, start_dt, end_dt, hours, finalized_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (plan_date, r.get("sr"), r.get("driver_id"), r.get("vehicle_id"), r.get("supplier_id"),
+             r.get("supplier_label"), r.get("start_dt"), r.get("end_dt"), r.get("hours"), now),
+        )
+    conn.commit()
+
+
+def get_supplier_cumulative_hours(conn, supplier_id, since_date=None):
+    """Total historical hours given to this supplier -- used to prefer
+    suppliers with less cumulative business when multiple offer the same
+    type/rate, giving everyone a fair long-run opportunity."""
+    q = "SELECT COALESCE(SUM(hours), 0) AS total FROM finalized_jobs WHERE supplier_id = ?"
+    params = [supplier_id]
+    if since_date:
+        q += " AND plan_date >= ?"
+        params.append(since_date)
+    return conn.execute(q, params).fetchone()["total"]
+
+
+# ---------------------------------------------------------- supplier rules
+
+def get_supplier_rules(conn, supplier_id):
+    return conn.execute(
+        "SELECT * FROM supplier_rules WHERE supplier_id = ? ORDER BY sort_order",
+        (supplier_id,),
+    ).fetchall()
+
+
+def add_supplier_rule(conn, supplier_id, line_text):
+    rule_type, parsed_value = parse_rule_line(line_text)
+    max_order = conn.execute(
+        "SELECT COALESCE(MAX(sort_order), -1) FROM supplier_rules WHERE supplier_id = ?",
+        (supplier_id,),
+    ).fetchone()[0]
+    cur = conn.execute(
+        "INSERT INTO supplier_rules (supplier_id, line_text, rule_type, parsed_json, sort_order) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (supplier_id, line_text.strip(), rule_type, json.dumps(parsed_value), max_order + 1),
+    )
+    conn.execute("UPDATE suppliers SET updated_at = ? WHERE id = ?", (_now(), supplier_id))
+    conn.commit()
+    return cur.lastrowid, rule_type, parsed_value
+
+
+def update_supplier_rule(conn, rule_id, new_text):
+    rule_type, parsed_value = parse_rule_line(new_text)
+    conn.execute(
+        "UPDATE supplier_rules SET line_text = ?, rule_type = ?, parsed_json = ? WHERE id = ?",
+        (new_text.strip(), rule_type, json.dumps(parsed_value), rule_id),
+    )
+    conn.commit()
+    return rule_type, parsed_value
+
+
+def delete_supplier_rule(conn, rule_id):
+    conn.execute("DELETE FROM supplier_rules WHERE id = ?", (rule_id,))
+    conn.commit()
+
+
+# --------------------------------------------------------------- vehicles
+
+def add_vehicle(conn, plate, vehicle_type, capacity_notes=""):
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO vehicles (plate, vehicle_type, capacity_notes, in_workshop, active, "
+        "created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?)",
+        (plate.strip(), vehicle_type.strip(), capacity_notes.strip(), now, now),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_vehicle(conn, vehicle_id, plate, vehicle_type, capacity_notes=""):
+    conn.execute(
+        "UPDATE vehicles SET plate = ?, vehicle_type = ?, capacity_notes = ?, updated_at = ? "
+        "WHERE id = ?",
+        (plate.strip(), vehicle_type.strip(), capacity_notes.strip(), _now(), vehicle_id),
+    )
+    conn.commit()
+
+
+def delete_vehicle(conn, vehicle_id):
+    conn.execute("DELETE FROM vehicles WHERE id = ?", (vehicle_id,))
+    conn.commit()
+
+
+def list_vehicles(conn, active_only=True):
+    q = "SELECT * FROM vehicles"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY excluded_from_planning, in_workshop, plate COLLATE NOCASE"
+    return conn.execute(q).fetchall()
+
+
+def set_vehicle_excluded(conn, vehicle_id, excluded, reason=""):
+    conn.execute(
+        "UPDATE vehicles SET excluded_from_planning = ?, exclusion_reason = ?, updated_at = ? WHERE id = ?",
+        (1 if excluded else 0, reason, _now(), vehicle_id),
+    )
+    conn.commit()
+
+
+def set_vehicle_workshop_status(conn, vehicle_id, in_workshop):
+    conn.execute(
+        "UPDATE vehicles SET in_workshop = ?, updated_at = ? WHERE id = ?",
+        (1 if in_workshop else 0, _now(), vehicle_id),
+    )
+    conn.commit()
+
+
+# ------------------------------------------------------------- off-days
+
+def set_off_day_status(conn, driver_id, date_str, scheduled_off, overridden=False, note=""):
+    conn.execute(
+        "INSERT INTO off_day_log (driver_id, date, scheduled_off, overridden, note) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(driver_id, date) DO UPDATE SET "
+        "scheduled_off=excluded.scheduled_off, overridden=excluded.overridden, note=excluded.note",
+        (driver_id, date_str, int(scheduled_off), int(overridden), note),
+    )
+    conn.commit()
+
+
+def add_comp_day(conn, driver_id, earned_date, note=""):
+    cur = conn.execute(
+        "INSERT INTO comp_days (driver_id, earned_date, status, note) VALUES (?, ?, 'owed', ?)",
+        (driver_id, earned_date, note),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def list_owed_comp_days(conn, driver_id=None):
+    q = "SELECT c.*, d.name AS driver_name FROM comp_days c JOIN drivers d ON d.id = c.driver_id WHERE c.status = 'owed'"
+    params = ()
+    if driver_id is not None:
+        q += " AND c.driver_id = ?"
+        params = (driver_id,)
+    q += " ORDER BY c.earned_date"
+    return conn.execute(q, params).fetchall()
+
+
+def apply_comp_day(conn, comp_day_id, applied_date):
+    conn.execute(
+        "UPDATE comp_days SET status = 'applied', applied_date = ? WHERE id = ?",
+        (applied_date, comp_day_id),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------- settings
+
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------- decision log
+
+def log_decision(conn, plan_date, affected_jobs, suggestion_type, reasoning, action):
+    """action is 'accepted' or 'rejected'. Logged forever, full detail --
+    this table is never sent to Claude directly; see preference_digest."""
+    conn.execute(
+        "INSERT INTO decision_log (plan_date, affected_jobs, suggestion_type, reasoning, action, logged_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (plan_date, ",".join(affected_jobs), suggestion_type, reasoning, action, _now()),
+    )
+    conn.commit()
+
+
+def get_decisions_since(conn, since_date_iso):
+    """since_date_iso: an ISO date string, or None for all decisions ever."""
+    if since_date_iso:
+        return conn.execute(
+            "SELECT * FROM decision_log WHERE plan_date > ? ORDER BY plan_date", (since_date_iso,)
+        ).fetchall()
+    return conn.execute("SELECT * FROM decision_log ORDER BY plan_date").fetchall()
+
+
+def count_undigested_decisions(conn):
+    digest = get_digest(conn)
+    since = digest["covered_through_date"] if digest else None
+    return len(get_decisions_since(conn, since))
+
+
+# ------------------------------------------------------- preference digest
+
+def get_digest(conn):
+    row = conn.execute("SELECT * FROM preference_digest WHERE id = 1").fetchone()
+    return dict(row) if row else None
+
+
+def save_digest(conn, digest_text, covered_through_date):
+    conn.execute(
+        "INSERT INTO preference_digest (id, digest_text, last_refreshed_at, covered_through_date) "
+        "VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET digest_text = excluded.digest_text, "
+        "last_refreshed_at = excluded.last_refreshed_at, covered_through_date = excluded.covered_through_date",
+        (digest_text, _now(), covered_through_date),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------- locations
+
+def add_location(conn, short_code, full_address):
+    now = _now()
+    conn.execute(
+        "INSERT INTO locations (short_code, full_address, created_at, updated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(short_code) DO UPDATE SET full_address = excluded.full_address, updated_at = excluded.updated_at",
+        (short_code.strip(), full_address.strip(), now, now),
+    )
+    conn.commit()
+
+
+def delete_location(conn, short_code):
+    conn.execute("DELETE FROM locations WHERE short_code = ?", (short_code,))
+    conn.commit()
+
+
+def list_locations(conn):
+    return conn.execute("SELECT * FROM locations ORDER BY short_code COLLATE NOCASE").fetchall()
+
+
+def resolve_location(conn, raw_text):
+    """
+    Looks up raw_text (as it appears in the daily Excel file, e.g. "CPK"
+    or "BQT STORE") against the predefined locations table.
+
+    Returns {"address": str, "exact": bool}. If a predefined short code
+    matches, the real address is used and exact=True (Maps gets a precise
+    point, so its travel-time estimate can be trusted fully). Otherwise
+    the raw text itself is used as a best-effort address and exact=False
+    -- Maps will still return a plausible average for that area, but the
+    planner/AI should treat it as a rougher estimate, not a precise one.
+    """
+    if not raw_text:
+        return {"address": "", "exact": False}
+    row = conn.execute(
+        "SELECT full_address FROM locations WHERE short_code = ?", (raw_text.strip(),)
+    ).fetchone()
+    if row:
+        return {"address": row["full_address"], "exact": True}
+    return {"address": raw_text.strip(), "exact": False}

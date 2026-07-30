@@ -1,0 +1,39 @@
+{
+  "project": "Fleet Planner",
+  "language": "Python",
+  "framework": "PySide6",
+  "database": "SQLite",
+  "modules": [
+    "excel_import",
+    "allocation_engine",
+    "rules_parser",
+    "db",
+    "ai_review",
+    "maps_client",
+    "ui"
+  ],
+  "core_logic": {
+    "fairness": "occupied_hours",
+    "overtime_allowed": false,
+    "supplier_fallback": true
+  },
+  "features": {
+    "excel_upload": true,
+    "event_grouping": true,
+    "allocation_engine": true,
+    "ai_layer": "partial",
+    "maps_integration": "pending"
+  },
+  "workflow": [
+    "upload_excel",
+    "parse_jobs",
+    "group_events",
+    "allocate",
+    "display_results"
+  ],
+  "future": [
+    "AI decision layer",
+    "maps API integration",
+    "vehicle issues module"
+  ]
+}
