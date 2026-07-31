@@ -2,7 +2,6 @@
 
 ## Core Rules
 
-- No driver overtime
 - Fair distribution by hours
 - Suppliers = fallback only
 - Vehicle type must match

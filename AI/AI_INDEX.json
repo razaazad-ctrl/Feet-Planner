@@ -1,39 +1,641 @@
 {
-  "project": "Fleet Planner",
-  "language": "Python",
-  "framework": "PySide6",
-  "database": "SQLite",
+  "project": {
+    "name": "Fleet Planner",
+    "type": "standalone_desktop_application",
+    "target_os": "Windows",
+    "target_user": "single_user",
+    "user_role": "fleet_planner_at_catering_events_company",
+    "purpose": "Daily tool that fills in Driver and Vehicle columns of an uploaded Excel transport-request file, using a deterministic rules engine plus an optional AI review layer, then exports the same file with only those two columns changed.",
+    "not_a_web_app": true,
+    "not_multiuser": true,
+    "language": "Python",
+    "gui_framework": "PySide6 (Qt for Python)",
+    "database": "SQLite (single local file, fleetplanner.db)",
+    "repository": "https://github.com/razaazad-ctrl/Feet-Planner",
+    "status": "actively developed, core pipeline working and validated against real user data"
+  },
+
+  "folder_structure": {
+    "fleetplanner.db": "SQLite database, created at runtime; a real snapshot has also been committed to the linked repo for AI testing purposes",
+    "requirements.txt": "PySide6==6.11.1, openpyxl==3.1.5, anthropic==0.120.0, requests",
+    "README.md": "human-facing setup/run instructions",
+    "app/__init__.py": "empty, package marker",
+    "app/main.py": "entry point",
+    "app/db.py": "all SQLite schema, migrations, and CRUD",
+    "app/rules_parser.py": "free-text rule-line recognizer, used ONLY for AI-context notes, not hard rules",
+    "app/excel_import.py": "daily request-file reader, produces Job objects",
+    "app/allocation_engine.py": "deterministic core allocation logic",
+    "app/maps_client.py": "Google Routes API wrapper",
+    "app/ai_review.py": "Claude call for event-chain/day-note reasoning",
+    "app/digest_generator.py": "compresses decision_log into preference_digest",
+    "app/export.py": "writes results into a copy of the original uploaded workbook",
+    "app/ui/__init__.py": "empty, package marker",
+    "app/ui/main_window.py": "QMainWindow, tab container, Settings PIN gating",
+    "app/ui/plan_day_tab.py": "daily workflow screen, largest UI file",
+    "app/ui/drivers_tab.py": "structured driver hard rules + AI notes",
+    "app/ui/suppliers_tab.py": "structured supplier offerings + AI notes",
+    "app/ui/vehicles_tab.py": "vehicle roster, workshop/exclusion toggle, edit dialog",
+    "app/ui/locations_tab.py": "short-code to address mapping",
+    "app/ui/settings_tab.py": "API keys, PIN, digest refresh control",
+    "app/ui/entity_rules_widget.py": "LEGACY, not imported by main_window.py as of last known state, superseded by drivers_tab.py/suppliers_tab.py"
+  },
+
   "modules": [
-    "excel_import",
-    "allocation_engine",
-    "rules_parser",
-    "db",
-    "ai_review",
-    "maps_client",
-    "ui"
+    {
+      "file": "app/db.py",
+      "responsibility": "Own all SQL. Every other module accesses SQLite only through db.* functions. No business logic lives here.",
+      "imports": ["sqlite3", "os", "json", "datetime", "app.rules_parser.parse_rule_line"],
+      "key_functions": [
+        {"name": "get_connection", "signature": "get_connection(db_path=None)", "purpose": "returns sqlite3.Connection with foreign_keys=ON and Row factory"},
+        {"name": "init_db", "signature": "init_db(db_path=None)", "purpose": "runs _SCHEMA then _run_migrations"},
+        {"name": "_run_migrations", "signature": "_run_migrations(conn)", "purpose": "additive ALTER TABLE ADD COLUMN, swallows duplicate-column errors; also creates supplier_offerings and finalized_jobs tables via executescript"},
+        {"name": "add_driver", "signature": "add_driver(conn, name)"},
+        {"name": "delete_driver", "signature": "delete_driver(conn, driver_id)", "note": "hard DELETE, not soft-delete via active flag"},
+        {"name": "list_drivers", "signature": "list_drivers(conn, active_only=True)", "note": "ORDER BY excluded_from_planning, name -- excluded sort last"},
+        {"name": "set_driver_excluded", "signature": "set_driver_excluded(conn, driver_id, excluded, reason='')"},
+        {"name": "set_driver_hard_rules", "signature": "set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_start=None, off_days=None, max_overtime_hours_per_month=None, total_hours_per_month_target=None, license_types=None)", "note": "off_days and license_types are lists, joined with comma for storage"},
+        {"name": "get_driver_month_to_date_hours", "signature": "get_driver_month_to_date_hours(conn, driver_id, year, month)", "purpose": "raw total hours, not overtime-specific"},
+        {"name": "get_driver_month_overtime_hours", "signature": "get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day)", "purpose": "sums per-day EXCESS over baseline, grouped by day first -- this is the real overtime-cap check basis"},
+        {"name": "get_driver_rules", "signature": "get_driver_rules(conn, driver_id)", "note": "free-text AI-context lines"},
+        {"name": "add_driver_rule", "signature": "add_driver_rule(conn, driver_id, line_text)", "returns": "(rule_id, rule_type, parsed_value)"},
+        {"name": "add_supplier", "signature": "add_supplier(conn, name)"},
+        {"name": "delete_supplier", "signature": "delete_supplier(conn, supplier_id)"},
+        {"name": "list_suppliers", "signature": "list_suppliers(conn, active_only=True)"},
+        {"name": "set_supplier_excluded", "signature": "set_supplier_excluded(conn, supplier_id, excluded, reason='')"},
+        {"name": "add_supplier_offering", "signature": "add_supplier_offering(conn, supplier_id, vehicle_type, rate_per_hour, max_available_per_day)"},
+        {"name": "delete_supplier_offering", "signature": "delete_supplier_offering(conn, offering_id)"},
+        {"name": "get_supplier_offerings", "signature": "get_supplier_offerings(conn, supplier_id)"},
+        {"name": "list_all_supplier_offerings", "signature": "list_all_supplier_offerings(conn)", "purpose": "joined with supplier name, excludes offerings from excluded suppliers -- what allocation_engine actually consumes"},
+        {"name": "save_finalized_jobs", "signature": "save_finalized_jobs(conn, plan_date, job_rows)", "note": "DELETEs existing rows for plan_date first, then inserts -- overwrite not duplicate"},
+        {"name": "get_supplier_cumulative_hours", "signature": "get_supplier_cumulative_hours(conn, supplier_id, since_date=None)"},
+        {"name": "add_vehicle", "signature": "add_vehicle(conn, plate, vehicle_type, capacity_notes='')"},
+        {"name": "update_vehicle", "signature": "update_vehicle(conn, vehicle_id, plate, vehicle_type, capacity_notes='')"},
+        {"name": "list_vehicles", "signature": "list_vehicles(conn, active_only=True)", "note": "ORDER BY excluded_from_planning, in_workshop, plate"},
+        {"name": "set_vehicle_excluded", "signature": "set_vehicle_excluded(conn, vehicle_id, excluded, reason='')"},
+        {"name": "set_vehicle_workshop_status", "signature": "set_vehicle_workshop_status(conn, vehicle_id, in_workshop)"},
+        {"name": "set_off_day_status", "signature": "set_off_day_status(conn, driver_id, date_str, scheduled_off, overridden=False, note='')", "status": "UNUSED -- no UI calls this"},
+        {"name": "add_comp_day", "signature": "add_comp_day(conn, driver_id, earned_date, note='')", "status": "UNUSED -- no UI calls this"},
+        {"name": "list_owed_comp_days", "signature": "list_owed_comp_days(conn, driver_id=None)", "status": "UNUSED -- no UI calls this"},
+        {"name": "apply_comp_day", "signature": "apply_comp_day(conn, comp_day_id, applied_date)", "status": "UNUSED -- no UI calls this"},
+        {"name": "get_setting", "signature": "get_setting(conn, key, default=None)"},
+        {"name": "set_setting", "signature": "set_setting(conn, key, value)"},
+        {"name": "log_decision", "signature": "log_decision(conn, plan_date, affected_jobs, suggestion_type, reasoning, action)", "note": "affected_jobs list joined with comma"},
+        {"name": "get_decisions_since", "signature": "get_decisions_since(conn, since_date_iso)"},
+        {"name": "count_undigested_decisions", "signature": "count_undigested_decisions(conn)"},
+        {"name": "get_digest", "signature": "get_digest(conn)"},
+        {"name": "save_digest", "signature": "save_digest(conn, digest_text, covered_through_date)"},
+        {"name": "add_location", "signature": "add_location(conn, short_code, full_address)", "note": "UPSERT via ON CONFLICT"},
+        {"name": "delete_location", "signature": "delete_location(conn, short_code)"},
+        {"name": "list_locations", "signature": "list_locations(conn)"},
+        {"name": "resolve_location", "signature": "resolve_location(conn, raw_text)", "returns": "{address: str, exact: bool}"}
+      ]
+    },
+    {
+      "file": "app/rules_parser.py",
+      "responsibility": "Recognizes free-text rule lines into structured (rule_type, parsed_value) pairs. Used ONLY for AI-context notes now -- hard rules moved to structured db.py columns.",
+      "imports": ["re", "datetime"],
+      "key_functions": [
+        {"name": "parse_rule_line", "signature": "parse_rule_line(text)", "returns": "(rule_type, parsed_value_dict)", "note": "falls back to rule_type='custom' if no pattern matches"},
+        {"name": "describe_rule_type", "signature": "describe_rule_type(rule_type, parsed_value)", "purpose": "human-readable confirmation string shown in UI"}
+      ],
+      "recognized_rule_types": ["shift_start", "max_hours", "qualified_vehicle_types", "not_qualified_vehicle_types", "off_day", "leave", "rate", "unit", "max_hours_per_unit", "blackout_day", "min_notice", "custom"],
+      "important_caveat": "Even when this recognizes a pattern like max_hours, it is NOT fed into allocation_engine's hard-rule logic. That logic reads only structured drivers.* / supplier_offerings columns."
+    },
+    {
+      "file": "app/excel_import.py",
+      "responsibility": "Parses the daily request Excel file into Job objects. Pure data transformation, no database access, no allocation decisions.",
+      "imports": ["re", "dataclasses", "datetime", "openpyxl"],
+      "dataclass": {
+        "name": "Job",
+        "parsed_fields": ["row_number", "sr", "order_no", "date", "start_dt", "end_dt", "pickup_location", "contact_person", "order_location", "event_text", "event_id", "vehicle_type_required", "additional_info", "charge_code"],
+        "assignment_fields": ["assigned_driver_id", "assigned_vehicle_id", "assigned_vehicle_plate", "assigned_supplier_unit", "assigned_supplier_id", "assignment_note", "unresolved"]
+      },
+      "key_functions": [
+        {"name": "load_jobs_from_excel", "signature": "load_jobs_from_excel(path)", "returns": "list[Job]", "note": "requires SR# to parse as plain integer or row is skipped -- this is how footer/note rows get filtered out"},
+        {"name": "group_jobs_by_event", "signature": "group_jobs_by_event(jobs)", "returns": "dict[event_id, list[Job]] sorted by start_dt"},
+        {"name": "_parse_date_value", "purpose": "handles START DATE column as either a real datetime object or text"},
+        {"name": "_parse_time_range_only", "purpose": "handles separate TIME column like '08:00 - 15:00'"},
+        {"name": "_combine_date_and_time", "purpose": "combines date + time-of-day, rolls end datetime to next day for overnight jobs"},
+        {"name": "_parse_datetime_range", "purpose": "FALLBACK for older combined single-cell format like '21-Mar-2026 02:00 - 06:00'"},
+        {"name": "_extract_event_id", "purpose": "regex extracts leading numeric code from Event text, e.g. '602102' from '602102 - 602102 - Dubai World Cup...'"},
+        {"name": "_clean_text", "purpose": "collapses embedded newlines/whitespace from wrapped Excel cells"}
+      ],
+      "header_map_note": "_HEADER_MAP is the single source of truth for recognized column headers. An unrecognized header silently contributes nothing -- no error raised. Real fragility point for future file format changes.",
+      "known_bug_fixed": "Originally assumed one combined START DATE TIME cell; real format has separate START DATE and TIME columns. Both now supported, real format preferred."
+    },
+    {
+      "file": "app/allocation_engine.py",
+      "responsibility": "The deterministic core. No AI, no network calls, fully repeatable. Takes in-memory profiles + jobs, mutates jobs in place.",
+      "imports": ["dataclasses", "datetime (timedelta, date, datetime)"],
+      "does_not_import": "app.db at module level -- db is passed as an explicit parameter to build_*_profiles functions, keeping this module testable standalone",
+      "dataclasses": [
+        {
+          "name": "DriverProfile",
+          "fields": ["id", "name", "working_hours_per_day", "shift_start", "license_types (list)", "off_days (list)", "max_overtime_hours_per_month", "total_hours_per_month_target", "month_overtime_so_far", "occupied_seconds (RUNTIME)", "busy_intervals (RUNTIME, list of datetime tuples)"],
+          "critical_history_note": "shift_start field was OMITTED from this dataclass during an earlier rewrite -- a real bug, fixed. Any future field additions to drivers must be added here too, not just in the database."
+        },
+        {
+          "name": "VehicleProfile",
+          "fields": ["id", "plate", "vehicle_type", "in_workshop (bool, merged from db.in_workshop OR db.excluded_from_planning)", "busy_intervals (RUNTIME)"]
+        },
+        {
+          "name": "SupplierOffering",
+          "fields": ["supplier_id", "supplier_name", "vehicle_type", "rate_per_hour", "max_available_per_day", "cumulative_hours_history"]
+        },
+        {
+          "name": "SupplierHire",
+          "fields": ["supplier_id", "supplier_name", "vehicle_type", "instance_number (1-based)", "busy_intervals", "already_used (bool)"],
+          "computed_property": "label -- supplier_name if instance_number==1 else f'{supplier_name} {instance_number-1}'",
+          "note": "RUNTIME ONLY, created dynamically during allocate(), never stored directly in the database -- only the resulting label text and supplier_id get persisted via finalized_jobs on Finalize"
+        }
+      ],
+      "key_functions": [
+        {"name": "build_driver_profiles", "signature": "build_driver_profiles(conn, db)", "purpose": "reads drivers table, skips excluded_from_planning, computes month_overtime_so_far via db.get_driver_month_overtime_hours"},
+        {"name": "build_vehicle_profiles", "signature": "build_vehicle_profiles(conn, db)"},
+        {"name": "build_supplier_offerings", "signature": "build_supplier_offerings(conn, db)", "purpose": "reads supplier_offerings joined with suppliers, computes cumulative_hours_history via db.get_supplier_cumulative_hours"},
+        {"name": "_driver_qualifies_for_type", "purpose": "exact-match check against license_types list; returns False entirely if license_types is empty (forces explicit configuration)"},
+        {"name": "_driver_is_off", "purpose": "weekday check against off_days, with allow_override_days escape hatch"},
+        {"name": "_parse_shift_start_time", "purpose": "parses '07:00 AM' or '18:00' style text into datetime.time"},
+        {"name": "_job_is_before_shift_start", "purpose": "hard rule: job.start_dt.time() must not be earlier than driver's parsed shift_start"},
+        {"name": "_overlaps_with_buffer", "purpose": "checks time-interval overlap with a configurable minute buffer (default 30) for travel time between jobs"},
+        {"name": "_type_matches", "purpose": "case-insensitive, whitespace-normalized EXACT string comparison -- no fuzzy matching, deliberate design choice"},
+        {
+          "name": "allocate",
+          "signature": "allocate(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=30)",
+          "returns": "jobs (mutated in place, also returned)",
+          "algorithm_summary": "For each job in time order: try in-house (qualifying + not off + shift started + no overlap + no overtime violation, pick least-occupied-hours candidate, then find any free matching vehicle). If no in-house driver+vehicle combo found, try supplier: prefer reusing an already-hired unit from today (any matching offering) that's free; if none, hire a new unit from the offering with lowest cumulative_hours_history among those with remaining daily capacity, naming it via SupplierHire.label convention.",
+          "note_on_unused_params": "allowed_driver_ids and allowed_supplier_ids support a 'restrict to shortlist' feature that has NO UI control yet -- backend-ready, frontend not built"
+        }
+      ],
+      "fairness_model": "hours-occupied, not job-count. min(candidates, key=lambda d: d.occupied_seconds)",
+      "supplier_naming_convention": {
+        "first_hire": "SUPPLIER NAME (no number)",
+        "second_hire": "SUPPLIER NAME 1",
+        "nth_hire": "SUPPLIER NAME {N-1}",
+        "reuse": "SAME <label>",
+        "priority": "always try to reuse an already-hired unit before hiring a new one, to minimize headcount for the day",
+        "confirmed_by_user": true,
+        "note": "user's own historical manually-planned reference files are inconsistent about this numbering (some suppliers numbered, some not) -- confirmed by user this is a manual-entry artifact, NOT the desired behavior; the engine's consistent numbering is correct and should not be changed to match old files"
+      },
+      "overtime_model": {
+        "max_overtime_hours_per_month_null_or_blank": "unlimited overtime allowed",
+        "max_overtime_hours_per_month_zero": "no overtime allowed at all -- working_hours_per_day becomes a strict daily ceiling",
+        "max_overtime_hours_per_month_positive": "monthly overtime budget, checked against finalized_jobs history"
+      }
+    },
+    {
+      "file": "app/maps_client.py",
+      "responsibility": "One job: HTTP call to Google Routes API, parse response, raise MapsClientError on failure. Knows nothing about jobs/drivers/allocation.",
+      "imports": ["requests"],
+      "api_used": "Google Routes API, computeRoutes endpoint (https://routes.googleapis.com/directions/v2:computeRoutes)",
+      "key_functions": [
+        {
+          "name": "get_travel_time",
+          "signature": "get_travel_time(api_key, origin_address, destination_address, departure_dt)",
+          "returns": "{duration_minutes: float, distance_km: float}",
+          "raises": "MapsClientError on any failure (missing key, bad response, no route found)",
+          "important_detail": "uses routingPreference=TRAFFIC_AWARE and passes the job's ACTUAL departure time (converted to RFC3339 UTC via _to_rfc3339) -- this is why the same route can return different estimates depending on time of day, which was an explicit requirement"
+        }
+      ],
+      "exception_class": "MapsClientError(Exception)"
+    },
+    {
+      "file": "app/ai_review.py",
+      "responsibility": "Builds AI context payload, calls Claude, parses JSON response into suggestions. Never mutates a Job directly -- only returns suggestion dicts.",
+      "imports": ["json", "anthropic.Anthropic"],
+      "model_used": "claude-sonnet-5",
+      "key_functions": [
+        {
+          "name": "build_review_context",
+          "signature": "build_review_context(jobs, event_groups, driver_hours_summary, travel_time_lookups, day_notes, preferences_digest='')",
+          "returns": "dict with keys: events_with_multiple_stages, driver_occupied_hours_today, travel_time_lookups_minutes, planner_day_notes, planner_preferences_digest",
+          "note": "filters event_groups to only events with >=2 stages -- single-stage events have nothing to reason about"
+        },
+        {
+          "name": "review_plan",
+          "signature": "review_plan(api_key, context)",
+          "returns": "list[suggestion dict] with keys: type, affected_jobs, reasoning",
+          "raises": "AIReviewError",
+          "note": "defensively strips markdown code fences from the response before JSON parsing, since the model sometimes wraps output despite instructions not to"
+        }
+      ],
+      "system_prompt_responsibilities": [
+        "reason about event-chain stay-on-site vs cycle-back decisions using travel time + gap + driver remaining hours",
+        "weigh travel-time confidence (exact vs approximate, from Locations tab resolution) -- more conservative suggestions on approximate data",
+        "read planner day-notes and propose specific overrides only when clearly supported",
+        "flag conflicts revealed by real travel times",
+        "use planner_preferences_digest as guidance, not a hard rule",
+        "NEVER change the plan itself -- suggestions only",
+        "respond ONLY with valid JSON matching the fixed suggestion schema"
+      ],
+      "exception_class": "AIReviewError(Exception)"
+    },
+    {
+      "file": "app/digest_generator.py",
+      "responsibility": "Compresses decision_log into the small preference_digest. Planner-triggered only (Settings tab button), never automatic -- deliberate cost control.",
+      "imports": ["json", "anthropic.Anthropic"],
+      "model_used": "claude-sonnet-5",
+      "constant": "MAX_DIGEST_WORDS = 400",
+      "key_functions": [
+        {
+          "name": "refresh_digest",
+          "signature": "refresh_digest(api_key, conn, db)",
+          "returns": "the new (or unchanged) digest text",
+          "behavior": "reads db.get_decisions_since(conn, existing_digest.covered_through_date); if empty, returns existing digest UNCHANGED and makes ZERO API calls (verified by test, not just intent); otherwise sends existing digest + only the new decisions to Claude, saves the merged result with an updated covered_through_date watermark",
+          "cost_guarantee": "old decisions are never resent on subsequent refreshes -- confirmed via test with decisions across multiple dates and two refresh calls"
+        }
+      ],
+      "exception_class": "DigestError(Exception)"
+    },
+    {
+      "file": "app/export.py",
+      "responsibility": "Loads the ORIGINAL uploaded workbook, writes only Vehicle/Driver columns for matched rows, saves as a new file. Regenerates nothing.",
+      "imports": ["re", "openpyxl"],
+      "key_functions": [
+        {
+          "name": "export_filled_excel",
+          "signature": "export_filled_excel(original_path, jobs, output_path)",
+          "raises": "ValueError if Vehicle/Driver columns aren't found in the header row",
+          "behavior": "openpyxl.load_workbook(original_path) preserves all styles/formatting; finds Vehicle/Driver column indices by header text; for each job matched by row_number, writes driver_text (driver name, or supplier label if supplier-assigned) and vehicle_text (plate, or blank for supplier jobs) into ONLY those two cells; unresolved jobs get both left blank",
+          "verified": "tested against a real file -- confirmed row/column counts unchanged, header font/formatting unchanged, an untouched column (Event) byte-identical before/after"
+        }
+      ]
+    },
+    {
+      "file": "app/main.py",
+      "responsibility": "Entry point.",
+      "flow": "db.init_db() -> conn = db.get_connection() -> QApplication -> MainWindow(conn) -> app.exec()"
+    },
+    {
+      "file": "app/ui/main_window.py",
+      "class": "MainWindow(QMainWindow)",
+      "responsibility": "Tab container, Settings PIN gating.",
+      "tabs_in_order": ["Plan a Day (PlanDayTab)", "Drivers (DriversTab)", "Suppliers (SuppliersTab)", "Vehicles (VehiclesTab)", "Locations (LocationsTab)", "Settings (SettingsTab)"],
+      "pin_gating_mechanism": "settings tab is disabled via setTabEnabled(False) while a PIN is set and not yet unlocked this session; a corner widget QPushButton '🔒 Unlock Settings' is the only way in; correct PIN calls setTabEnabled(True) and switches to it; this replaced an earlier switch-then-revert approach that could flash tab contents",
+      "signal_connections": "settings_widget.pin_changed connects back to _apply_lock_state so removing/changing the PIN from within Settings updates the lock state live"
+    },
+    {
+      "file": "app/ui/plan_day_tab.py",
+      "class": "PlanDayTab(QWidget)",
+      "responsibility": "The daily workflow screen. Largest UI file.",
+      "state_held": ["self.jobs (list[Job], in-memory only until Finalize/Export)", "self.uploaded_path", "self.last_drivers (DriverProfile list from the last Run Planning, used for AI Review's hours summary)"],
+      "buttons_and_handlers": [
+        {"button": "Upload Excel File...", "handler": "_on_upload", "calls": "excel_import.load_jobs_from_excel"},
+        {"button": "Run Planning", "handler": "_on_run", "calls": "allocation_engine.build_driver_profiles/build_vehicle_profiles/build_supplier_offerings/allocate", "enables": ["ai_review_btn", "finalize_btn", "export_btn"]},
+        {"button": "AI Review (event chains + day notes)", "handler": "_on_ai_review", "calls": "excel_import.group_jobs_by_event, db.resolve_location, maps_client.get_travel_time, db.get_digest, ai_review.build_review_context, ai_review.review_plan", "renders": "one QFrame per suggestion with Accept/Reject buttons via _add_suggestion_widget"},
+        {"button": "Finalize Day (save to history)", "handler": "_on_finalize", "calls": "db.save_finalized_jobs", "note": "skips unresolved jobs; confirms via QMessageBox before saving"},
+        {"button": "Export Filled Excel", "handler": "_on_export", "calls": "export.export_filled_excel", "note": "uses QFileDialog.getSaveFileName with a suggested _PLANNED.xlsx filename"}
+      ],
+      "results_table": {
+        "columns": ["SR", "Time", "Event", "Vehicle Type Required", "Pick Up", "Driver / Supplier", "Vehicle / Unit", "Note"],
+        "sorting": "setSortingEnabled(True), but MUST be toggled False during population and True after -- Qt scrambles rows if sorting is on while inserting",
+        "filtering": "dropdown above table, filters by Driver/Supplier column, strips 'SAME ' prefix so a reused truck's entries group with its base label",
+        "row_coloring": "UNRESOLVED_COLOR (dark red) for unresolved jobs, SUPPLIER_COLOR (dark yellow) for supplier-assigned jobs"
+      },
+      "known_gap": "Accept on an AI suggestion logs the decision via db.log_decision but does NOT automatically mutate the corresponding Job or re-render the table -- planner must manually edit the table row if acting on a suggestion"
+    },
+    {
+      "file": "app/ui/drivers_tab.py",
+      "class": "DriversTab(QWidget)",
+      "responsibility": "Structured driver hard-rule fields plus free-text AI notes list.",
+      "layout": "QSplitter: left = entity list (checkbox exclusion toggle, serial numbers, orange color + bottom-sort when excluded); right = QFormLayout hard-rule fields + notes list below",
+      "hard_rule_fields": ["working_hours_per_day", "shift_start", "off_days (comma-separated in UI)", "max_overtime_hours_per_month", "total_hours_per_month_target", "license_types (comma-separated in UI)"],
+      "save_handler": "_on_save_hard_rules calls db.set_driver_hard_rules",
+      "displays": "month-to-date hours (db.get_driver_month_to_date_hours) as read-only info"
+    },
+    {
+      "file": "app/ui/suppliers_tab.py",
+      "class": "SuppliersTab(QWidget)",
+      "responsibility": "Structured supplier offerings (repeatable per vehicle type) plus free-text AI notes list.",
+      "layout": "same left/right split pattern as DriversTab",
+      "offerings_table_columns": ["Vehicle Type", "Rate / Hour", "Available / Day"],
+      "add_offering_handler": "_on_add_offering calls db.add_supplier_offering",
+      "displays": "cumulative historical hours (db.get_supplier_cumulative_hours) as read-only info"
+    },
+    {
+      "file": "app/ui/vehicles_tab.py",
+      "classes": ["EditVehicleDialog(QDialog)", "VehiclesTab(QWidget)"],
+      "responsibility": "Vehicle roster CRUD, workshop toggle, exclusion toggle, edit dialog.",
+      "table_columns": ["Plate", "Type", "Capacity / Notes", "In Workshop", "Don't Use Tomorrow"],
+      "buttons": ["Add Vehicle", "Edit Selected (opens EditVehicleDialog)", "Delete Selected", "Toggle Workshop Status", "Toggle Don't Use Tomorrow"]
+    },
+    {
+      "file": "app/ui/locations_tab.py",
+      "class": "LocationsTab(QWidget)",
+      "responsibility": "Short-code to real-address mapping CRUD.",
+      "table_columns": ["Short Code (as in Excel)", "Real Address"]
+    },
+    {
+      "file": "app/ui/settings_tab.py",
+      "class": "SettingsTab(QWidget)",
+      "signal": "pin_changed = Signal()",
+      "responsibility": "API key entry/testing, digest refresh trigger, PIN management.",
+      "module_level_functions": [
+        {"name": "hash_pin", "signature": "hash_pin(pin)", "implementation": "hashlib.sha256(pin.encode('utf-8')).hexdigest()"},
+        {"name": "pin_is_set", "signature": "pin_is_set(conn)"},
+        {"name": "verify_pin", "signature": "verify_pin(conn, pin)", "note": "returns True if no PIN configured -- nothing to check against"}
+      ],
+      "constants": ["ANTHROPIC_KEY_SETTING = 'anthropic_api_key'", "GOOGLE_MAPS_KEY_SETTING = 'google_maps_api_key'", "PIN_HASH_SETTING = 'settings_pin_hash'"],
+      "test_buttons": "each API key field has a 'Test' button making one minimal real request (Anthropic: 10-token message; Google Maps: one real get_travel_time call between two Dubai landmarks)",
+      "security_note": "PIN is explicitly framed as friction-prevention, not real security"
+    },
+    {
+      "file": "app/ui/entity_rules_widget.py",
+      "class": "EntityRulesWidget(QWidget)",
+      "status": "LEGACY / likely unused",
+      "responsibility_when_used": "generic Drivers/Suppliers screen using free-text rule lines",
+      "superseded_by": ["app/ui/drivers_tab.py", "app/ui/suppliers_tab.py"],
+      "warning": "verify current main_window.py imports before assuming this is dead code or before modifying it expecting changes to take effect"
+    }
   ],
-  "core_logic": {
-    "fairness": "occupied_hours",
-    "overtime_allowed": false,
-    "supplier_fallback": true
+
+  "database_schema": {
+    "type": "SQLite 3",
+    "file": "fleetplanner.db",
+    "connection_settings": "PRAGMA foreign_keys = ON; row_factory = sqlite3.Row",
+    "migration_system": "additive only (ALTER TABLE ADD COLUMN, swallows duplicate-column errors); new tables via CREATE TABLE IF NOT EXISTS; does NOT support column rename/retype/removal",
+    "tables": [
+      {
+        "name": "drivers",
+        "columns": [
+          {"name": "id", "type": "INTEGER PK"},
+          {"name": "name", "type": "TEXT UNIQUE COLLATE NOCASE"},
+          {"name": "active", "type": "INTEGER", "note": "NOT actually used for filtering -- delete_driver does a hard DELETE"},
+          {"name": "created_at", "type": "TEXT"},
+          {"name": "updated_at", "type": "TEXT"},
+          {"name": "excluded_from_planning", "type": "INTEGER", "migration": true},
+          {"name": "exclusion_reason", "type": "TEXT", "migration": true},
+          {"name": "working_hours_per_day", "type": "REAL", "migration": true, "business_rule": "baseline daily hours, not automatically a hard ceiling"},
+          {"name": "shift_start", "type": "TEXT", "migration": true, "business_rule": "job before this time-of-day can never be assigned to this driver"},
+          {"name": "off_days", "type": "TEXT", "migration": true, "format": "comma-separated lowercase weekday names"},
+          {"name": "max_overtime_hours_per_month", "type": "REAL", "migration": true, "business_rule": "NULL=unlimited overtime, 0=no overtime allowed, positive=monthly budget"},
+          {"name": "total_hours_per_month_target", "type": "REAL", "migration": true, "status": "informational only, NOT enforced anywhere in code"},
+          {"name": "license_types", "type": "TEXT", "migration": true, "format": "comma-separated, EXACT text match required against vehicle types"}
+        ],
+        "foreign_keys_from_children": ["driver_rules.driver_id CASCADE", "off_day_log.driver_id CASCADE (unused table)", "comp_days.driver_id CASCADE (unused table)"]
+      },
+      {
+        "name": "driver_rules",
+        "purpose": "free-text AI-context notes only, NOT hard rules",
+        "columns": ["id PK", "driver_id FK CASCADE", "line_text", "rule_type", "parsed_json", "sort_order"]
+      },
+      {
+        "name": "suppliers",
+        "columns": [
+          {"name": "id", "type": "INTEGER PK"},
+          {"name": "name", "type": "TEXT UNIQUE COLLATE NOCASE"},
+          {"name": "active", "type": "INTEGER", "note": "not used for filtering"},
+          {"name": "created_at", "type": "TEXT"},
+          {"name": "updated_at", "type": "TEXT"},
+          {"name": "excluded_from_planning", "type": "INTEGER", "migration": true},
+          {"name": "exclusion_reason", "type": "TEXT", "migration": true}
+        ]
+      },
+      {
+        "name": "supplier_rules",
+        "purpose": "free-text AI-context notes only",
+        "columns": ["id PK", "supplier_id FK CASCADE", "line_text", "rule_type", "parsed_json", "sort_order"]
+      },
+      {
+        "name": "supplier_offerings",
+        "added_via": "migration executescript, not original _SCHEMA",
+        "purpose": "structured hard-rule replacement for the old pre-named-unit model. One row per vehicle type a supplier offers.",
+        "columns": [
+          {"name": "id", "type": "INTEGER PK"},
+          {"name": "supplier_id", "type": "INTEGER FK CASCADE"},
+          {"name": "vehicle_type", "type": "TEXT", "business_rule": "exact match required"},
+          {"name": "rate_per_hour", "type": "REAL", "note": "informational/business record, NOT used in allocation decision logic"},
+          {"name": "max_available_per_day", "type": "INTEGER", "note": "NULL = unlimited"}
+        ],
+        "important": "individual supplier UNITS are never stored as rows -- generated dynamically at allocation time (SupplierHire dataclass)"
+      },
+      {
+        "name": "vehicles",
+        "columns": [
+          {"name": "id", "type": "INTEGER PK"},
+          {"name": "plate", "type": "TEXT UNIQUE COLLATE NOCASE"},
+          {"name": "vehicle_type", "type": "TEXT NOT NULL", "business_rule": "exact match required against Job.vehicle_type_required and drivers.license_types"},
+          {"name": "capacity_notes", "type": "TEXT"},
+          {"name": "in_workshop", "type": "INTEGER"},
+          {"name": "active", "type": "INTEGER", "note": "not used for filtering"},
+          {"name": "created_at", "type": "TEXT"},
+          {"name": "updated_at", "type": "TEXT"},
+          {"name": "excluded_from_planning", "type": "INTEGER", "migration": true, "note": "treated as equivalent to in_workshop by build_vehicle_profiles"},
+          {"name": "exclusion_reason", "type": "TEXT", "migration": true}
+        ]
+      },
+      {
+        "name": "off_day_log",
+        "status": "SCHEMA EXISTS, NO CRUD/UI WIRED -- reserved/future, not a working feature",
+        "columns": ["id PK", "driver_id FK CASCADE", "date", "scheduled_off", "overridden", "note", "UNIQUE(driver_id, date)"]
+      },
+      {
+        "name": "comp_days",
+        "status": "SCHEMA EXISTS, NO CRUD/UI WIRED -- reserved/future, not a working feature",
+        "columns": ["id PK", "driver_id FK CASCADE", "earned_date", "status ('owed'|'applied')", "applied_date", "note"]
+      },
+      {
+        "name": "app_settings",
+        "purpose": "generic key-value store",
+        "columns": ["key PK", "value"],
+        "known_keys": ["anthropic_api_key", "google_maps_api_key", "settings_pin_hash"]
+      },
+      {
+        "name": "decision_log",
+        "purpose": "permanent append-only record of every AI suggestion Accepted/Rejected. NEVER sent to Claude directly.",
+        "columns": ["id PK", "plan_date", "affected_jobs (comma-separated)", "suggestion_type", "reasoning", "action ('accepted'|'rejected')", "logged_at"]
+      },
+      {
+        "name": "preference_digest",
+        "purpose": "single-row (CHECK id=1) compact summary of demonstrated planner patterns, capped ~400 words. The ONLY history ever sent to Claude for daily reasoning.",
+        "columns": ["id PK CHECK(id=1)", "digest_text", "last_refreshed_at", "covered_through_date (watermark, prevents resending old decisions)"]
+      },
+      {
+        "name": "locations",
+        "purpose": "short-code to real-address mapping for accurate Maps queries",
+        "columns": ["short_code PK COLLATE NOCASE", "full_address NOT NULL", "created_at", "updated_at"]
+      },
+      {
+        "name": "finalized_jobs",
+        "added_via": "migration executescript",
+        "purpose": "permanent record of what was actually finalized each day. Basis for monthly overtime enforcement and cross-day supplier fairness.",
+        "columns": ["id PK", "plan_date", "sr", "driver_id (nullable, no FK constraint intentionally)", "vehicle_id (nullable, no FK)", "supplier_id (nullable, no FK)", "supplier_label", "start_dt", "end_dt", "hours", "finalized_at"],
+        "write_behavior": "save_finalized_jobs DELETEs existing rows for plan_date first -- overwrite not duplicate",
+        "note": "unresolved jobs are never written here -- explicitly skipped by the UI handler",
+        "fk_design_note": "driver_id/vehicle_id/supplier_id are intentionally loose (no REFERENCES clause) so historical records survive deletion of the referenced entity"
+      }
+    ]
   },
-  "features": {
-    "excel_upload": true,
-    "event_grouping": true,
-    "allocation_engine": true,
-    "ai_layer": "partial",
-    "maps_integration": "pending"
-  },
-  "workflow": [
-    "upload_excel",
-    "parse_jobs",
-    "group_events",
-    "allocate",
-    "display_results"
+
+  "external_apis": [
+    {
+      "name": "Anthropic Claude API",
+      "sdk": "anthropic Python package, version 0.120.0",
+      "model": "claude-sonnet-5",
+      "used_by": ["app/ai_review.py (event-chain/day-note suggestions)", "app/digest_generator.py (history compression)", "app/ui/settings_tab.py (key test button)"],
+      "auth": "user-provided API key, stored in app_settings table, entered via Settings tab",
+      "cost_model": "pay-per-token, no subscription; deliberately kept low-frequency by the two-stage design (not called automatically) and the digest system (bounded history cost)"
+    },
+    {
+      "name": "Google Maps Routes API",
+      "endpoint": "https://routes.googleapis.com/directions/v2:computeRoutes",
+      "http_library": "requests (direct HTTP, no Google SDK)",
+      "used_by": ["app/maps_client.py"],
+      "auth": "user-provided API key, stored in app_settings table",
+      "key_parameter": "routingPreference=TRAFFIC_AWARE, departureTime=actual job time (RFC3339 UTC)",
+      "free_tier_note": "discussed as ~10,000 free calls/month at time of research; app usage pattern (50-100 lookups/day) expected to stay within free tier for a single planner"
+    }
   ],
-  "future": [
-    "AI decision layer",
-    "maps API integration",
-    "vehicle issues module"
-  ]
+
+  "business_rules": [
+    "In-house drivers/vehicles are always attempted before any supplier for every job, independently, in time order -- no pre-reservation of jobs for suppliers.",
+    "Fairness among in-house drivers is measured by cumulative occupied HOURS, not job count.",
+    "A driver's license_types must contain an EXACT (case/whitespace-normalized) match for a job's vehicle_type_required, or the driver is not considered at all for that job.",
+    "A job starting before a driver's configured shift_start can never be assigned to that driver.",
+    "Off days are a hard skip unless explicitly overridden for a specific date (allow_override_days parameter, no UI yet).",
+    "max_overtime_hours_per_month: NULL/blank = unlimited overtime; 0 = no overtime allowed at all; positive number = monthly budget checked against finalized_jobs history.",
+    "Supplier hiring always tries to REUSE an already-hired unit before hiring a new one, to minimize the day's headcount, even if it means one supplier driver works more hours.",
+    "New supplier hires are chosen from the offering with the LOWEST cumulative historical hours among suppliers with remaining daily capacity, for cross-day fairness.",
+    "Supplier unit naming: 1st hire = bare supplier name, 2nd hire = 'NAME 1', Nth = 'NAME {N-1}', reuse = 'SAME <label>'. This is user-confirmed and should not be changed based on old inconsistent manual reference files.",
+    "A vehicle is unavailable if EITHER in_workshop OR excluded_from_planning is set -- they are treated as equivalent for allocation purposes.",
+    "AI suggestions never change the plan automatically -- every suggestion requires an explicit planner Accept/Reject click.",
+    "The raw decision_log is never sent to Claude -- only the small, periodically-refreshed preference_digest is included in daily AI Review calls, to keep cost/latency flat over time regardless of history length.",
+    "Export must preserve the original uploaded file exactly, changing only the Vehicle and Driver cell values for matched rows -- no reformatting, no regeneration from a template.",
+    "Unresolved jobs (no valid assignment found) are never written to finalized_jobs.",
+    "Events (grouped by event_id) with 2+ stages are the unit of reasoning for the AI's stay-on-site-vs-cycle-back judgment; single-stage events are excluded from that reasoning entirely."
+  ],
+
+  "workflows": [
+    {
+      "name": "daily_planning_workflow",
+      "steps": [
+        "1. Upload Excel file -> excel_import.load_jobs_from_excel -> list[Job] in memory",
+        "2. (optional) type free-text day notes",
+        "3. Run Planning -> allocation_engine.allocate() mutates jobs -> results table rendered, filter dropdown populated",
+        "4. (optional) AI Review -> travel-time lookups via maps_client + db.resolve_location -> ai_review.review_plan() -> suggestion cards with Accept/Reject",
+        "5. (per suggestion) Accept/Reject -> db.log_decision (does NOT auto-update the table -- known gap)",
+        "6. Finalize Day -> db.save_finalized_jobs (skips unresolved jobs, overwrites existing rows for that date)",
+        "7. Export Filled Excel -> export.export_filled_excel writes into a COPY of the original file, saved wherever the planner chooses"
+      ]
+    },
+    {
+      "name": "digest_refresh_workflow",
+      "trigger": "manual, planner clicks 'Refresh Preferences Digest Now' in Settings tab",
+      "steps": [
+        "1. db.get_digest -> existing digest text + covered_through_date watermark",
+        "2. db.get_decisions_since(watermark) -> only NEW decision_log rows",
+        "3. If none new: return existing digest unchanged, ZERO API calls made",
+        "4. If new decisions exist: send existing digest + new decisions to Claude, get merged/updated digest text (capped ~400 words)",
+        "5. db.save_digest with new watermark = latest decision's plan_date"
+      ]
+    },
+    {
+      "name": "master_data_setup_workflow",
+      "description": "one-time-ish setup, edited only when something changes (new driver, rate change, vehicle to workshop)",
+      "tabs_involved": ["Drivers", "Suppliers", "Vehicles", "Locations", "Settings"]
+    }
+  ],
+
+  "architectural_decisions": [
+    {
+      "decision": "Standalone single-user desktop app, not multi-user web app",
+      "reasoning": "Only one planner uses the actual software; supervisor/drivers only ever see the exported file distributed externally. Eliminated need for hosting/accounts/real-time sync entirely."
+    },
+    {
+      "decision": "Deterministic engine and AI review are two separate, manually-triggered steps, not automatically combined",
+      "reasoning": "While the deterministic engine was (and still is, to some degree) being actively debugged, keeping AI out of the automatic loop made every discovered issue traceable to one layer or the other. A combined one-click shortcut is a deliberately deferred future addition."
+    },
+    {
+      "decision": "AI never finalizes anything automatically -- suggestions require explicit Accept/Reject",
+      "reasoning": "Non-negotiable requirement from the first design discussion; human stays in control of every change."
+    },
+    {
+      "decision": "Two-tier decision history: full local log (never sent) + small periodically-refreshed digest (only thing sent)",
+      "reasoning": "Answers 'does the AI learn over time' honestly (the model is stateless per call) while letting the SYSTEM reflect accumulated real decisions without unbounded cost/latency growth."
+    },
+    {
+      "decision": "Hard rules moved from free-text rule-line parsing to structured database columns",
+      "reasoning": "Directly caused by two real bugs (a driver's hour cap silently unenforced due to un-matched phrasing; later, shift_start type of issue) where free-text matching failed silently. Structured fields with explicit format-hint UI eliminate the ambiguity."
+    },
+    {
+      "decision": "Supplier units are generated dynamically at planning time, never pre-named by the planner",
+      "reasoning": "The original 'pre-name your trucks' model was identified as backwards -- the app should decide unit numbering based on actual daily demand, not have the planner guess in advance."
+    },
+    {
+      "decision": "Export loads and modifies the ORIGINAL workbook rather than regenerating from a template",
+      "reasoning": "Explicit requirement: output must be byte-identical to the input except for the Vehicle/Driver cells -- no reformatting risk."
+    },
+    {
+      "decision": "Settings PIN disables the tab entirely rather than switch-then-revert",
+      "reasoning": "The switch-then-revert approach could flash tab contents before the check completed -- a real, observed issue, fixed by disabling the tab outright while locked."
+    },
+    {
+      "decision": "Additive-only schema migrations (ALTER TABLE ADD COLUMN)",
+      "reasoning": "After multiple rounds of asking the user to delete their local database for schema changes, this was added so small future field additions don't cause data loss. Structural changes (rename/retype/remove) still require a fresh database."
+    },
+    {
+      "decision": "Vehicle-type matching is exact string comparison, never fuzzy",
+      "reasoning": "Deliberately rejected fuzzy matching as riskier than the problem it solves (risk of silently conflating genuinely different vehicle configurations). Real-world text mismatches are treated as a data-entry/process problem to fix at the source, not a matching-algorithm problem to work around."
+    }
+  ],
+
+  "important_constants": [
+    {"name": "DEFAULT_TRAVEL_BUFFER_MINUTES", "location": "allocation_engine.py", "value": 30, "purpose": "minimum gap enforced between two jobs assigned to the same driver or vehicle, placeholder until real point-to-point Maps data supplies it"},
+    {"name": "MAX_DIGEST_WORDS", "location": "digest_generator.py", "value": 400, "purpose": "caps preference_digest size regardless of how much history feeds into it"},
+    {"name": "MODEL (ai_review.py)", "value": "claude-sonnet-5"},
+    {"name": "MODEL (digest_generator.py)", "value": "claude-sonnet-5"},
+    {"name": "DEFAULT_DB_PATH", "location": "db.py", "value": "next to the app directory, fleetplanner.db"}
+  ],
+
+  "configuration": {
+    "requirements_txt": ["PySide6==6.11.1", "openpyxl==3.1.5", "anthropic==0.120.0", "requests"],
+    "run_command": "python -m app.main",
+    "packaging": "NOT YET DONE -- discussed as PyInstaller (--noconsole --onefile) for a future .exe, deliberately deferred during active development",
+    "api_keys_required": ["Anthropic API key (for AI Review and digest refresh)", "Google Maps API key (for travel-time lookups)"],
+    "both_keys_optional_at_runtime": "app functions without either key -- Run Planning works with zero API keys; AI Review requires Anthropic key at minimum, Maps key is optional (falls back to no travel-time data with a warning)"
+  },
+
+  "known_limitations": [
+    "total_hours_per_month_target is stored/displayed but never enforced by any logic",
+    "AI suggestion Accept does not automatically update the results table -- planner must manually edit",
+    "No UI for the allowed_driver_ids/allowed_supplier_ids 'daily shortlist' feature, though the backend function signature supports it",
+    "No PDF export -- Excel export only",
+    "No driver shift-rotation logic (e.g. 15-day morning/afternoon cycles) -- explicitly deferred pending sufficient finalized_jobs history",
+    "No packaging into a distributable .exe yet",
+    "off_day_log and comp_days tables exist with zero CRUD or UI -- reserved schema, not working features",
+    "Vehicle-type/license-type matching is exact-string only -- real-world wording inconsistencies (e.g. 'Seated' vs 'Seater') cause silent zero-match failures with no error surfaced to the user",
+    "entity_rules_widget.py is legacy code, likely no longer imported -- verify before modifying"
+  ],
+
+  "future_plans_discussed": [
+    "Combined one-click 'Plan My Day' button merging Run Planning + AI Review, once the deterministic engine is proven reliable over more real-world use",
+    "Vehicle maintenance/inspection log -- planner-suggested feature (drivers report issues, auto-timestamped, weekly printout), explicitly deferred until core planning flow is solid; would be a new table hanging off vehicles, independent of existing schema",
+    "PDF export via Excel COM automation (pywin32), since target machine is Windows and likely has Excel installed",
+    "Driver shift rotation derived from finalized_jobs history (not a fixed calendar anchor) -- user's explicit preference",
+    "Daily shortlist UI for restricting planning to specific drivers/suppliers (backend-ready)",
+    "PyInstaller packaging into a distributable .exe, deferred during active iteration to avoid rebuild friction",
+    "Wiring AI suggestion Accept to automatically mutate the results table instead of requiring manual edits"
+  ],
+
+  "assumptions_made_during_development": [
+    "Planner's PC has internet access at all times the app is used (needed for optional AI/Maps calls even though the app itself is a standalone install)",
+    "Planner obtains and manages their own Anthropic and Google Maps API keys -- app does not proxy or share credentials",
+    "Only one calendar day is planned per allocate() run; the model assumes a single operational day which may extend into early hours of the next calendar date for overnight jobs",
+    "Uploaded Excel file's header row matches expected column names after case/whitespace normalization -- excel_import._HEADER_MAP is the single source of truth, unrecognized headers silently contribute nothing",
+    "Windows is the only target OS",
+    "Single-user, single-process usage -- no concurrent-access handling was designed for the database"
+  ],
+
+  "real_world_validation_performed": {
+    "method": "user pushed a real fleetplanner.db snapshot plus a real day's UNPLANNED.xlsx/PLANNED.xlsx pair to a public GitHub repo specifically for AI testing",
+    "repo": "https://github.com/razaazad-ctrl/Feet-Planner",
+    "findings_were_mostly_data_issues_not_code_bugs": [
+      "All 11 drivers in the snapshot had identical license_types ('5 Ton Chiller Truck (with lift)'), blocking 95 of 125 real jobs from ever going in-house",
+      "Only 4 in-house chiller trucks existed in the snapshot, 2 legitimately locked for a full 12-hour event",
+      "A driver (VENUGOPAL) present in the planned reference was missing from the database entirely",
+      "A vehicle-type text mismatch ('23 Seater Bus' entered vs '23 Seated Bus' required) caused a silent zero-match"
+    ],
+    "code_bug_found_via_this_process": "shift_start field missing from DriverProfile dataclass -- see allocation_engine module entry above",
+    "tooling_built_during_validation": "a one-off script extracting suggested license_types per driver directly from PLANNED.xlsx by grouping historical Driver->VehicleType pairs; applied to a test database copy, improved match rate from 4% to 7% (confirming license types were a real factor but not the sole explanation)"
+  }
 }
