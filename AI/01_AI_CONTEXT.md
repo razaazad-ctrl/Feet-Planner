@@ -178,13 +178,27 @@ saw a rule it could enforce). The current model:
 
 ### Overtime model
 - `working_hours_per_day` is a **baseline**, not a hard daily ceiling by
-  itself.
-- `max_overtime_hours_per_month` is the actual hard cap: `None`/blank =
-  **unlimited overtime allowed**; `0` = **no overtime allowed at all**
-  (working_hours_per_day becomes a strict daily ceiling); any positive
-  number = that many hours of overtime allowed per month, tracked via
-  `finalized_jobs` history (`db.get_driver_month_overtime_hours`, which
-  sums *per-day excess over working_hours_per_day*, not raw totals).
+  itself, EXCEPT when no monthly overtime allowance is configured at all
+  (see below) — in that case it becomes the hard ceiling.
+- `max_overtime_hours_per_month` is the actual hard cap: `0` = **no
+  overtime allowed at all** (working_hours_per_day becomes a strict daily
+  ceiling); any positive number = that many hours of overtime allowed per
+  month, tracked via `finalized_jobs` history
+  (`db.get_driver_month_overtime_hours`, which sums *per-day excess over
+  working_hours_per_day*, not raw totals).
+- **`None`/blank = also treated as 0 overtime allowed (fixed this
+  session, was previously "unlimited overtime allowed").** The original
+  code skipped the entire hours-check block whenever
+  `max_overtime_hours_per_month` was `None`, meaning a driver with
+  `working_hours_per_day` configured but no overtime cap could be given
+  unlimited hours in a single day with zero enforcement — a real bug,
+  proven with a test giving one driver 21.5 hours in one day with no
+  rejection. Confirmed with the project owner (this is a driver-safety
+  hard constraint, Rule 6): a blank overtime cap must NOT mean "no
+  restriction at all," it should fall back to "no overtime allowed,"
+  same as an explicit `0`. If a driver genuinely needs truly unlimited
+  overtime, that must now be set as an explicit very-large number rather
+  than left blank — blank no longer means "no limit."
 - This is why `finalized_jobs` (populated by the "Finalize Day" button)
   matters: without it, monthly overtime enforcement has no history to
   check against and behaves as if every driver starts every month at
@@ -193,13 +207,61 @@ saw a rule it could enforce). The current model:
 ### Shift start enforcement
 A job starting before a driver's configured `shift_start` must never be
 assigned to that driver, regardless of how few hours they've logged.
-**This was implemented as a stored field but never actually wired into
-`allocate()`'s candidate-filtering loop in an earlier pass** — a real
-bug, found and fixed via `_job_is_before_shift_start()`, now called in
-the candidate loop. See `CHANGELOG_AI.md` and `NEXT_SESSION.md` for why
-this class of bug (field exists, stored correctly, UI reads/writes it,
-but the *engine* never actually checks it) is the single most important
-thing to watch for when adding new structured fields.
+**This was stored as a field, shown correctly in the Drivers tab UI, but
+never actually wired into `DriverProfile`, `build_driver_profiles`, or
+`allocate()`'s candidate-filtering loop** — a real bug, present in both
+this repo snapshot and the project owner's live local copy, confirmed
+directly by the project owner. Fixed this session by adding all three
+missing pieces: the `DriverProfile.shift_start` field, populating it in
+`build_driver_profiles`, and a new `_job_is_before_shift_start()` /
+`_parse_shift_start_time()` pair actually called in the candidate loop.
+`_parse_shift_start_time` accepts the "07:00 AM"-style text the Drivers
+tab placeholder suggests, or a plain 24-hour "18:00"; unparseable or
+blank text fails open (no restriction), matching every other optional
+hard-rule field in this engine, rather than silently blocking every job
+for a driver whose text didn't parse. See `CHANGELOG_AI.md` and
+`NEXT_SESSION.md` for why this class of bug (field exists, stored
+correctly, UI reads/writes it, but the *engine* never actually checks
+it) is the single most important thing to watch for when adding new
+structured fields — it has now happened at least three times in this
+project's history (`shift_start` twice, effectively, plus the earlier
+documented case) and is worth a deliberate audit pass rather than
+assuming "it's in the dataclass so it must be enforced."
+
+### "Same Driver" column (planner-flagged, deterministic, not AI)
+The daily request Excel file has a "Same Driver" column. The planner
+pastes the same text (typically the Event text) onto every row they want
+one driver to handle back and forth, rather than treating each row as an
+independent job for fairness/overlap purposes. This is enforced in
+`allocation_engine.py`, not the AI layer, because it's an explicit
+planner instruction (Rule 3/9), not a judgment call. Confirmed rules
+(agreed with the project owner before implementing):
+- Overlapping times between two rows sharing the same flagged value are
+  allowed for the same driver (or reused supplier unit) -- this is NOT a
+  double-booking conflict, since the planner has already judged it's one
+  person's job. Overlap against anything outside that specific group is
+  still a hard conflict as normal.
+- No hard-coded time-based or vehicle-type-based split. The engine
+  always tries to reuse the driver(s)/supplier unit(s) already assigned
+  to that group before adding a new one, mirroring the existing supplier
+  reuse-before-hire pattern. It only adds an additional driver/unit when
+  none of the group's current ones still qualify for the next row. This
+  was validated against the real `PLANNED.xlsx`/`UNPLANNED.xlsx` files
+  and a synthetic test suite (`test_same_driver.py`,
+  `test_same_driver_supplier.py`) covering: same-group overlap allowed,
+  single-driver-covers-everything preferred when possible, forced split
+  when no driver is licensed for every vehicle type in the group, and a
+  regression check confirming normal (unflagged) overlapping jobs still
+  conflict as before.
+- Documented simplification: hour totals still SUM every row's duration
+  even when two same-group rows overlap (doesn't compute a true
+  elapsed-time union) -- overstates rather than understates occupied
+  hours, which is the safe direction given Rule 6.
+- `export.py` was fixed at the same time to read a new clean
+  `Job.assigned_driver_name` field instead of parsing the driver's name
+  back out of `assignment_note` -- `assignment_note` is now allowed to
+  contain extra human-readable context (e.g. "[Same Driver group]")
+  without that leaking into the exported file's Driver cell.
 
 ### Vehicle-type matching is exact string comparison
 `_type_matches()` does case-insensitive, whitespace-normalized *exact*
@@ -379,7 +441,32 @@ retyped from memory.
    than "fixed," since fuzzy-matching was deliberately rejected as
    riskier than the problem it would solve.
 
-## 10. Current project status (as of the end of this conversation)
+9. **`max_overtime_hours_per_month = None` (blank) silently disabled
+   `working_hours_per_day` enforcement entirely**, rather than meaning
+   "no restriction beyond the daily baseline" as the field's own
+   semantics implied. The whole hours-check block in `allocate()`
+   required BOTH `working_hours_per_day` and `max_overtime_hours_per_month`
+   to be set before checking anything — so a driver with a daily limit
+   configured but no monthly overtime cap could be given unlimited hours
+   in a single day. Found while auditing all three "hard rule" fields at
+   the project owner's request (prompted by the `shift_start` bug above),
+   proven with a test giving one driver 21.5 hours in one day with zero
+   rejection. Confirmed with the project owner and fixed: a blank
+   overtime cap is now treated the same as an explicit `0` (no overtime
+   allowed), not as "unlimited." See the "Overtime model" note in
+   Section 7 for the corrected semantics.
+10. **License-type enforcement (`_driver_qualifies_for_type`,
+    `_type_matches`) was audited at the same time and found to be
+    correctly implemented already** — a driver not licensed for a job's
+    required vehicle type, or with no license types configured at all,
+    is correctly refused. No code change was needed here; documenting
+    this explicitly since it was specifically asked about and checked
+    end-to-end with a test, not just read for correctness. If it's still
+    misbehaving in the project owner's live copy, the cause is most
+    likely a text-mismatch data issue (see item 8) rather than a logic
+    bug in this function.
+
+## 11. Current project status (as of the end of this conversation)
 
 **Built, tested, working:**
 - Excel import (real format), event-ID grouping, deterministic

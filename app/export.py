@@ -54,7 +54,12 @@ def export_filled_excel(original_path, jobs, output_path):
         driver_text = ""
         vehicle_text = ""
         if job.assigned_driver_id is not None:
-            driver_text = job.assignment_note.replace("In-house: ", "")
+            # Use the clean assigned_driver_name field, not assignment_note --
+            # assignment_note is a human-readable explanation and may contain
+            # extra context (e.g. "[Same Driver group]") that must never leak
+            # into the actual exported Driver cell. Fall back to the old
+            # string-parse only for any Job that predates this field.
+            driver_text = job.assigned_driver_name or job.assignment_note.replace("In-house: ", "")
             vehicle_text = job.assigned_vehicle_plate
         elif job.assigned_supplier_unit:
             # Matches the real-world convention: supplier name goes in the

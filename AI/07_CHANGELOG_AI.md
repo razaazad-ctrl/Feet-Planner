@@ -258,11 +258,113 @@ two of those three steps and silently failed at the third. Any review of
 new or existing rule logic should explicitly verify all three steps are
 present, not just that the field exists in the database and the UI.
 
-## Documentation phase (this file and its siblings)
+## Phase 7 — "Same Driver" Excel column
 
-- At the user's request, project knowledge was extracted from this
+- New requirement: a "Same Driver" column in the daily request Excel
+  file, which the planner pastes the same text onto for every row they
+  want one driver to handle back-and-forth, rather than as independent
+  jobs for fairness/overlap purposes.
+- Before implementing, checked the requirement against the real
+  `PLANNED.xlsx`/`UNPLANNED.xlsx` files (pulled from the GitHub repo
+  referenced in `NEXT_SESSION.md`) rather than guessing the split logic
+  in the abstract. Found the historical human-planned assignments split
+  flagged groups differently case by case (sometimes one driver did the
+  whole group, sometimes split by vehicle-type license, sometimes with
+  two rows for the same driver having identical overlapping times) --
+  confirmed this ambiguity with the project owner before writing any
+  code, per Rule 16.
+- Two design questions were explicitly confirmed with the project owner:
+  (1) overlapping times within a flagged group are allowed for the same
+  driver, not treated as a conflict; (2) when one driver can't cover the
+  whole group, the engine picks the fewest additional drivers possible
+  rather than a hard-coded time-based or vehicle-type-based split.
+- Implemented in `excel_import.py` (`same_driver_key` field, "same
+  driver" header recognized) and `allocation_engine.py` (group-scoped
+  overlap relaxation via a `group_key` tag on every busy interval;
+  reuse-before-new-driver preference; same treatment extended to the
+  supplier-hire fallback pass).
+- While implementing, found that writing `[Same Driver group]` into
+  `assignment_note` would have leaked into the exported Excel file's
+  Driver cell, because `export.py` derived the driver name by string-
+  parsing `assignment_note` (`.replace("In-house: ", "")`). Fixed by
+  adding a dedicated `Job.assigned_driver_name` field that `export.py`
+  now uses directly, so `assignment_note` is free to carry extra
+  human-readable context without risk to the exported file. Verified
+  with a byte/value-level diff of the exported file against the
+  original confirming every column except Driver/Vehicle is unchanged.
+- Tested with: (a) the real `UNPLANNED.xlsx` run through the real
+  database's actual drivers/vehicles/suppliers (`fleetplanner.db`) --
+  all 9 flagged groups in that file resolved to a single driver each,
+  since the current real driver roster happens to hold multi-type
+  licenses, consistent with the known data-quality note in
+  `NEXT_SESSION.md` about under-specified license types; (b) a
+  synthetic test suite (`test_same_driver.py`) with deliberately
+  single-type-licensed drivers to force and verify an actual split,
+  overlap relaxation, and a regression check that unflagged overlapping
+  jobs still conflict as before; (c) `test_same_driver_supplier.py`
+  confirming the same reuse/overlap behavior when a flagged group falls
+  through to the supplier pass.
+- **Found but explicitly NOT fixed in this session:** the real cloned
+  repository's `allocation_engine.py` does not actually contain the
+  `shift_start` dataclass field, `build_driver_profiles` population, or
+  `_job_is_before_shift_start()` enforcement that this very documentation
+  package (`AI_CONTEXT.md` Section 6/9, this file) describes as already
+  fixed. `shift_start` does exist in `db.py`'s schema and in
+  `drivers_tab.py`'s UI, but the engine currently never reads or enforces
+  it -- meaning a driver's shift start time is not actually a hard
+  constraint in the code as it stands in this repo snapshot, contrary to
+  what the documentation says. Left untouched since it's outside what was
+  asked this session and it wasn't clear whether this GitHub snapshot
+  predates a fix already present in the planner's actual local copy of
+  the app -- flagged to the project owner directly instead of assuming
+  either way.
+
+## Phase 8 — Hard-rule audit: shift_start (re-fixed) and working_hours_per_day (real bug found)
+
+- The project owner confirmed directly that `shift_start` was not being
+  enforced in their live local copy either — not just this GitHub
+  snapshot — so the discrepancy flagged at the end of Phase 7 was a real,
+  live bug. Fixed properly this time, following the exact three-step
+  pattern this project's own docs warn about: added
+  `DriverProfile.shift_start`, populated it in `build_driver_profiles`,
+  and added `_parse_shift_start_time()` / `_job_is_before_shift_start()`,
+  called in the candidate-filtering loop in `allocate()`. Verified with a
+  dedicated test (`test_shift_start.py`): a driver whose shift starts at
+  11 PM is correctly refused a 10 AM job; the same driver correctly gets
+  jobs starting after their shift begins; drivers with no `shift_start`
+  configured are correctly unrestricted; parsing handles both "07:00 AM"
+  and "18:00" style text and fails open (not blocking) on garbage input.
+- At the project owner's request, `license_types` and
+  `working_hours_per_day` were also audited for the same
+  field-exists-but-unenforced failure pattern:
+  - `license_types` (`_driver_qualifies_for_type`, `_type_matches`) was
+    confirmed correctly implemented already — tested with a driver
+    licensed for the wrong type and a driver with no license types
+    configured at all; both correctly refused. No code change needed.
+  - `working_hours_per_day` had a real bug: the entire hours-check block
+    in `allocate()` was gated on BOTH `working_hours_per_day` AND
+    `max_overtime_hours_per_month` being set, so a driver with a daily
+    limit configured but a blank overtime cap could be given unlimited
+    hours in a single day with zero enforcement. Proven with a test
+    giving one driver 21.5 hours in one day, zero rejections. This is a
+    genuine business-rule ambiguity (does blank overtime mean "no limit
+    at all" or "no overtime allowed"?), not just a code bug, so it was
+    confirmed with the project owner before fixing rather than guessed:
+    blank overtime cap is now treated the same as an explicit `0`.
+    Verified with `test_license_and_hours.py`, including a check that a
+    job landing exactly at the daily cap is still correctly assignable
+    (no off-by-one over-restriction from the fix).
+- Full regression run after all three fixes: real `UNPLANNED.xlsx` +
+  real `fleetplanner.db` still resolves to the same 39 in-house / 0
+  supplier / 5 unresolved split as before these fixes (i.e. no real job
+  in the current dataset was actually relying on the bugs to get
+  assigned), and the exported file was re-verified byte/value-identical
+  to the original outside the Driver/Vehicle columns.
+
+## Documentation phase (this file and its siblings)
   conversation into a permanent documentation package
   (`AI_CONTEXT.md`, `ARCHITECTURE.md`, `DATABASE.md`, this file,
   `NEXT_SESSION.md`, `AI_INDEX.json`) intended to fully replace this
   conversation as the onboarding source for any future AI assistant
   session working on this repository.
+

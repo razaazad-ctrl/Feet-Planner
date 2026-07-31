@@ -114,11 +114,27 @@ SupplierHire                      # RUNTIME ONLY, created dynamically during
 Job
 ├── (parsed from Excel) row_number, sr, order_no, date, start_dt, end_dt,
 │   pickup_location, contact_person, order_location, event_text, event_id,
-│   vehicle_type_required, additional_info, charge_code
+│   vehicle_type_required, additional_info, charge_code, same_driver_key
 └── (filled in by allocation_engine.allocate(), later read by UI/export)
-    assigned_driver_id, assigned_vehicle_id, assigned_vehicle_plate,
-    assigned_supplier_unit, assigned_supplier_id, assignment_note, unresolved
+    assigned_driver_id, assigned_driver_name, assigned_vehicle_id,
+    assigned_vehicle_plate, assigned_supplier_unit, assigned_supplier_id,
+    assignment_note, unresolved
 ```
+`same_driver_key` (added for the "Same Driver" column feature) is read
+straight from the planner-pasted "Same Driver" column text -- blank for
+every row unless the planner explicitly flags it. It is NOT derived from
+`event_id`; a row can belong to an event chain without being flagged for
+same-driver handling, and vice versa (though in practice the planner
+pastes the Event text into it).
+
+`assigned_driver_name` was added alongside `same_driver_key`. It exists
+because `assignment_note` (e.g. `"In-house: NAME [Same Driver group]"`) is
+a human-readable explanation string, not something to be parsed back out --
+`export.py` had been fragile-parsing `assignment_note` for the driver name
+before this change; now it uses `assigned_driver_name` directly. Do not
+add more suffixes to `assignment_note` and expect `export.py` to strip
+them out -- always write to `assigned_driver_name` for anything that must
+end up unmodified in the exported file.
 A single `Job` instance flows: `excel_import.load_jobs_from_excel()` →
 mutated by `allocation_engine.allocate()` → read by `ai_review.py` (to
 build context) and `plan_day_tab.py` (to render the results table) →
@@ -218,24 +234,47 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
   hires_by_key = {}   # (supplier_id, vehicle_type) -> list[SupplierHire],
                        # persists across the whole run = "today's hires so far"
 
+  group_drivers = {}           # same_driver_key -> [DriverProfile,...] used so far
+  group_vehicle_by_driver = {} # (same_driver_key, driver_id) -> last VehicleProfile used
+  group_supplier_hires = {}    # same_driver_key -> [SupplierHire,...] used so far
+
   for each job in time order:
+    group_key = job.same_driver_key or None   # None = normal, unflagged job
+
     # ---- IN-HOUSE PASS ----
     candidates = [d for d in driver_pool if:
         d qualifies for job.vehicle_type_required (exact license_types match)
         AND NOT d is off that weekday (off_days, unless overridden)
-        AND NOT job starts before d.shift_start
+        AND NOT job starts before d.shift_start (parsed from free text like
+            "07:00 AM" or "18:00"; unparseable/blank = no restriction)
         AND NOT d has a time-overlapping (with 30-min buffer) existing job
-        AND (if d.working_hours_per_day and d.max_overtime_hours_per_month
-             are both set) adding this job would not push
-             d.month_overtime_so_far + today's overtime-so-far
-             over max_overtime_hours_per_month
+            -- UNLESS the overlapping job belongs to this SAME group_key,
+               in which case overlap is allowed (see "Same Driver" note below)
+        AND (if d.working_hours_per_day is set) adding this job would not
+             push d.month_overtime_so_far + today's projected overtime over
+             d.max_overtime_hours_per_month -- OR, if no monthly overtime cap
+             is configured at all for this driver, working_hours_per_day
+             becomes a hard DAILY ceiling instead (0 overtime allowed) rather
+             than silently going unenforced
     ]
     if candidates:
-      chosen_driver = min(candidates, key=occupied_seconds)  # hours-fairness
-      matching_vehicles = [free, type-matching, non-workshop vehicles]
+      # Fewest-drivers preference for flagged groups: prefer a driver
+      # already used for this same group_key, if one of them still
+      # qualifies for this row. Only fall back to the normal
+      # least-occupied-hours pick across ALL candidates when there's no
+      # group yet, or none of the group's current driver(s) qualify here.
+      group_candidates = [d for d in candidates if group_key and d in group_drivers[group_key]]
+      chosen_driver = min(group_candidates or candidates, key=occupied_seconds)
+
+      matching_vehicles = [free (same group_key overlap exception applies),
+                            type-matching, non-workshop vehicles]
       if matching_vehicles:
-        assign chosen_driver + matching_vehicles[0]
-        update chosen_driver.occupied_seconds, both busy_intervals
+        # prefer the same vehicle this driver already used for this group
+        chosen_vehicle = group_vehicle_by_driver.get((group_key, chosen_driver.id))
+                          if that's still in matching_vehicles, else matching_vehicles[0]
+        assign chosen_driver + chosen_vehicle
+        update chosen_driver.occupied_seconds, both busy_intervals (tagged with group_key)
+        record chosen_driver/chosen_vehicle into the group_* registries above
         continue to next job
       # else: qualified driver exists but no free in-house vehicle ->
       #        fall through to supplier pass (do NOT give up yet)
@@ -244,12 +283,16 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
     matching_offerings = [offerings where vehicle_type matches]
     if no matching_offerings: mark unresolved, continue
 
-    # Priority 1: reuse any already-hired unit (any matching supplier)
+    # Priority 1a (flagged groups only): reuse a hire already used for
+    #             THIS group_key, if one is free now (same overlap
+    #             exception as drivers above)
+    # Priority 1b: reuse any already-hired unit (any matching supplier)
     #             that is free at this time
     if a reusable hire exists:
       assign it; label = "SAME <hire.label>" if hire.already_used
                           else hire.label
       mark hire.already_used = True
+      record into group_supplier_hires[group_key] if flagged
       continue
 
     # Priority 2: hire a NEW unit, from the offering with the lowest
@@ -258,7 +301,7 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
     if no offering has remaining capacity: mark unresolved (at daily cap)
     else:
       instance_number = (count of existing hires for this supplier+type) + 1
-      create new SupplierHire, register in hires_by_key
+      create new SupplierHire, register in hires_by_key (and group_supplier_hires if flagged)
       label = hire.label   # bare name if instance_number==1, else "NAME {n-1}"
       assign; continue
 
@@ -269,6 +312,35 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
 logic runs, for every single job independently — there's no "reserve
 some jobs for suppliers" pre-planning; it's a strict greedy pass in time
 order.
+
+**"Same Driver" groups (`same_driver_key`, from the planner-pasted "Same
+Driver" Excel column):** confirmed behaviour, agreed with the project
+owner before implementing (do not change without re-confirming):
+1. Two rows sharing the same non-blank `same_driver_key`, assigned to the
+   same driver (or same reused supplier unit), are allowed to have
+   overlapping times without being treated as a double-booking conflict.
+   This models cases like a truck parked on-site for a long window while
+   the same driver also has a nested/overlapping row for the same event.
+   This relaxation is scoped ONLY to pairs of rows sharing the identical
+   group key — overlap against any job outside that specific group (a
+   different group, or no group) is still a hard conflict as normal.
+2. There is no hard-coded "split by time" or "split by vehicle type"
+   rule. The engine always tries to reuse the driver(s)/supplier unit(s)
+   already used for that group first (same "fewest units" idea as the
+   existing supplier reuse-before-hire logic) and only introduces an
+   additional driver/unit when none of the group's current one(s) still
+   qualify for the next row (wrong vehicle-type license, hours
+   exhausted, off day, etc). In real test data this naturally reproduces
+   both a vehicle-type split and an hours-driven split, whichever the
+   actual constraint is, without guessing which one applies.
+3. Known, documented simplification: `occupied_seconds` and the monthly
+   overtime projection still SUM every row's duration even when two rows
+   in the same group overlap in time, rather than computing a true
+   elapsed-time union. This can overstate a driver's real occupied hours
+   for overlapping same-group rows but never understates them — an
+   intentional, safety-conservative choice (Rule 6: driver hour limits
+   are a hard constraint), not an oversight. Revisit only as a deliberate
+   follow-up if it starts producing noticeably wrong fairness ranking.
 
 ## 6. Data flow diagram (text form)
 

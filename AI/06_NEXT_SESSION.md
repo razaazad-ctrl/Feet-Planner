@@ -143,6 +143,26 @@ Section 3 below).
 
 ## 5. Current known issues (honest, as of end of last session)
 
+- ~~`shift_start` documentation/code mismatch~~ **RESOLVED this session.**
+  The project owner confirmed directly that `shift_start` was NOT being
+  enforced in their live local copy either (not just this GitHub
+  snapshot) — so this was a real, live bug, not a stale-snapshot
+  artifact. Fixed by adding the missing `DriverProfile.shift_start`
+  field, populating it in `build_driver_profiles`, and enforcing it via
+  `_job_is_before_shift_start()` in the candidate loop. While fixing
+  this, the project owner also asked for `license_types` and
+  `working_hours_per_day` to be audited for the same failure pattern:
+  `license_types` was confirmed correct (tested, no bug); a real bug WAS
+  found in `working_hours_per_day` — see the item below.
+- ~~`working_hours_per_day` not enforced when overtime cap is blank~~
+  **RESOLVED this session.** `max_overtime_hours_per_month = None` was
+  silently skipping the entire hours-check block, rather than being
+  treated as "no overtime allowed" — a driver with a daily limit
+  configured but no monthly overtime cap could get unlimited hours in
+  one day. Confirmed with the project owner and fixed: blank overtime
+  cap is now treated the same as an explicit `0`. See `AI_CONTEXT.md`
+  Section 9 (bug #9) for the full writeup and the test that proved it.
+
 - **`total_hours_per_month_target` is stored and shown in the UI but
   never enforced anywhere.** It's informational only right now — no
   logic reads it. If asked to make it a real constraint, this is new

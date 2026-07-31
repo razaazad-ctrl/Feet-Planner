@@ -9,6 +9,14 @@ Also extracts an `event_id` from the Event column (the repeated numeric
 code, e.g. "602102 - 602102 - Dubai World Cup DWC 2026 @Meydan" -> "602102")
 so the engine can recognize which rows belong to the same event and reason
 about them as a chain rather than unrelated one-off trips.
+
+Also reads the "Same Driver" column (planner-pasted free text, typically
+the Event text copy-pasted onto every row the planner wants handled by one
+driver going back and forth). This is NOT the same mechanism as event_id --
+event_id groups rows automatically from the Event column; same_driver_key
+is an explicit planner override that only exists when the planner pastes
+something into that column. Rows with a blank "Same Driver" cell behave
+exactly as before. See allocation_engine.py for how this is enforced.
 """
 import re
 from dataclasses import dataclass, field
@@ -40,6 +48,7 @@ _HEADER_MAP = {
     "additional info": "additional_info",
     "vehicle": "vehicle",
     "driver": "driver",
+    "same driver": "same_driver_key",
     "charge code": "charge_code",
 }
 
@@ -60,9 +69,11 @@ class Job:
     vehicle_type_required: str = ""
     additional_info: str = ""
     charge_code: str = ""
+    same_driver_key: str = ""  # planner-pasted text flagging "same driver should do all rows with this value"
 
     # filled in by the allocation engine
     assigned_driver_id: Optional[int] = None
+    assigned_driver_name: str = ""  # clean name only, no suffixes -- for export/writing, not display
     assigned_vehicle_id: Optional[int] = None
     assigned_vehicle_plate: str = ""
     assigned_supplier_unit: Optional[str] = None  # "Supplier Name #N"
@@ -228,6 +239,7 @@ def load_jobs_from_excel(path):
             vehicle_type_required=_clean_text(get("vehicle_type_required")),
             additional_info=_clean_text(get("additional_info")),
             charge_code=get("charge_code"),
+            same_driver_key=_clean_text(get("same_driver_key")),
         )
         jobs.append(job)
 
