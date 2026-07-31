@@ -461,7 +461,7 @@
           "name": "allocate",
           "signature": "allocate(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=30)",
           "returns": "jobs (mutated in place, also returned)",
-          "algorithm_summary": "For each job in time order: try in-house (qualifying + not off + shift started + no overlap + no overtime violation, pick least-occupied-hours candidate, then find any free matching vehicle). If no in-house driver+vehicle combo found, try supplier: prefer reusing an already-hired unit from today (any matching offering) that's free; if none, hire a new unit from the offering with lowest cumulative_hours_history among those with remaining daily capacity, naming it via SupplierHire.label convention. 'Same Driver' groups (job.same_driver_key): tracks group_drivers/group_vehicle_by_driver/group_supplier_hires registries; prefers reusing the driver/vehicle/supplier-hire already used for that group before considering others, and relaxes the overlap check between rows sharing the same group_key. Only brings in an additional driver/unit when none of the group's current one(s) still qualify for the next row. shift_start is now actually enforced via _job_is_before_shift_start() in the candidate loop (was previously missing -- fixed this session, confirmed as a real bug in both this repo snapshot and the project owner's live copy). The working-hours check was also fixed: a blank max_overtime_hours_per_month is now treated as 0 overtime allowed (a hard daily cap via working_hours_per_day), not as 'unlimited' -- previously the whole hours-check block was skipped in that case.",
+          "algorithm_summary": "For each job in time order: try in-house (qualifying + not off + shift started + no overlap + no overtime violation, pick least-occupied-hours candidate, then find any free matching vehicle). If no in-house driver+vehicle combo found, try supplier: prefer reusing an already-hired unit from today (any matching offering) that's free; if none, hire a new unit from the offering with lowest cumulative_hours_history among those with remaining daily capacity, naming it via SupplierHire.label convention. 'Same Driver' groups (job.same_driver_key): tracks group_drivers/group_vehicle_by_driver/group_supplier_hires registries; prefers reusing the driver/vehicle/supplier-hire already used for that group before considering others, and relaxes the overlap check between rows sharing the same group_key. Only brings in an additional driver/unit when none of the group's current one(s) still qualify for the next row. shift_start is now actually enforced via _job_is_before_shift_start() in the candidate loop (was previously missing -- fixed this session, confirmed as a real bug in both this repo snapshot and the project owner's live copy). The working-hours check was also fixed: a blank max_overtime_hours_per_month is now treated as 0 overtime allowed (a hard daily cap via working_hours_per_day), not as 'unlimited' -- previously the whole hours-check block was skipped in that case. A hard MAX_OVERTIME_HOURS_PER_DAY ceiling (2.0h) is now checked before the monthly overtime bucket, cumulative across all of a driver's jobs that day -- fixes a real bug where a driver with unused monthly overtime could get an entire ~22h single day.",
           "note_on_unused_params": "allowed_driver_ids and allowed_supplier_ids support a 'restrict to shortlist' feature that has NO UI control yet -- backend-ready, frontend not built"
         },
         {
@@ -500,6 +500,9 @@
           "test_same_driver.py (synthetic: forced split, overlap relaxation, regression check)",
           "test_same_driver_supplier.py (supplier-fallback reuse + overlap relaxation)"
         ]
+      },
+      "important_constants_in_this_module": {
+        "MAX_OVERTIME_HOURS_PER_DAY": "2.0 -- hard per-day ceiling on overtime on top of working_hours_per_day, checked before the monthly-overtime-bucket logic, regardless of remaining monthly allowance. Added after the project owner reported a real ~22-hour single day (7 AM to 5 AM next day) despite hard rules supposedly being enforced. Confirmed with the project owner (2h/day). Currently a single global constant, not per-driver configurable."
       }
     },
     {
@@ -1134,7 +1137,8 @@
     "Events (grouped by event_id) with 2+ stages are the unit of reasoning for the AI's stay-on-site-vs-cycle-back judgment; single-stage events are excluded from that reasoning entirely.",
     "The 'Same Driver' Excel column lets the planner flag rows that should be handled by one driver back-and-forth; overlapping times within such a flagged group are allowed for the same driver, and the engine brings in the fewest additional drivers/supplier units possible rather than a hard-coded time or vehicle-type split.",
     "A blank 'Max overtime/month' for a driver is treated the same as an explicit 0 (no overtime allowed) -- working_hours_per_day still applies as a hard daily cap in that case. Fixed this session; previously a blank overtime cap silently disabled ALL hours enforcement for that driver, allowing unlimited hours in a single day.",
-    "License-type qualification (a driver must hold the exact vehicle type license for a job) was audited this session at the project owner's request and confirmed correctly enforced -- no bug found here."
+    "License-type qualification (a driver must hold the exact vehicle type license for a job) was audited this session at the project owner's request and confirmed correctly enforced -- no bug found here.",
+    "A driver's overtime is hard-capped at MAX_OVERTIME_HOURS_PER_DAY (currently 2 hours) in a single day, on top of working_hours_per_day, regardless of remaining monthly overtime budget. Fixed this session after the project owner reported a real ~22-hour single day being assigned."
   ],
   "workflows": [
     {
@@ -1239,6 +1243,12 @@
       "name": "DEFAULT_DB_PATH",
       "location": "db.py",
       "value": "next to the app directory, fleetplanner.db"
+    },
+    {
+      "name": "MAX_OVERTIME_HOURS_PER_DAY",
+      "value": 2.0,
+      "location": "allocation_engine.py",
+      "purpose": "hard daily overtime ceiling, see modules.allocation_engine.py for full rationale"
     }
   ],
   "configuration": {

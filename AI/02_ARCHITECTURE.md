@@ -250,12 +250,18 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
         AND NOT d has a time-overlapping (with 30-min buffer) existing job
             -- UNLESS the overlapping job belongs to this SAME group_key,
                in which case overlap is allowed (see "Same Driver" note below)
-        AND (if d.working_hours_per_day is set) adding this job would not
-             push d.month_overtime_so_far + today's projected overtime over
-             d.max_overtime_hours_per_month -- OR, if no monthly overtime cap
-             is configured at all for this driver, working_hours_per_day
-             becomes a hard DAILY ceiling instead (0 overtime allowed) rather
-             than silently going unenforced
+        AND (if d.working_hours_per_day is set) the day's cumulative
+             overtime-so-far (across every job already given to this
+             driver today) plus this job's contribution does not exceed
+             MAX_OVERTIME_HOURS_PER_DAY (a hard, fixed daily ceiling --
+             currently 2.0h -- checked FIRST, regardless of how much
+             monthly overtime budget remains)
+             AND adding this job would not push d.month_overtime_so_far +
+             today's projected overtime over d.max_overtime_hours_per_month
+             -- OR, if no monthly overtime cap is configured at all for
+             this driver, working_hours_per_day becomes a hard DAILY
+             ceiling instead (0 overtime allowed) rather than silently
+             going unenforced
     ]
     if candidates:
       # Fewest-drivers preference for flagged groups: prefer a driver

@@ -33,6 +33,18 @@ BUT:
 
 ---
 
+## Driver Hours
+
+- A driver's daily overtime is hard-capped at MAX_OVERTIME_HOURS_PER_DAY
+  (currently 2 hours), on top of their working_hours_per_day baseline --
+  regardless of how much monthly overtime allowance they have left. A
+  driver cannot be given, for example, a 22-hour day just because their
+  monthly budget has room for it.
+- A blank "Max overtime/month" is treated as 0 overtime allowed, same as
+  an explicit 0 -- not as "unlimited."
+
+---
+
 ## Same Driver Column (Excel)
 
 - Planner can paste the same text (usually the Event text) into the

@@ -361,7 +361,47 @@ present, not just that the field exists in the database and the UI.
   assigned), and the exported file was re-verified byte/value-identical
   to the original outside the Driver/Vehicle columns.
 
-## Documentation phase (this file and its siblings)
+## Phase 9 — Hard daily overtime ceiling (real symptom reported by the project owner)
+
+- The project owner reported, from real live use, that a driver was
+  still being given absurd hours — specifically jobs from 7 AM to 5 AM
+  the next day (~22 hours) — despite the shift_start and
+  working_hours_per_day fixes from Phase 8. Investigated and found a
+  deeper design gap, not just an empty-database issue: the monthly
+  overtime bucket (`month_overtime_so_far + today's overtime <=
+  max_overtime_hours_per_month`) has no concept of a per-day sub-limit.
+  Most real drivers here are configured with 60h/month overtime
+  allowance; with `finalized_jobs` history empty, `month_overtime_so_far`
+  starts at 0 for everyone, so a single day could consume 13+ hours of
+  that 60-hour budget in one sitting with nothing to stop it.
+- This is a genuine business-rule decision (how many overtime hours is
+  safe/legal in ONE day?), not something to invent per Rule 16, so it was
+  confirmed with the project owner before implementing: 2 hours/day.
+- Fixed by adding `MAX_OVERTIME_HOURS_PER_DAY = 2.0` as a module-level
+  constant in `allocation_engine.py`, checked in the candidate loop
+  BEFORE the monthly-bucket logic -- this caps the CUMULATIVE overtime a
+  driver can accrue across however many jobs they pick up in one day,
+  not just a single job, regardless of how much monthly budget remains.
+- Tested with `test_daily_overtime_ceiling.py`: reproduces the exact
+  reported 7 AM -> 5 AM scenario and confirms it's now rejected; also
+  confirms a day landing exactly at the 11h ceiling (9h baseline + 2h
+  overtime) is still assignable, and 1 minute past it is correctly
+  rejected.
+- Re-ran the full real-data pipeline after this fix: the real
+  `UNPLANNED.xlsx` + real `fleetplanner.db` result changed materially
+  from the Phase 8 baseline -- 29 in-house / 5 supplier / 10 unresolved
+  (was 39 / 0 / 5 before this fix). This is the CORRECT and expected
+  consequence of enforcing a real hard rule that was previously silently
+  bypassed -- some jobs that were only "resolvable" because a driver was
+  illegally over-worked now correctly fall to a supplier or go
+  unresolved instead. Confirmed no driver in this run now exceeds 11h in
+  a single day. Export byte/value-diff re-verified clean (Driver/Vehicle
+  columns only).
+- Currently a single global constant, not per-driver configurable --
+  flagged in `NEXT_SESSION.md` in case a future request needs per-driver
+  daily overtime limits (would need a new db column + UI field +
+  dataclass field, same three-step pattern as every other hard rule
+  here).
   conversation into a permanent documentation package
   (`AI_CONTEXT.md`, `ARCHITECTURE.md`, `DATABASE.md`, this file,
   `NEXT_SESSION.md`, `AI_INDEX.json`) intended to fully replace this

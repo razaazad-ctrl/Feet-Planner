@@ -162,6 +162,29 @@ Section 3 below).
   one day. Confirmed with the project owner and fixed: blank overtime
   cap is now treated the same as an explicit `0`. See `AI_CONTEXT.md`
   Section 9 (bug #9) for the full writeup and the test that proved it.
+- ~~No hard per-day ceiling on overtime~~ **RESOLVED this session.** The
+  project owner reported the exact live symptom: a driver given jobs
+  from 7 AM to 5 AM the next day (~22h). Root cause: the monthly-bucket
+  overtime check had no per-day sub-limit, so a driver with unused
+  monthly overtime (most real drivers have 60h/month) could spend a huge
+  chunk of it in one single day. Fixed by adding
+  `MAX_OVERTIME_HOURS_PER_DAY = 2.0` (confirmed with the project owner)
+  as a hard daily ceiling in `allocation_engine.py`, checked before the
+  monthly-bucket logic. This is currently a single global constant, not
+  per-driver configurable -- if a future request needs per-driver daily
+  overtime limits, that's a new column + UI field + dataclass field,
+  following the same three-step pattern as every other hard rule in this
+  project (see "Common mistakes to avoid" above).
+- **The real database's `finalized_jobs` table is empty** (no planning
+  day has ever been "Finalized" yet, or the history wasn't migrated into
+  this repo snapshot). This means `month_overtime_so_far` always starts
+  at 0 for every driver on every run, which maximizes how much monthly
+  overtime "looks available" for any given day -- not a bug by itself
+  (0 is a safe/conservative starting assumption), but it does mean the
+  monthly-bucket side of the overtime check is currently not doing
+  anything useful without real history. The project owner has offered to
+  provide the last ~25 days of PLANNED Excel files to backfill this --
+  see the note at the top of this file about that in-progress request.
 
 - **`total_hours_per_month_target` is stored and shown in the UI but
   never enforced anywhere.** It's informational only right now — no

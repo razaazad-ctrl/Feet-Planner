@@ -177,32 +177,50 @@ saw a rule it could enforce). The current model:
   text — context only, not enforced automatically").
 
 ### Overtime model
-- `working_hours_per_day` is a **baseline**, not a hard daily ceiling by
-  itself, EXCEPT when no monthly overtime allowance is configured at all
-  (see below) — in that case it becomes the hard ceiling.
-- `max_overtime_hours_per_month` is the actual hard cap: `0` = **no
-  overtime allowed at all** (working_hours_per_day becomes a strict daily
-  ceiling); any positive number = that many hours of overtime allowed per
-  month, tracked via `finalized_jobs` history
+- `working_hours_per_day` is a **baseline**, not by itself a hard daily
+  ceiling — but see the hard daily ceiling below, which caps how far
+  past that baseline a single day can go regardless of monthly budget.
+- **`MAX_OVERTIME_HOURS_PER_DAY` (currently `2.0`, a module-level
+  constant in `allocation_engine.py`) is a hard per-day ceiling on
+  overtime, on top of `working_hours_per_day`, regardless of how much
+  monthly overtime allowance the driver has left.** Added after the
+  project owner reported a driver getting jobs from 7 AM to 5 AM the
+  next day (~22h) despite hard rules supposedly being enforced. Root
+  cause: the monthly-bucket check alone (`month_overtime_so_far +
+  today's overtime <= max_overtime_hours_per_month`) has no concept of
+  "per day" — a driver with plenty of unused monthly overtime (e.g. most
+  real drivers here have 60h/month) could have an entire day's worth of
+  that budget (13+ hours of overtime) spent in one single day, since
+  nothing stopped it. Confirmed with the project owner (2 hours/day was
+  the number given) and fixed by checking `projected_today_overtime >
+  MAX_OVERTIME_HOURS_PER_DAY` FIRST, before the monthly-bucket check --
+  this cumulatively caps overtime across however many jobs a driver picks
+  up in one day, not just a single job. This is currently a single global
+  constant (not per-driver configurable) -- see Section 10 for the
+  tradeoff if that ever needs to change.
+- `max_overtime_hours_per_month` is the actual monthly hard cap: `0` =
+  **no overtime allowed at all** (working_hours_per_day becomes a strict
+  daily ceiling); any positive number = that many hours of overtime
+  allowed per month, tracked via `finalized_jobs` history
   (`db.get_driver_month_overtime_hours`, which sums *per-day excess over
-  working_hours_per_day*, not raw totals).
-- **`None`/blank = also treated as 0 overtime allowed (fixed this
-  session, was previously "unlimited overtime allowed").** The original
-  code skipped the entire hours-check block whenever
-  `max_overtime_hours_per_month` was `None`, meaning a driver with
-  `working_hours_per_day` configured but no overtime cap could be given
-  unlimited hours in a single day with zero enforcement — a real bug,
-  proven with a test giving one driver 21.5 hours in one day with no
-  rejection. Confirmed with the project owner (this is a driver-safety
-  hard constraint, Rule 6): a blank overtime cap must NOT mean "no
-  restriction at all," it should fall back to "no overtime allowed,"
-  same as an explicit `0`. If a driver genuinely needs truly unlimited
-  overtime, that must now be set as an explicit very-large number rather
-  than left blank — blank no longer means "no limit."
+  working_hours_per_day*, not raw totals) -- but capped per-day at
+  `MAX_OVERTIME_HOURS_PER_DAY` regardless of how much of the monthly
+  total remains, per the fix above.
+- **`None`/blank = also treated as 0 overtime allowed** (fixed the same
+  session as the daily-ceiling bug above, was previously "unlimited
+  overtime allowed"). The original code skipped the entire hours-check
+  block whenever `max_overtime_hours_per_month` was `None`, meaning a
+  driver with `working_hours_per_day` configured but no overtime cap
+  could be given unlimited hours in a single day with zero enforcement —
+  a real bug, proven with a test giving one driver 21.5 hours in one day
+  with no rejection. If a driver genuinely needs a large overtime
+  allowance, that must now be set as an explicit number rather than left
+  blank — blank no longer means "no limit."
 - This is why `finalized_jobs` (populated by the "Finalize Day" button)
-  matters: without it, monthly overtime enforcement has no history to
-  check against and behaves as if every driver starts every month at
-  zero overtime.
+  matters for the MONTHLY side of this: without it, monthly overtime
+  enforcement has no history to check against and behaves as if every
+  driver starts every month at zero overtime. It does NOT affect the
+  daily ceiling, which is independent of history.
 
 ### Shift start enforcement
 A job starting before a driver's configured `shift_start` must never be
@@ -466,7 +484,25 @@ retyped from memory.
     likely a text-mismatch data issue (see item 8) rather than a logic
     bug in this function.
 
-## 11. Current project status (as of the end of this conversation)
+11. **No hard ceiling on how much of a driver's monthly overtime
+    allowance could be spent in a single day.** Reported directly by the
+    project owner as a real, observed symptom: a driver was given jobs
+    from 7 AM to 5 AM the next day (~22 hours) despite hard rules
+    supposedly being enforced. Root cause: the monthly-bucket overtime
+    check (`month_overtime_so_far + today's overtime <=
+    max_overtime_hours_per_month`) has no per-day sub-limit — with most
+    real drivers configured for 60h/month overtime and an empty
+    `finalized_jobs` history (so `month_overtime_so_far` starts at 0
+    every time), a single day could consume 13+ hours of that 60-hour
+    budget in one sitting with nothing to stop it. Confirmed with the
+    project owner (2 hours/day) and fixed by adding
+    `MAX_OVERTIME_HOURS_PER_DAY = 2.0` as a hard per-day ceiling, checked
+    before the monthly-bucket logic, cumulative across however many jobs
+    a driver picks up in one day. Proven with a test reproducing the
+    exact 7 AM–5 AM scenario and confirming it's now rejected, plus
+    exact-boundary tests (11h exactly = OK, 11h01m = rejected).
+
+## 12. Current project status (as of the end of this conversation)
 
 **Built, tested, working:**
 - Excel import (real format), event-ID grouping, deterministic

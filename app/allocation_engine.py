@@ -86,6 +86,15 @@ from datetime import timedelta, date, datetime
 
 DEFAULT_TRAVEL_BUFFER_MINUTES = 30
 
+# Hard per-day ceiling on overtime, on top of a driver's working_hours_per_day
+# baseline, regardless of how much monthly overtime allowance they have left.
+# Confirmed with the project owner: the monthly overtime bucket alone is not
+# enough -- without this, a driver with plenty of unused monthly overtime
+# could be given one absurd single day (e.g. 7 AM to 5 AM the next day, ~22h)
+# since nothing capped how much of the month's allowance one day could
+# consume. This is a hard safety constraint (Rule 6), not a suggestion.
+MAX_OVERTIME_HOURS_PER_DAY = 2.0
+
 
 @dataclass
 class DriverProfile:
@@ -316,6 +325,11 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
             if d.working_hours_per_day is not None:
                 projected_today_hours = d.occupied_seconds / 3600.0 + job_hours
                 projected_today_overtime = max(0.0, projected_today_hours - d.working_hours_per_day)
+                if projected_today_overtime > MAX_OVERTIME_HOURS_PER_DAY:
+                    # Hard daily ceiling -- applies regardless of how much
+                    # monthly overtime allowance remains. See
+                    # MAX_OVERTIME_HOURS_PER_DAY docstring above.
+                    continue
                 if d.max_overtime_hours_per_month is not None:
                     projected_month_overtime = d.month_overtime_so_far + projected_today_overtime
                     if projected_month_overtime > d.max_overtime_hours_per_month:
