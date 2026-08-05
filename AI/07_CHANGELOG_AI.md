@@ -768,3 +768,56 @@ present, not just that the field exists in the database and the UI.
 - Scheduling rules spec bumped to v8 (SD-004 added and resolved, NEW-007
   added as an open, unconfirmed question). `AI_INDEX.json`'s `allocate()`
   algorithm_summary updated to reflect the SD-004 fix.
+## Phase 14 — Specialist-reservation ranking (NEW-007 sharpened and fixed) (2026-08-03, same day as Phase 10-13)
+
+- Following up on the NEW-007 discussion from Phase 13, the project owner
+  sharpened the diagnosis into a concrete principle: a driver licensed for
+  ONLY one vehicle type is a non-substitutable resource for that type, and
+  the engine should reserve their hours for it rather than spend them on
+  work a more broadly-licensed driver could equally cover. Real example:
+  a driver licensed ONLY for "10 Ton Chiller Truck" had that day's full
+  set of Chiller requests (11h true/merged work) fit cleanly in their
+  hour rule -- but an earlier, non-exclusive Chiller job landing on them
+  first could burn just enough capacity to push a later exclusive request
+  to supplier/unresolved, even with an idle qualifying driver available.
+- **Fix:** for an ungrouped job with multiple qualifying candidates, the
+  main loop's ranking now prefers the more broadly-licensed ("generalist")
+  candidate over a narrowly-licensed ("specialist") one:
+  `min(candidates, key=lambda d: (-len(d.license_types), d.occupied_seconds))`
+  -- license breadth first, existing hours-fairness as the tiebreak.
+  Confirmed this can't push anyone over their own ceiling: the hard-rule
+  filter already excludes any candidate who'd violate their daily/monthly
+  limit BEFORE this ranking runs, so a generalist is only ever preferred
+  up to their own legal limit, then naturally drops out of candidacy.
+- **First attempt applied this to ALL candidates including a "Same
+  Driver" group's first-ever assignment, and it backfired** -- caught
+  immediately by testing: since neither driver is in
+  `group_drivers[group_key]` yet for a group's opening row, both fall
+  into the same candidate pool this ranking touches, and it stole the
+  group's first job away from the specialist toward the generalist,
+  fragmenting a block of work that should have started and stayed on one
+  driver (confirmed via `tests/test_specialist_reservation.py` failing
+  with the exclusive block split across both drivers instead of staying
+  on the specialist). Fixed by scoping the new ranking to ungrouped jobs
+  only -- grouped jobs (both starting a new group and continuing an
+  existing one) keep the original plain least-occupied ranking, which
+  already handles group consolidation correctly on its own.
+- **Side finding, not addressed:** while building the regression test,
+  found a real interaction with HR-005 (the daily minimum-hours rule,
+  Phase 10) -- if a generalist is given just one small ungrouped job via
+  this new preference and nothing else fills their day, HR-005 tries to
+  move that job elsewhere for being under-minimum, and releases it to
+  unresolved if no one has room -- turning an "assignable but short" day
+  into "unresolved," arguably a worse outcome. Worked around in the test
+  by giving the generalist enough other same-day work to independently
+  clear their own minimum, which cleanly isolates what this phase's fix
+  is actually about. Not fixed -- logged in the spec (NEW-007) as tied to
+  the still-open OPT-001 duty-span/unresolved-policy question.
+- New test: `tests/test_specialist_reservation.py` -- reproduces the
+  project owner's exact real scenario (shared job → generalist, full
+  exclusive block → specialist, zero unresolved). Full existing suite
+  re-run unchanged and still passing throughout.
+- Scheduling rules spec bumped to v9 (NEW-007 updated with the sharper
+  diagnosis, the fix, the group-scoping caveat, and the HR-005 side
+  finding). `AI_INDEX.json`'s `allocate()` algorithm_summary updated to
+  mention the specialist-reservation ranking and its group-scoping.

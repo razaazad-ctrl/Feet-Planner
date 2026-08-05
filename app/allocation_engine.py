@@ -742,8 +742,36 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
             # below, which runs as a post-pass instead, once every driver's
             # day is actually known. See OPT-001/002/003 in the scheduling
             # rules spec.
+            # NEW-007 fix (2026-08-03): reserve narrowly-licensed
+            # "specialist" drivers for the jobs only they (or few others)
+            # can do, instead of spending their limited hours on a job a
+            # broadly-licensed "generalist" driver could equally take.
+            # Real example from the project owner: a driver licensed ONLY
+            # for "10 Ton Chiller Truck" had every one of that day's
+            # Chiller Truck requests fit cleanly in their hours -- but if
+            # an earlier, non-exclusive job (one a generalist could also
+            # cover) had been given to them first, it could burn hours
+            # that were needed for the Chiller-only requests later that
+            # day, pushing those to supplier/unresolved unnecessarily even
+            # though a driver who could ONLY do them was sitting idle.
+            #
+            # Scoped to UNGROUPED jobs only. Tried applying this to a
+            # "Same Driver" group's first-ever assignment too and it
+            # backfired: it can steal a group's opening job away from a
+            # specialist toward a generalist (since neither is in
+            # group_drivers[group_key] yet, both fall into the same
+            # candidate pool this ranking applies to), fragmenting a block
+            # of work that should have stayed on one driver from the
+            # start. Group continuity (group_candidates below, and
+            # least-occupied fairness for a group's first assignment)
+            # already handles consolidation correctly on its own and
+            # takes priority; this heuristic only kicks in once there's no
+            # group to defer to.
             group_candidates = [d for d in candidates if group_key and d in group_drivers.get(group_key, [])]
-            chosen_driver = min(group_candidates or candidates, key=lambda d: d.occupied_seconds)
+            if group_candidates or group_key:
+                chosen_driver = min(group_candidates or candidates, key=lambda d: d.occupied_seconds)
+            else:
+                chosen_driver = min(candidates, key=lambda d: (-len(d.license_types), d.occupied_seconds))
 
             # NEW-004 fix (2026-08-03): a "Driver Only" row needs a
             # qualified driver but no physical vehicle at all -- confirmed

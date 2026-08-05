@@ -1,0 +1,701 @@
+Fleet Planner Scheduling Rules Specification v9
+(v3 reviewed against the actual codebase in FleetPlanner.zip and tested live
+against UNPLANNED.xlsx on 2026-08-02. v4 updated 2026-08-03 after a working
+session with the project owner that resolved HR-002/NEW-002 and redesigned
+how shift timing works -- see the new SHIFT section and the updated HR-002/
+HR-005 entries below. v5 updated 2026-08-03, same day, after the project
+owner tested v4 live against a real UNPLANNED.xlsx and found the exact
+scattered-driver/idle-gap symptom OPT-001/002/003 had already flagged --
+see the updated OPT-002/OPT-003 entries. v6 updated 2026-08-03, same day
+again, after the project owner supplied a real human-planned PLANNED.xlsx
+for detailed study: found and fixed a real hour-double-counting bug (see
+the HR-002 addendum), resolved NEW-004 (Driver Only jobs), refined HR-005
+against real data, and opened a new finding, TB-001 (default travel buffer
+too strict for some real back-to-back continuations). A from-scratch
+reconstruction of that file (jobs stripped of their human driver/vehicle
+assignments, re-run through allocate() with a comparable driver pool and
+hour rules) auto-assigned 42 of 44 real rows in-house with zero supplier
+fallback, matching the real file's own driver-splitting pattern (split
+only where forced by vehicle type). v7 updated 2026-08-03, same day again:
+the project owner confirmed TB-001's root cause directly (planner-set
+times already include return-to-base travel time) and the buffer was
+changed from 30 minutes to 0 -- re-running the SAME reconstruction now
+auto-assigns ALL 44 real rows in-house, zero unresolved, zero supplier,
+zero hard-rule violations. v8 updated 2026-08-03, same day again, after
+the project owner supplied a real software-output test file (post-v7)
+showing a driver booked on two different vehicles at the exact same time
+inside one "Same Driver" flagged group -- confirmed and fixed, see SD-004.
+Also opened NEW-007 (gap-fill coverage limitation for wide-open, not just
+bounded, driver capacity), not yet confirmed as a bug or fixed. v9 updated
+2026-08-03, same day again: the project owner sharpened NEW-007 into a
+concrete qualification-scarcity principle (reserve narrowly-licensed
+"specialist" drivers' hours for their exclusive-type work, don't spend it
+on jobs a generalist could equally cover) -- implemented as a
+specialist-reservation ranking for ungrouped jobs, deliberately NOT
+applied to "Same Driver" grouped jobs (tried it, it fragmented group
+continuity). A real interaction with HR-005 was also found and logged,
+not yet resolved. Legend below.)
+
+LEGEND
+[✓]  Verified working in the current code
+[X]  Verified NOT working / contradicted by the current code
+[~]  Partially working -- see note
+[NEW] Rule/finding not in the original spec, added because testing surfaced it
+
+--------------------------------------------------------------------------
+PURPOSE
+--------------------------------------------------------------------------
+REQ-001 [✓] Plan daily UNPLANNED requests.
+        Confirmed: excel_import.load_jobs_from_excel() reads UNPLANNED.xlsx
+        (tested live, 44 rows loaded correctly) and allocation_engine.allocate()
+        assigns them.
+REQ-002 [✓] Prefer in-house resources.
+        allocate() always runs the in-house pass before ever looking at
+        supplier_offerings.
+REQ-003 [✓] Use supplier only as last resort.
+        Supplier pass only runs when no qualifying in-house driver+vehicle
+        pair is found for that row.
+
+--------------------------------------------------------------------------
+WORKING HOURS
+--------------------------------------------------------------------------
+HR-001 [✓] Driver normal duty hours are planner configurable.
+        Set per-driver in the Drivers tab (working_hours_per_day column),
+        read by build_driver_profiles().
+HR-002 [✓] Maximum duty hours including overtime are planner configurable.
+        RESOLVED 2026-08-03. The hidden hardcoded MAX_OVERTIME_HOURS_PER_DAY
+        = 2.0 constant is gone. Drivers now have two real, planner-set
+        fields (Drivers tab): working_hours_per_day (the normal full day,
+        e.g. 9) and max_working_hours_per_day (the hard daily ceiling
+        including overtime, e.g. 12). Both are hard rules -- the engine
+        will never plan a day under the daily minimum or over the daily
+        ceiling for a driver who's used at all that day (see HR-005 for the
+        minimum-hours mechanism, which needed a repair pass rather than a
+        simple filter). If max_working_hours_per_day is left blank, it
+        falls back to working_hours_per_day (zero daily overtime allowed) --
+        fail-closed, same precedent as a blank monthly overtime cap,
+        deliberately chosen over silently reopening the old
+        unlimited-single-day bug.
+        Monthly overtime tracking was already solid before this session --
+        get_driver_month_overtime_hours() sums finalized-day overtime from
+        the 1st of the month correctly. It just wasn't surfaced in the
+        Drivers tab; that display gap is still open, see NEW-006 below.
+        CRITICAL FIX, 2026-08-03 (same day, after testing against a real
+        PLANNED.xlsx): occupied_seconds was a naive SUM of every row's
+        duration, including when two rows in the same "Same Driver" group
+        are the exact same time slot (e.g. two simultaneous pickups on one
+        truck for two different orders -- confirmed as a routine, everyday
+        pattern in the real file, not an edge case). This overstated a
+        driver's true hours enough to falsely trip the daily ceiling --
+        one real driver showed ~17h "occupied" against ~11h of actual
+        work. Fixed by switching all hour accounting (daily ceiling,
+        minimum, monthly-overtime projection) to the TRUE UNION of a
+        driver's time intervals (`_merged_hours()` in
+        allocation_engine.py) instead of a running sum -- two overlapping
+        rows for one real duty period now count once, exactly like a
+        human dispatcher counts them. This was flagged as a known,
+        deliberate simplification in the module docstring from an earlier
+        session ("if this ever needs to be exact... that is a deliberate
+        follow-up") -- this is that follow-up, prompted directly by real
+        data proving it was needed, not a guess.
+HR-003 [✓] Scheduler must never exceed the configured maximum.
+        Verified live: no assignment was produced that exceeded either the
+        daily or monthly limits in a direct test.
+HR-004 [✓] Idle time counts as break.
+        Confirmed: occupied_seconds only accumulates actual job duration,
+        never the gap between jobs, so idle time is never charged against a
+        driver's hours.
+HR-005 [✓ NEW] A driver used at all on a given day must reach at least
+        their configured working_hours_per_day that day (hard minimum, not
+        just a target).
+        Added 2026-08-03 at the project owner's explicit request ("full
+        rework now to enforce as a hard minimum"). This can't be enforced
+        as a simple per-job filter the way the daily ceiling is, because
+        the engine assigns jobs one at a time in time order and doesn't
+        know a driver's full-day total until the day's last job has been
+        considered. It's enforced instead as a repair pass
+        (_repair_minimum_daily_hours() in allocation_engine.py) that runs
+        after normal allocation: for every driver left with a non-zero,
+        under-minimum day, it tries to move ALL of that driver's jobs for
+        that day to another qualifying driver with spare room (respecting
+        every other hard rule -- license, off-day, shift, overlap, daily
+        ceiling, monthly overtime cap). If every job can be moved, the move
+        is committed. If even one can't, the whole day is released back to
+        unresolved with a clear note ("Below X's minimum daily hours...")
+        rather than silently keeping an illegal short day. Runs in a small
+        loop (up to 5 passes) since fixing one driver's day can free up
+        room that fixes another's.
+        Known limitation, disclosed to and accepted by the project owner:
+        this is a best-effort greedy heuristic, not a global optimizer --
+        with limited test data available, it hasn't been validated against
+        a real full day's volume yet (see TESTING NOTES). It also
+        deliberately does not touch jobs inside a "Same Driver" group
+        (planner-flagged pairings are left alone), and does not attempt a
+        supplier fallback for a released day (flagged for manual review
+        instead, since moving cost to a supplier is a planner decision).
+        VALIDATED AND REFINED against real data, 2026-08-03 (same day):
+        reconstructing a real PLANNED.xlsx (stripping the human's driver/
+        vehicle assignments and re-running allocate() from scratch) showed
+        several real drivers legitimately end their day under 9h -- e.g.
+        one driver's whole day was two simultaneous pickups for one 20h
+        order (5h true work after the hour-accounting fix above), nothing
+        else. In every such case the shortfall was entirely inside a
+        "Same Driver" flagged group. The original scope note above ("does
+        not touch grouped jobs") was correct but the total-hours
+        CALCULATION had a gap: it only summed the driver's UNGROUPED jobs,
+        silently ignoring the grouped ones' hours entirely when deciding
+        whether the day was under minimum. Fixed: total_hours is now the
+        true merged total across EVERY job the driver has that day
+        (grouped and ungrouped); if any of those jobs are grouped, the day
+        is now correctly recognized as unfixable-without-touching-a-
+        protected-group and left alone entirely, rather than incorrectly
+        moving/releasing the ungrouped remainder (which could never have
+        fixed the shortfall anyway, since the group's own hours are what's
+        driving it). A second, independent staleness/tentative-tracking
+        bug was also caught and fixed in this same function -- see
+        CHANGELOG_AI.md Phase 12 for the full detail.
+
+--------------------------------------------------------------------------
+SHIFT (NEW section -- added 2026-08-03)
+--------------------------------------------------------------------------
+Background: the field previously called "Shift start" was a free-typed
+exact clock time (e.g. "07:00 AM"), set by the planner BEFORE planning,
+and enforced as an absolute wall -- no job before that exact minute could
+ever be assigned to that driver. The project owner flagged this as
+backwards: in real operation, the planner never fixes an exact time in
+advance -- they just decide, per driver, whether that driver is running
+mornings or evenings, and the driver's actual first-job time is only
+known -- and announced to the driver -- after the plan is built. A rigid
+15-days-morning/15-days-evening rotation with automatic transition rules
+was discussed and explicitly rejected in favor of a simpler model (see
+SS-002).
+
+SS-001 [✓ NEW] Shift start is never fixed by the planner before planning.
+        The planner sets a simple label per driver -- "Morning", "Evening",
+        or no restriction -- not a clock time. The engine enforces this as
+        a window (morning = before 12:00, evening = 12:00 onward; see
+        SHIFT_PERIOD_EVENING_CUTOFF_HOUR in allocation_engine.py if this
+        cutoff ever needs to change). The driver's exact first-job time for
+        a given day comes out of whichever job the plan happens to give
+        them first -- it is never chosen in advance.
+SS-002 [✓ NEW] No automatic 15-day rotation or off-day-triggered transition
+        logic.
+        Explicitly decided against, at the project owner's request: "if the
+        planner is deciding which driver to bring in morning and evening we
+        dont have to track this." The planner can change a driver's
+        Morning/Evening label whenever they choose -- the software does not
+        compute, enforce, or remember any rotation schedule, and does not
+        restrict when a driver can be switched between the two.
+SS-003 [NEW, open follow-up] Reporting each driver's actual first-job time
+        back to them after planning.
+        The data needed for this already exists in a finalized day's plan
+        (the earliest assigned job's start time per driver per day) but
+        isn't currently surfaced anywhere in export.py or digest_generator.py.
+        Not built this session -- flagged as a natural next step if the
+        planner wants an actual "your shift starts at X today" line in the
+        driver-facing output.
+
+--------------------------------------------------------------------------
+DRIVER RULES
+--------------------------------------------------------------------------
+DR-001 [✓] Drivers may change vehicles during the day.
+        Vehicle choice is re-evaluated per job; nothing locks a driver to one
+        vehicle plate for the day (outside of the "Same Driver" vehicle
+        preference, which is a soft preference, not a lock).
+DR-002 [✓] Driver cannot have overlapping assigned jobs in automatic scheduling.
+        Verified live against the full UNPLANNED.xlsx run: 0 overlap
+        violations across all assigned drivers.
+DR-003 [X] Jobs ending exactly when another starts are not overlapping.
+        Verified NOT working with a direct test: one driver, one vehicle,
+        job A 08:00-10:00 and job B 10:00-12:00 (back-to-back, no "Same
+        Driver" flag). Job B was rejected as "No qualifying in-house or
+        supplier resource available" even though the same driver/vehicle
+        were free. Root cause below (DR-004).
+DR-004 [X] Travel time is ignored because planner already included it.
+        Contradicted by the code: allocation_engine.py applies a hardcoded
+        DEFAULT_TRAVEL_BUFFER_MINUTES = 30 on every overlap check, for every
+        job, everywhere in the engine. This buffer is never overridden from
+        the UI or settings -- it is always 30 minutes. This is what causes
+        the DR-003 failure above, and will also silently swallow any two
+        back-to-back or near-back-to-back jobs for the same driver/vehicle
+        that aren't explicitly tied together with a "Same Driver" tag,
+        forcing them to an (unnecessary) supplier hire or leaving them
+        unresolved. Recommend either removing the buffer entirely (per
+        DR-004 as written) or making it a planner-configurable setting
+        defaulting to 0.
+
+--------------------------------------------------------------------------
+VEHICLE RULES
+--------------------------------------------------------------------------
+VR-001 [✓] Vehicle may have multiple drivers during the day.
+        Vehicles are not tied to a single driver; build_vehicle_profiles()
+        tracks only busy_intervals, not an owning driver.
+VR-002 [✓] Vehicle cannot be double-booked unless planner grouping allows it.
+        Same overlap + ignore_group_key mechanism as drivers, and it applies
+        to vehicle busy_intervals too, so a "Same Driver" flagged group can
+        legitimately double up on a vehicle by design; anything outside a
+        group is a hard block. (Same 30-min buffer caveat as DR-004 applies
+        here as well for un-flagged jobs.)
+
+--------------------------------------------------------------------------
+SAME DRIVER
+--------------------------------------------------------------------------
+SD-001 [✓] Same Driver is a planning hint.
+        Implemented as same_driver_key from the "Same Driver" column --
+        explicitly documented as planner-flagged, not AI-driven.
+SD-002 [✓] Keep same driver when feasible.
+        group_candidates logic prefers a driver already in the flagged group
+        before falling back to the normal least-occupied-driver ranking.
+SD-003 [✓] Split only when required by hard rules.
+        A new driver is only pulled into a group when none of the current
+        group's drivers still qualify (hours, license, or overlap) for the
+        next row -- confirmed in code comments and logic.
+SD-004 [✓ RESOLVED 2026-08-03] A driver cannot be on two different
+        vehicles at the same time, even within one "Same Driver" flagged
+        group.
+        CONFIRMED REAL BUG via a real software-output test file: one
+        driver was assigned a 10 Ton Chiller Truck 23:00-00:00 AND a 20
+        Seater Bus 23:00-01:00 SIMULTANEOUSLY, both rows sharing the same
+        flagged group. Root cause: the overlap-relaxation that lets a
+        "Same Driver" group's rows overlap in time (needed for the
+        legitimate case -- one truck doing two simultaneous pickups for
+        two different orders) was keyed PURELY on the group tag matching,
+        with no check on whether it was actually the same vehicle/type
+        involved. It fired for ANY two rows sharing a group tag,
+        including ones needing genuinely different vehicles.
+        FIXED: the relaxation now also requires that the driver's
+        already-established vehicle for that group (tracked via
+        group_vehicle_by_driver) is the same TYPE as what the new row
+        needs. If a driver's group vehicle is a Chiller Truck and the
+        next row in that group needs a Bus, the overlap check runs
+        normally for that driver -- if they're already busy at that time
+        (as in the real bug), they're correctly excluded, and the group
+        naturally splits into two consistent driver-vehicle threads
+        instead (matching the real ground-truth pattern already seen in
+        earlier PLANNED.xlsx analysis -- e.g. one driver handles all of a
+        group's Chiller rows, another handles all its Bus rows). A driver
+        picking up a different vehicle type within the same group at a
+        NON-overlapping time is still correctly allowed (confirmed
+        against real ground-truth behavior where this happens routinely).
+        See tests/test_same_driver_vehicle_consistency.py.
+
+--------------------------------------------------------------------------
+EVENT PREFERENCES
+--------------------------------------------------------------------------
+EP-001 [~] Prefer same driver.
+        Only enforced automatically when the planner explicitly pastes a
+        "Same Driver" value (see SD-001). For events that share an event_id
+        but have NO "Same Driver" tag, the deterministic engine does NOT
+        prefer the driver who did an earlier stage -- it just picks whoever
+        has the fewest occupied hours. Keeping the same driver across an
+        event's stages in that case is only ever a *suggestion* from the
+        optional AI review layer (ai_review.py), which requires an Anthropic
+        API key to be configured. With no API key set, EP-001 does not
+        function for un-flagged events at all.
+EP-002 [~] Prefer same vehicle.
+        Same situation as EP-001 -- only enforced for "Same Driver" flagged
+        groups (group_vehicle_by_driver); otherwise it's AI-suggestion-only.
+EP-003 [✓] Preferences never override hard rules.
+        Both the "Same Driver" preference and the AI suggestion layer are
+        confirmed unable to bypass the hard-rule candidate filtering.
+
+--------------------------------------------------------------------------
+SCHEDULING ENGINE
+--------------------------------------------------------------------------
+SE-001 [✓] Build a fully legal schedule using only hard rules.
+        allocation_engine.py never calls the AI layer; it is a pure,
+        deterministic pass.
+SE-002 [✓] Respect configured duty hours.
+        Same enforcement as HR-002/HR-003 (see the caveat noted there).
+SE-003 [~] Balance workload fairly.
+        Implemented only as "pick the least-occupied-TODAY driver"
+        (min occupied_seconds). There is no cross-day fairness tracking for
+        drivers at all -- e.g. a driver who worked very light days all month
+        gets no preference over one who's been maxed out every day, as long
+        as both qualify today. (Suppliers DO get this cross-day fairness via
+        get_supplier_cumulative_hours; drivers don't have an equivalent.)
+SE-004 [✓] Minimize supplier usage.
+        Confirmed: reuse-before-hire logic, in-house-first ordering, and the
+        live UNPLANNED.xlsx test never touched a supplier at all (34 of 44
+        rows went in-house, 10 unresolved due to missing vehicle types --
+        none were pushed to a supplier that could have taken them).
+
+--------------------------------------------------------------------------
+OPTIMIZATION
+--------------------------------------------------------------------------
+OPT-001 [~] Calculate each driver's duty span.
+        STILL not a distinct "duty span" object -- see 2026-08-03 update
+        below. Every hard rule (daily ceiling, daily minimum, monthly
+        overtime) still checks summed job DURATION (occupied_seconds), not
+        elapsed span (first job start to last job end). Confirmed as a
+        real symptom by the project owner testing a live UNPLANNED.xlsx
+        run: a driver got a 13:00-15:00 job and a 22:00-01:00 job (5h of
+        actual work) across a 12h span with a 7h idle hole in the middle,
+        and none of the hour-based hard rules had any way to see that.
+        OPEN QUESTION, discussed 2026-08-03 but not yet decided: should a
+        driver's SPAN count toward daily hour limits instead of (or in
+        addition to) summed duration? Tradeoff explained to the project
+        owner: span-based is more realistic about a driver being
+        unavailable for other work during a gap, but would hit daily/
+        monthly ceilings much faster than actual hours worked and may not
+        match how drivers are paid. Not resolved -- flagged in
+        NEXT_SESSION.md for a future session once the gap-filling fix
+        below has had a chance to reduce how often this scenario even
+        comes up.
+OPT-002 [✓ PARTIAL, 2026-08-03] Detect idle gaps.
+        `_driver_has_bounded_gap_fit()` (allocation_engine.py) now exists
+        and can identify a genuine gap in a driver's day: a job slot that
+        sits strictly between an already-assigned job before it and one
+        after it (with the normal travel buffer on both sides). It is
+        used by OPT-003 below. It is NOT used to detect gaps proactively
+        for reporting/display purposes -- only as an internal check
+        during the fix below.
+OPT-003 [✓ PARTIAL, 2026-08-03] Automatically insert jobs that legally fit
+        gaps.
+        Fixed for the confirmed real-world case: `allocation_engine.
+        _fill_gaps_with_unresolved_jobs()` runs once after the main
+        greedy pass (and after suppliers), and for every job still fully
+        unresolved, checks whether some driver now has a bounded gap
+        (per OPT-002) that the job fits into -- respecting every other
+        hard rule (license, off-day, shift, overlap, daily ceiling,
+        monthly overtime) -- and assigns it there instead of leaving it
+        unresolved. This CANNOT be done inside the main greedy pass
+        itself: jobs are processed strictly in start-time order, so the
+        LATER of a gap's two bounding jobs is never assigned yet when an
+        earlier-starting job that would sit inside that gap is being
+        considered -- confirmed by testing an in-pass version first and
+        finding it structurally could not fire (see CHANGELOG_AI.md
+        Phase 11 for the detail). A real bug was also found and fixed in
+        the neighboring HR-005 minimum-hours repair pass while building
+        this: it was working off a one-time snapshot of each driver's job
+        list, so a fix made for one driver during a pass could leave a
+        LATER driver's fix in the same pass reasoning about stale data --
+        jobs visibly ping-ponged between two drivers instead of settling.
+        Fixed by recomputing each driver's actual current day fresh right
+        before processing it, and by tracking hours/overlaps tentatively
+        added within a single move-batch so two moves to the same new
+        driver can't each look individually legal but jointly exceed a
+        hard rule. See tests/test_gap_filling.py.
+        Deliberately NOT done: reclaiming a job already given to a
+        SUPPLIER back to an in-house driver's newly-available gap --
+        unwinding a SupplierHire safely (renumbering, freeing capacity)
+        is separate, riskier work not attempted this session. Only jobs
+        that are still fully unresolved (no driver AND no supplier) are
+        considered.
+OPT-004 [~] If no legal fit exists, generate Planner Suggestions only.
+        Partially true: when no legal in-house/supplier fit exists, the job
+        is marked unresolved with a note (confirmed in the live test -- 10
+        rows). But nothing resembling a "Planner Suggestion" object is
+        generated for it -- it's simply left blank/unresolved.
+OPT-005 [X] Planner Suggestions may include small overlaps for planner review only.
+        Not implemented. There is no mechanism anywhere that proposes an
+        overlapping assignment for review. An unresolved job stays fully
+        unassigned; the engine never suggests a "tight but possible" overlap.
+OPT-006 [X] Suggested overlaps are never auto-approved.
+        N/A / can't be verified as working, since OPT-005 (the feature this
+        depends on) does not exist yet.
+OPT-007 [~] Highlight Planner Suggestions visually.
+        Unresolved jobs ARE visually highlighted in the Plan Day tab
+        (UNRESOLVED_COLOR, confirmed in plan_day_tab.py and in the live
+        test's unresolved_count display). But this is highlighting for
+        "could not be assigned at all," not for the OPT-005 "small overlap
+        suggestion" concept, which doesn't exist.
+
+--------------------------------------------------------------------------
+AI & EXTERNAL SERVICES
+--------------------------------------------------------------------------
+AI-001 [✓] Hard Rule Engine is deterministic.
+        allocation_engine.py has zero calls to the Anthropic API or any
+        randomness.
+AI-002 [✓] AI never decides legality.
+        ai_review.py's own system prompt explicitly tells the model not to
+        re-check hard rules and to trust the engine's output; it only
+        proposes non-binding suggestions.
+AI-003 [✓] Google Maps and AI are optional enhancement layers.
+        Both maps_client.get_travel_time() and ai_review.review_plan() are
+        only called from optional UI actions and both raise a clear,
+        catchable error if no API key is configured, rather than being
+        required for planning to run.
+AI-004 [✓] Software must function correctly with no external APIs.
+        Confirmed live: the full allocate() run against UNPLANNED.xlsx was
+        done with zero network calls, no Anthropic key, no Google Maps key,
+        and produced a complete, correct assignment pass.
+AI-005 [✓] AI may explain or suggest improvements but cannot override hard rules.
+        Confirmed by ai_review.py's design (see AI-002) -- it returns
+        suggestions only; nothing in the codebase lets an AI suggestion
+        mutate a Job's assignment directly.
+
+--------------------------------------------------------------------------
+VALIDATION
+--------------------------------------------------------------------------
+VAL-001 [✓] No illegal driver overlaps.
+        Verified live: ran the full allocation over all 44 UNPLANNED.xlsx
+        rows and checked every driver's assigned jobs pairwise -- 0
+        overlaps found (outside of intentionally-flagged "Same Driver"
+        groups, which are allowed to overlap by design).
+VAL-002 [✓] No illegal vehicle overlaps.
+        Same overlap-check mechanism/guarantee as VAL-001, applied to
+        vehicles.
+VAL-003 [✓] No driver exceeds configured duty hours.
+        Verified live with a direct overtime test (see HR-002) -- the
+        engine correctly refuses jobs that would exceed either the daily
+        or monthly configured limits.
+VAL-004 [~] Fair workload distribution.
+        Same-day fairness works (least-occupied-driver-first). No
+        cross-day/monthly fairness exists for drivers -- see SE-003.
+VAL-005 [✓] Minimal supplier usage.
+        See SE-004.
+
+--------------------------------------------------------------------------
+[NEW] FINDINGS NOT IN THE ORIGINAL SPEC (found during this review/testing)
+--------------------------------------------------------------------------
+NEW-001 [X] Hardcoded 30-minute travel buffer contradicts DR-003 and DR-004.
+        See DR-003/DR-004 above. This is the single highest-impact bug found
+        -- it can silently turn a perfectly legal back-to-back job into an
+        "unresolved" row or force an unnecessary supplier hire, for ANY job
+        pair not explicitly tied together with a "Same Driver" tag.
+        Suggested fix: make travel_buffer_minutes a planner setting
+        (default 0, per DR-004's stated intent) instead of a hardcoded 30.
+
+NEW-002 [✓ RESOLVED 2026-08-03] Hardcoded daily overtime ceiling (2h) isn't
+        planner-configurable.
+        Fixed -- see HR-002/HR-005. Now a real per-driver field
+        (max_working_hours_per_day), paired with working_hours_per_day, both
+        hard rules.
+
+NEW-003 [~] Free-text "rules" per Driver/Supplier are stored and shown as
+        "Recognized: ..." but are NOT enforced by the scheduling engine.
+        The Drivers/Suppliers tabs let a planner type a line like
+        "Max hours: 8" and rules_parser.py will confidently show
+        "Recognized: max duty hours = 8" -- but allocation_engine.py never
+        reads this table at all. Only the separate structured fields
+        (set via the actual form fields, not this free-text box) are
+        enforced. This is a deliberate, documented design choice in the
+        code (to avoid a past bug where unenforced free text caused a
+        driver to be over-scheduled), but as currently presented in the UI
+        there's no visible warning telling the planner that this panel's
+        "recognized" rules aren't actually binding on the scheduler --
+        worth a UI label change to avoid planner confusion.
+        Update 2026-08-03: the free-text "Shift start: HH:MM" pattern was
+        removed from rules_parser.py as part of the HR-002 rework, since
+        shift is now a structured field (see SS-001) and the old pattern's
+        example text was actively misleading (it implied an exact time
+        still mattered). The general non-binding-free-text issue described
+        above still applies to the remaining recognized patterns.
+
+NEW-004 [✓ RESOLVED 2026-08-03] No support for "Driver Only" /
+        driverless-of-vehicle-type jobs.
+        Confirmed as a real, routine request type by a real PLANNED.xlsx
+        row (SR52, "Driver Only", successfully hand-assigned by the human
+        planner with no vehicle). Fixed: `_vehicle_type_needs_vehicle()`
+        in allocation_engine.py special-cases this type string
+        (case-insensitive) to skip vehicle-matching entirely across the
+        main pass, the gap-filler, and the minimum-hours repair pass --
+        the driver just needs the right license_types entry ("Driver
+        Only"), no VehicleProfile is required or assigned.
+
+TB-001 [✓ RESOLVED 2026-08-03, same day] The default 30-minute travel
+        buffer blocked legitimate back-to-back continuations for the same
+        driver across UNRELATED orders, when neither row is flagged
+        "Same Driver".
+        Found reconstructing a real PLANNED.xlsx end-to-end (see
+        CHANGELOG_AI.md Phase 12): after the HR-002/NEW-004 fixes above,
+        42 of 44 real rows were auto-assignable in-house with zero
+        supplier fallback and every hard rule respected. The remaining 2
+        both traced to the SAME pattern: the human planner ran two
+        completely unrelated orders (different event IDs, no "Same
+        Driver" flag connecting them) back-to-back with ZERO gap for one
+        driver. The engine's overlap check treated "starts less than the
+        buffer window after the previous job ends" as a conflict UNLESS
+        both rows shared a "Same Driver" tag.
+        RESOLVED: confirmed directly with the project owner that this
+        buffer was actively wrong, not just strict -- a planner-set end
+        time already accounts for travel back to base (their example:
+        05:00-08:00 followed by 08:00-11:00 for the same driver is
+        intentional; 08:00 IS the chosen return-to-base time, not a
+        shorthand needing a buffer added on top). DEFAULT_TRAVEL_BUFFER_MINUTES
+        changed from 30 to 0 in allocation_engine.py -- adjacent
+        (zero-gap) jobs for the same driver/vehicle are no longer a
+        conflict, regardless of "Same Driver" flag; genuine time overlap
+        still is. Re-ran the same reconstruction after this change: ALL
+        44 real rows now auto-assign in-house, zero unresolved, zero
+        supplier, zero hard-rule violations. See tests/test_travel_buffer.py.
+        FUTURE WORK, not built yet: once live travel-time lookups (Google
+        Maps API) are wired in per the project owner's stated plan, gaps
+        between jobs at genuinely different locations should be checked
+        against real drive time instead of trusting the planner's manual
+        timing -- a distance-aware replacement for this flat constant,
+        tracked for whenever that integration happens, not a reason to
+        raise the constant back to a flat non-zero value in the meantime.
+
+NEW-005 [~] Vehicle-type text must match exactly (case/spacing aside).
+        _type_matches() does a straight lowercase string compare with no
+        fuzzy matching. In the live test, 3 unresolved rows requested
+        "4.2 Ton Double cabin Open Truck (with lift)" -- a type that simply
+        doesn't exist in the vehicles table (only the Chiller Truck variant
+        does). This isn't a code bug, but it means small wording
+        differences between the request sheet and the fleet list will
+        silently produce unresolved rows with no fuzzy-match warning to the
+        planner (e.g. "did you mean...").
+
+NEW-006 [NEW, open follow-up] Monthly overtime-so-far isn't shown on the
+        Drivers tab, even though it's already computed correctly.
+        get_driver_month_overtime_hours() sums overtime from finalized_jobs,
+        scoped from the 1st of the given month -- this already matches what
+        the project owner asked for ("calculated from every 1st of every
+        month"). The Drivers tab currently shows month-to-date total HOURS
+        (get_driver_month_to_date_hours), not the overtime-specific number.
+        Not changed this session (scope was the two new hard-rule fields);
+        flagged as a quick follow-up if the planner wants overtime-so-far
+        visible at a glance.
+
+NEW-007 [~ PARTIALLY RESOLVED 2026-08-03, same day] Underutilized drivers
+        while other jobs sit unresolved -- two distinct causes found.
+        Originally framed as: the OPT-002/003 gap-filler only covers a
+        driver with a GENUINE BOUNDED gap (an existing booking before AND
+        after); it does nothing for a driver who is simply underutilized
+        with wide-open capacity on one or both sides. Observed in a real
+        software-output test: one driver ended the day with a single 2h
+        job and nothing else, while several jobs sat unresolved. Checked
+        whether those specific unresolved jobs matched that driver's
+        likely vehicle-type license -- they didn't appear to, so that
+        specific instance looked like a correct license-mismatch outcome,
+        not a bug.
+        SHARPER DIAGNOSIS from the project owner, same day: proposed that
+        the engine should recognize vehicle-type QUALIFICATION SCARCITY --
+        a driver licensed for ONLY one vehicle type is a non-substitutable
+        resource for that type, and their hours should be reserved for it
+        rather than spent on a job a more broadly-licensed driver could
+        equally cover. Concrete real example given: a driver licensed
+        ONLY for "10 Ton Chiller Truck" had that day's full set of Chiller
+        requests (12:00-17:00 x2 simultaneous, 17:00-22:00, 23:00-00:00
+        x2 simultaneous -- 11h true/merged work) fit cleanly inside their
+        hour rule -- but if an earlier, non-exclusive Chiller job (one a
+        broadly-licensed driver could also cover) had landed on them
+        first, it could have burned just enough capacity to push one of
+        the later exclusive requests over their ceiling, to
+        supplier/unresolved, even with an idle qualifying driver
+        available.
+        FIXED (specialist-reservation ranking): for an UNGROUPED job with
+        multiple qualifying candidates, the engine now prefers the more
+        broadly-licensed ("generalist") candidate over a narrowly-licensed
+        ("specialist") one, reserving the specialist's hours for
+        exclusive-type demand. Ranking key: `(-len(driver.license_types),
+        driver.occupied_seconds)` -- license breadth first, existing
+        hours-fairness as the tiebreak. Since the daily/monthly hard-rule
+        ceiling checks still run BEFORE this ranking (filtering candidates
+        first), a generalist can never be pushed over their own limit by
+        this preference -- they simply get preferred up to their own
+        ceiling, then naturally drop out of candidacy and whoever's next
+        (another generalist, or the specialist) takes over.
+        DELIBERATELY SCOPED OUT: "Same Driver" grouped jobs, including a
+        group's very first assignment. Tried applying the same ranking
+        there first and it backfired -- since neither driver is yet in
+        group_drivers[group_key] for a group's opening row, both fall into
+        the same general candidate pool this ranking touches, and it can
+        steal a group's first job away from a specialist toward a
+        generalist, fragmenting a block of work that should have started
+        and stayed on one driver. Group continuity (the existing
+        group_candidates preference, and plain least-occupied fairness for
+        a group's first assignment) already handles consolidation
+        correctly on its own and takes priority; the specialist-reservation
+        heuristic only applies once there's no group to defer to.
+        SIDE FINDING, not addressed: while building the regression test,
+        surfaced a real interaction between this fix and HR-005 (the daily
+        minimum-hours rule) worth knowing about -- if a generalist is
+        given just ONE small ungrouped job (e.g. 2h) via this new
+        preference and nothing else fills their day, HR-005's repair pass
+        will try to move that 2h job elsewhere for being under-minimum;
+        if no one else has room, it releases to unresolved rather than
+        just leaving the generalist with a short, perfectly legal-in-
+        every-other-sense day. This can turn an "assignable but short"
+        outcome into "unresolved," which is arguably worse. Not changed
+        this session -- ties into the still-open OPT-001 duty-span/
+        unresolved-policy question in NEXT_SESSION.md.
+        See tests/test_specialist_reservation.py.
+
+--------------------------------------------------------------------------
+TESTING NOTES
+--------------------------------------------------------------------------
+- Ran app/excel_import.load_jobs_from_excel() directly against the supplied
+  UNPLANNED.xlsx: 44 rows parsed correctly (dates, times, event grouping,
+  Same Driver keys all read as expected).
+- Ran app/allocation_engine.allocate() against those 44 rows using the real
+  seeded fleetplanner.db (11 active drivers, 21 vehicles, 9 supplier
+  offerings): 34 rows resolved in-house, 0 supplier hires needed, 10 rows
+  unresolved -- all 10 were due to genuinely missing vehicle types/records
+  (see NEW-004, NEW-005), not scheduling logic errors.
+- Ran targeted synthetic tests (single driver/vehicle, controlled times) to
+  isolate and confirm the DR-003/DR-004/HR-002 findings above.
+
+Addendum, 2026-08-03 (HR-002/HR-005/SS-001..SS-003 rework):
+- tests/test_shift_period.py (new, replaces the old test_shift_start.py):
+  confirms the morning/evening window check, an evening driver correctly
+  refused a morning job and vice versa, and no-restriction fail-open
+  behaviour when shift is left blank.
+- tests/test_daily_overtime_ceiling.py (rewritten): confirms the 12h daily
+  ceiling from max_working_hours_per_day, the fail-closed default when it's
+  left blank, an under-minimum day being released when no other driver is
+  available, and -- the main new case -- a genuine repair-pass success
+  where a short day is moved onto a driver with spare room instead of
+  being left unresolved.
+- tests/test_license_and_hours.py and tests/test_same_driver.py: re-run
+  and adjusted only where fixture hours needed to land at/above the new
+  9h minimum (e.g. an 8h-only single-driver day, which is now correctly
+  below minimum and gets released -- the fixture was changed to 9h so it
+  keeps testing what it originally intended to test, the daily-ceiling
+  behaviour, without tripping the new minimum-hours rule at the same time).
+- Caveat carried over from HR-005: none of this has been run yet against a
+  real multi-driver day's full volume (only synthetic 1-3 job scenarios).
+  Recommend a trial run against a real UNPLANNED.xlsx day once enough
+  driver hour-configuration data exists in the database to make that
+  meaningful.
+
+Addendum, 2026-08-03 (OPT-002/OPT-003 gap-filling fix, same day as above):
+- Prompted directly by the project owner's live-test finding (the
+  13:00-15:00 / 22:00-01:00 / 16:00-20:00 scenario), not a synthetic-only
+  exercise this time.
+- tests/test_gap_filling.py (new): reproduces the exact reported scenario
+  (two drivers, one ends up covering all three jobs with no idle gap,
+  instead of a gap plus an unresolved job or a second idle driver); also
+  confirms gap-filling still refuses to fire when it would break the
+  daily hour ceiling.
+- Full existing suite re-run unchanged and still passing, confirming the
+  new gap-fill pass and the HR-005 repair-pass rewrite didn't disturb
+  license/hours/shift/same-driver-group/supplier behaviour.
+- Still only validated against small synthetic multi-job scenarios (now
+  including the specific real-world shape reported), not a full real
+  day's job volume -- the HR-005 caveat above still stands.
+
+Addendum, 2026-08-03 (real PLANNED.xlsx study -- HR-002 hour-accounting
+fix, NEW-004, HR-005 refinement, TB-001, same day as everything above):
+- First real full-day validation this project has had: a genuine
+  human-planned PLANNED.xlsx (44 rows, 11 drivers, 13 vehicles, 8
+  distinct "Same Driver" flagged events) was studied in full detail --
+  every row parsed, grouped by driver, and cross-checked for summed vs.
+  true (merged) hours, idle gaps, and duty span.
+- That analysis is what surfaced the hour-double-counting bug (real
+  driver: ~17h "occupied" vs. ~11h true), the missing "Driver Only"
+  support (a real row in the file), and, after fixing those two, the
+  travel-buffer issue (2 remaining real rows).
+- tests/test_hour_accounting.py (new): direct unit tests for
+  _merged_hours(), plus an allocate()-level test reproducing the exact
+  duplicate-simultaneous-pickup pattern found in the file, plus a
+  Driver-Only assignment test.
+- tests/test_travel_buffer.py (new): confirms zero-gap back-to-back jobs
+  for the same driver across unrelated orders are now assignable, and
+  that genuine time overlap is still correctly rejected.
+- End-to-end reconstruction methodology: the real file's driver/vehicle
+  assignments were stripped, jobs rebuilt as fresh Job objects (keeping
+  only time, vehicle-type-required, and the "Same Driver" grouping text),
+  a comparable 11-driver pool built (license types inferred from what
+  each real driver was observed driving; 2 drivers configured 9h/9h
+  no-overtime matching the 2 real drivers who happened to land exactly on
+  9h true hours; the rest 9h/12h with a 60h/month overtime allowance),
+  and run through allocate() from scratch. Before the TB-001 fix: 42/44
+  rows auto-assigned in-house, 0 supplier, 0 hard-rule violations, and
+  every "Same Driver" group split only where the real file's own group
+  also required a type-driven split (confirmed by cross-checking vehicle
+  types within each split group). After the TB-001 fix: 44/44.
+- Full existing suite re-run unchanged and still passing throughout every
+  fix in this addendum.

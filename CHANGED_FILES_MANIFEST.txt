@@ -1,0 +1,41 @@
+Files changed this session (2026-08-03), relative to the FleetPlanner/ project root.
+Drop these into your existing project, overwriting the matching paths.
+
+DELETED (not included in this zip -- delete it yourself if it still exists in your copy):
+  tests/test_shift_start.py   -- replaced by tests/test_shift_period.py
+
+MODIFIED:
+  app/db.py
+  app/allocation_engine.py
+  app/ui/drivers_tab.py
+  app/ui/entity_rules_widget.py
+  app/rules_parser.py
+  README.md
+  tests/test_daily_overtime_ceiling.py   -- rewritten
+  tests/test_license_and_hours.py        -- one fixture adjusted
+  AI/01_AI_CONTEXT.md
+  AI/02_ARCHITECTURE.md
+  AI/03_DATABASE.md
+  AI/04_BUSINESS_RULES.md
+  AI/06_NEXT_SESSION.md
+  AI/07_CHANGELOG_AI.md
+  AI/AI_INDEX.json
+
+NEW:
+  tests/test_shift_period.py
+  tests/test_gap_filling.py
+  tests/test_hour_accounting.py
+  tests/test_travel_buffer.py
+  tests/test_same_driver_vehicle_consistency.py
+  tests/test_specialist_reservation.py
+
+Everything else in the project (fleetplanner.db, PLANNED.xlsx/UNPLANNED.xlsx,
+requirements.txt, untouched app/ and AI/ files, etc.) is unchanged -- not
+included here since you asked for edited files only.
+
+Your database schema is handled automatically -- see app/db.py's migration
+system, no manual DB file replacement needed (already discussed earlier in
+this conversation).
+
+Scheduling rules spec: delivered separately as
+FleetPlanner_Scheduling_Rules_Numbered_v9.txt, not bundled in this zip.
