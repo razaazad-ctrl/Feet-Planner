@@ -115,9 +115,10 @@ class EntityRulesWidget(QWidget):
         right_layout.addLayout(rule_btn_row)
 
         hint = QLabel(
-            "Tip: each line is one rule (e.g. \"Shift start: 07:00 AM\", \"Max duty hours: 8\"). "
+            "Tip: each line is one rule (e.g. \"Max duty hours: 8\"). "
             "Lines the app recognizes are enforced automatically; anything else is still saved "
-            "and used by the AI as context."
+            "and used by the AI as context. (Shift and max daily/monthly hours are set on the "
+            "Drivers tab as structured fields, not as free-text lines here.)"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #666666; font-size: 11px;")

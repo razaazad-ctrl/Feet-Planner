@@ -168,11 +168,24 @@ _MIGRATIONS = [
     # Structured hard-rule fields for drivers -- exact format, reliably
     # enforced, instead of free-text lines that can silently fail to match.
     ("drivers", "working_hours_per_day REAL"),
-    ("drivers", "shift_start TEXT"),
+    ("drivers", "shift_start TEXT"),                  # DEPRECATED (see HR-002 rework below) -- kept so
+                                                       # old data isn't lost; no longer read by the engine.
     ("drivers", "off_days TEXT"),                    # comma-separated lowercase weekday names
     ("drivers", "max_overtime_hours_per_month REAL"), # NULL = unlimited overtime
     ("drivers", "total_hours_per_month_target REAL"), # mainly informational, for temp drivers
     ("drivers", "license_types TEXT"),                # comma-separated vehicle types
+    # --- HR-002 rework -------------------------------------------------
+    # shift_period replaces shift_start: the planner no longer commits to
+    # an exact clock time before planning. They just mark this driver as
+    # "morning" or "evening" (or leave blank = no restriction); the exact
+    # first-job time that day falls out of the plan itself and is
+    # reported back to the driver afterward, not chosen in advance.
+    ("drivers", "shift_period TEXT"),                 # 'morning' | 'evening' | NULL
+    # Replaces the old hardcoded MAX_OVERTIME_HOURS_PER_DAY=2.0 constant
+    # in allocation_engine.py. NULL = no daily overtime allowed beyond
+    # working_hours_per_day (fail-closed, matching the same precedent as
+    # max_overtime_hours_per_month=None elsewhere in this file).
+    ("drivers", "max_working_hours_per_day REAL"),
 ]
 
 
@@ -254,23 +267,28 @@ def set_driver_excluded(conn, driver_id, excluded, reason=""):
     conn.commit()
 
 
-def set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_start=None,
+def set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_period=None,
                            off_days=None, max_overtime_hours_per_month=None,
-                           total_hours_per_month_target=None, license_types=None):
+                           total_hours_per_month_target=None, license_types=None,
+                           max_working_hours_per_day=None):
     """
     off_days: list of lowercase weekday strings, or None
     license_types: list of vehicle-type strings, or None
+    shift_period: 'morning', 'evening', or None (no restriction) -- see HR-002 rework.
     All numeric args: None means "not set" (no cap / not applicable).
     """
+    if shift_period not in (None, "morning", "evening"):
+        raise ValueError(f"shift_period must be 'morning', 'evening', or None, got {shift_period!r}")
     conn.execute(
-        "UPDATE drivers SET working_hours_per_day = ?, shift_start = ?, off_days = ?, "
+        "UPDATE drivers SET working_hours_per_day = ?, shift_period = ?, off_days = ?, "
         "max_overtime_hours_per_month = ?, total_hours_per_month_target = ?, license_types = ?, "
-        "updated_at = ? WHERE id = ?",
+        "max_working_hours_per_day = ?, updated_at = ? WHERE id = ?",
         (
-            working_hours_per_day, shift_start,
+            working_hours_per_day, shift_period,
             ",".join(off_days) if off_days else None,
             max_overtime_hours_per_month, total_hours_per_month_target,
             ",".join(license_types) if license_types else None,
+            max_working_hours_per_day,
             _now(), driver_id,
         ),
     )

@@ -85,8 +85,8 @@
         },
         {
           "name": "set_driver_hard_rules",
-          "signature": "set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_start=None, off_days=None, max_overtime_hours_per_month=None, total_hours_per_month_target=None, license_types=None)",
-          "note": "off_days and license_types are lists, joined with comma for storage"
+          "signature": "set_driver_hard_rules(conn, driver_id, working_hours_per_day=None, shift_period=None, off_days=None, max_overtime_hours_per_month=None, total_hours_per_month_target=None, license_types=None, max_working_hours_per_day=None)",
+          "note": "off_days and license_types are lists, joined with comma for storage. shift_period must be 'morning', 'evening', or None (raises ValueError otherwise). Renamed from shift_start / gained max_working_hours_per_day 2026-08-03, see HR-002 rework."
         },
         {
           "name": "get_driver_month_to_date_hours",
@@ -261,7 +261,6 @@
         }
       ],
       "recognized_rule_types": [
-        "shift_start",
         "max_hours",
         "qualified_vehicle_types",
         "not_qualified_vehicle_types",
@@ -372,7 +371,8 @@
             "id",
             "name",
             "working_hours_per_day",
-            "shift_start",
+            "shift_period ('morning' | 'evening' | None -- replaces shift_start, see HR-002 rework 2026-08-03)",
+            "max_working_hours_per_day (hard daily ceiling; None falls back to working_hours_per_day -- new 2026-08-03, replaces the removed MAX_OVERTIME_HOURS_PER_DAY module constant)",
             "license_types (list)",
             "off_days (list)",
             "max_overtime_hours_per_month",
@@ -381,7 +381,7 @@
             "occupied_seconds (RUNTIME)",
             "busy_intervals (RUNTIME, list of (start, end, group_key) tuples -- group_key is the same_driver_key of the job that created that interval, or None)"
           ],
-          "critical_history_note": "shift_start field was OMITTED from this dataclass during an earlier rewrite -- a real bug, fixed. Any future field additions to drivers must be added here too, not just in the database."
+          "critical_history_note": "shift_start field was OMITTED from this dataclass during an earlier rewrite -- a real bug, fixed, then the field itself was replaced entirely by shift_period on 2026-08-03 (see HR-002 rework in CHANGELOG_AI.md Phase 10). Any future field additions to drivers must be added here too, not just in the database."
         },
         {
           "name": "VehicleProfile",
@@ -442,35 +442,56 @@
           "purpose": "weekday check against off_days, with allow_override_days escape hatch"
         },
         {
-          "name": "_parse_shift_start_time",
-          "purpose": "parses '07:00 AM' or '18:00' style text into datetime.time"
-        },
-        {
-          "name": "_job_is_before_shift_start",
-          "purpose": "hard rule: job.start_dt.time() must not be earlier than driver's parsed shift_start"
+          "name": "_job_matches_shift_period",
+          "purpose": "hard rule (replaces _parse_shift_start_time/_job_is_before_shift_start, removed 2026-08-03): True if shift_period is None (no restriction), or if job.start_dt's time-of-day falls on the correct side of the noon cutoff for 'morning'/'evening'. See SHIFT_PERIOD_EVENING_CUTOFF_HOUR module constant."
         },
         {
           "name": "_overlaps_with_buffer",
-          "purpose": "checks time-interval overlap with a configurable minute buffer (default 30) for travel time between jobs -- now accepts an ignore_group_key parameter: intervals tagged with that same group_key are skipped, allowing overlap between rows the planner explicitly flagged as belonging to the same 'Same Driver' group."
+          "purpose": "checks time-interval overlap with a configurable minute buffer (default 0 as of 2026-08-03, was 30 -- see TB-001) for travel time between jobs -- now accepts an ignore_group_key parameter: intervals tagged with that same group_key are skipped, allowing overlap between rows the planner explicitly flagged as belonging to the same 'Same Driver' group."
         },
         {
           "name": "_type_matches",
           "purpose": "case-insensitive, whitespace-normalized EXACT string comparison -- no fuzzy matching, deliberate design choice"
         },
         {
+          "name": "_vehicle_type_needs_vehicle",
+          "signature": "_vehicle_type_needs_vehicle(vehicle_type_required)",
+          "added": "2026-08-03, NEW-004 in the scheduling rules spec",
+          "purpose": "False for 'Driver Only' (case-insensitive) -- these rows need a qualified driver but no physical vehicle at all. Confirmed by a real PLANNED.xlsx row. Used across the main pass, gap-filler, and minimum-hours repair pass to skip vehicle-matching entirely for this type; assigned_vehicle_id/plate are left None/blank."
+        },
+        {
+          "name": "_merged_hours",
+          "signature": "_merged_hours(intervals)",
+          "added": "2026-08-03, hour-accounting fix, HR-002 in the scheduling rules spec",
+          "purpose": "Returns the TRUE UNION of hours covered by the given (start, end, ...) intervals -- overlapping or touching intervals count once, not once each. Replaces naive summing everywhere occupied_seconds is read or written (main loop, gap-filler, minimum-hours repair pass) after a real PLANNED.xlsx showed a driver with ~17h 'occupied' (summed) against ~11h true (merged) work, which falsely tripped the daily ceiling. occupied_seconds is now always recomputed via this function immediately after busy_intervals changes, rather than incremented/decremented directly."
+        },
+        {
           "name": "allocate",
-          "signature": "allocate(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=30)",
+          "signature": "allocate(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES)  # 0 as of 2026-08-03, was 30 -- see TB-001",
           "returns": "jobs (mutated in place, also returned)",
-          "algorithm_summary": "For each job in time order: try in-house (qualifying + not off + shift started + no overlap + no overtime violation, pick least-occupied-hours candidate, then find any free matching vehicle). If no in-house driver+vehicle combo found, try supplier: prefer reusing an already-hired unit from today (any matching offering) that's free; if none, hire a new unit from the offering with lowest cumulative_hours_history among those with remaining daily capacity, naming it via SupplierHire.label convention. 'Same Driver' groups (job.same_driver_key): tracks group_drivers/group_vehicle_by_driver/group_supplier_hires registries; prefers reusing the driver/vehicle/supplier-hire already used for that group before considering others, and relaxes the overlap check between rows sharing the same group_key. Only brings in an additional driver/unit when none of the group's current one(s) still qualify for the next row. shift_start is now actually enforced via _job_is_before_shift_start() in the candidate loop (was previously missing -- fixed this session, confirmed as a real bug in both this repo snapshot and the project owner's live copy). The working-hours check was also fixed: a blank max_overtime_hours_per_month is now treated as 0 overtime allowed (a hard daily cap via working_hours_per_day), not as 'unlimited' -- previously the whole hours-check block was skipped in that case. A hard MAX_OVERTIME_HOURS_PER_DAY ceiling (2.0h) is now checked before the monthly overtime bucket, cumulative across all of a driver's jobs that day -- fixes a real bug where a driver with unused monthly overtime could get an entire ~22h single day.",
+          "algorithm_summary": "For each job in time order: try in-house (qualifying + not off + shift period matches + no overlap + no daily/monthly overtime violation, pick least-occupied-hours candidate, then find any free matching vehicle -- or, for a 'Driver Only' row, no vehicle at all, see _vehicle_type_needs_vehicle). If no in-house driver+vehicle combo found, try supplier: prefer reusing an already-hired unit from today (any matching offering) that's free; if none, hire a new unit from the offering with lowest cumulative_hours_history among those with remaining daily capacity, naming it via SupplierHire.label convention. 'Same Driver' groups (job.same_driver_key): tracks group_drivers/group_vehicle_by_driver/group_supplier_hires registries; prefers reusing the driver/vehicle/supplier-hire already used for that group before considering others, and relaxes the overlap check between rows sharing the same group_key -- BUT (fixed 2026-08-03, SD-004 in the scheduling rules spec) only when the candidate driver's already-established vehicle for that group is the SAME TYPE as what the current row needs (or they have none established yet); otherwise the overlap check runs normally, since a driver can't be on two different vehicles at once just because both rows share a group tag -- a real bug found via a live test (one driver on a Chiller Truck and a Bus simultaneously). Only brings in an additional driver/unit when none of the group's current one(s) still qualify for the next row. shift_period is enforced via _job_matches_shift_period() in the candidate loop (replaces the old exact-time shift_start check, removed 2026-08-03 -- see HR-002 rework). The working-hours check: a blank max_overtime_hours_per_month is treated as 0 overtime allowed (a hard daily cap via working_hours_per_day), not as 'unlimited'. The daily ceiling is now d.max_working_hours_per_day (falls back to working_hours_per_day if blank) instead of the old fixed MAX_OVERTIME_HOURS_PER_DAY module constant, which was removed 2026-08-03. All hour arithmetic uses _merged_hours() (2026-08-03 fix, see above), not a running sum. AFTER this per-job loop finishes: _fill_gaps_with_unresolved_jobs() runs once (OPT-002/003, added 2026-08-03 -- NOTE: only covers a driver with a genuine BOUNDED gap, booking before AND after; a driver with wide-open, non-bracketed spare capacity is NOT covered -- see NEW-007, open/unconfirmed), THEN _repair_minimum_daily_hours() runs looped up to 5x (HR-005, 2026-08-03) -- see each function's own entry below. Deliberately NOT done inside this per-job loop itself: a gap-fill preference was tried directly in candidate selection here first and reverted, since jobs are processed in strict start-time order so the LATER of a gap's two bounding jobs is never assigned yet when an earlier job that would sit in that gap is being considered -- it's structurally impossible for an in-loop check to see that gap.",
           "note_on_unused_params": "allowed_driver_ids and allowed_supplier_ids support a 'restrict to shortlist' feature that has NO UI control yet -- backend-ready, frontend not built"
         },
         {
-          "name": "_parse_shift_start_time",
-          "purpose": "Parses the free-typed Drivers-tab 'Shift start' text ('07:00 AM' or '18:00' style) into a datetime.time. Returns None (no restriction) if blank or unparseable -- fails open, consistent with every other optional hard-rule field in this engine."
+          "name": "_driver_has_bounded_gap_fit",
+          "signature": "_driver_has_bounded_gap_fit(driver, job_start, job_end, travel_buffer_minutes)",
+          "added": "2026-08-03, OPT-002 in the scheduling rules spec",
+          "purpose": "True if job_start/job_end sits strictly BETWEEN one of driver.busy_intervals ending before it and another starting after it (both with the travel buffer) -- i.e. a genuine gap-fill, not merely extending the driver's day earlier or later. Used by _fill_gaps_with_unresolved_jobs() below."
         },
         {
-          "name": "_job_is_before_shift_start",
-          "purpose": "True if job.start_dt's time-of-day is earlier than the driver's parsed shift_start. Compares time-of-day only, not date -- shift_start is a daily recurring time. Called in allocate()'s candidate loop; this call was missing before this session's fix."
+          "name": "_fill_gaps_with_unresolved_jobs",
+          "signature": "_fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days)",
+          "added": "2026-08-03, OPT-002/OPT-003 in the scheduling rules spec",
+          "purpose": "Post-pass, runs once (not looped) right after the main per-job loop, BEFORE _repair_minimum_daily_hours. Confirmed real-world trigger reported by the project owner: a driver got jobs at 13:00-15:00 and 22:00-01:00 (5h work, 7h idle across the 12h span) while a 16:00-20:00 job that fit the gap was left unresolved. For every still-fully-unresolved job (no driver AND no supplier), checks every driver for a bounded gap fit (via _driver_has_bounded_gap_fit) that respects every other hard rule (license/off-day/shift/overlap/ceiling/monthly-cap), and assigns it there instead of leaving it unresolved. Does NOT reclaim a job already given to a supplier -- unwinding a SupplierHire safely is separate, riskier work not attempted. Skips 'Same Driver' grouped jobs.",
+          "returns": "bool -- True if anything was filled (currently unused by the caller, kept for symmetry with _repair_minimum_daily_hours's return value and potential future looping)"
+        },
+        {
+          "name": "_repair_minimum_daily_hours",
+          "signature": "_repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days)",
+          "added": "2026-08-03, HR-005 in the scheduling rules spec",
+          "purpose": "Post-pass hard rule: a driver used at all on a day must reach working_hours_per_day that day. For every (day, driver) left under-minimum, tries to move ALL of that driver's jobs that day to another qualifying driver with room (same license/off-day/shift/overlap/ceiling/monthly-cap checks as the main loop); if every job can move, commits the move, else releases the whole day to unresolved with an explicit note. Skips jobs inside a 'Same Driver' group. Does not attempt a supplier fallback for a released day (flagged for manual review instead). Best-effort greedy heuristic, not a global optimizer -- see CHANGELOG_AI.md Phase 10 for the disclosed limitation and NEXT_SESSION.md for the still-open real-data validation.",
+          "bug_fixed_2026_08_03": "Phase 11: originally snapshotted every (day, driver)'s job list ONCE at the start and iterated the static snapshot -- a fix for one driver could leave a LATER driver's entry in the same pass reasoning about stale data, causing jobs to visibly ping-pong between two drivers instead of settling (caught by tests/test_gap_filling.py). Fixed by recomputing each pair's actual current jobs/total fresh from `jobs` immediately before processing it. A second latent bug (multiple jobs moved to the same replacement driver in one batch weren't checked against each other's tentative hours/overlap, so two individually-legal moves could jointly exceed a hard rule) was fixed at the same time by tracking tentative per-driver/per-vehicle additions within a batch before anything is committed.",
+          "returns": "bool -- True if anything changed, used by allocate()'s calling loop to decide whether another pass might help"
         }
       ],
       "fairness_model": "hours-occupied, not job-count. min(candidates, key=lambda d: d.occupied_seconds)",
@@ -484,9 +505,11 @@
         "note": "user's own historical manually-planned reference files are inconsistent about this numbering (some suppliers numbered, some not) -- confirmed by user this is a manual-entry artifact, NOT the desired behavior; the engine's consistent numbering is correct and should not be changed to match old files"
       },
       "overtime_model": {
-        "max_overtime_hours_per_month_null_or_blank": "unlimited overtime allowed",
-        "max_overtime_hours_per_month_zero": "no overtime allowed at all -- working_hours_per_day becomes a strict daily ceiling",
-        "max_overtime_hours_per_month_positive": "monthly overtime budget, checked against finalized_jobs history"
+        "max_overtime_hours_per_month_null_or_blank": "no overtime allowed at all -- working_hours_per_day becomes a strict daily ceiling (fixed to fail-closed some time ago; this entry was previously stale/wrong here, saying 'unlimited' -- corrected 2026-08-03)",
+        "max_overtime_hours_per_month_zero": "same as blank -- no overtime allowed at all",
+        "max_overtime_hours_per_month_positive": "monthly overtime budget, checked against finalized_jobs history",
+        "daily_ceiling": "max_working_hours_per_day (per-driver, planner-set, e.g. 12 paired with working_hours_per_day=9). Null/blank falls back to working_hours_per_day (zero daily overtime). Replaces the old fixed MAX_OVERTIME_HOURS_PER_DAY module constant, removed 2026-08-03 -- see HR-002 rework.",
+        "daily_minimum": "NEW 2026-08-03 (HR-005). A driver used at all on a day must reach at least working_hours_per_day that day. Enforced as a post-pass repair (_repair_minimum_daily_hours), not a per-job filter -- see that function's entry above."
       },
       "same_driver_group_feature": {
         "added": "this session",
@@ -502,7 +525,8 @@
         ]
       },
       "important_constants_in_this_module": {
-        "MAX_OVERTIME_HOURS_PER_DAY": "2.0 -- hard per-day ceiling on overtime on top of working_hours_per_day, checked before the monthly-overtime-bucket logic, regardless of remaining monthly allowance. Added after the project owner reported a real ~22-hour single day (7 AM to 5 AM next day) despite hard rules supposedly being enforced. Confirmed with the project owner (2h/day). Currently a single global constant, not per-driver configurable."
+        "MAX_OVERTIME_HOURS_PER_DAY": "REMOVED 2026-08-03. Was 2.0, a hard per-day overtime ceiling on top of working_hours_per_day, global/not per-driver configurable. Replaced by the per-driver DriverProfile.max_working_hours_per_day field -- see HR-002 rework, CHANGELOG_AI.md Phase 10.",
+        "SHIFT_PERIOD_EVENING_CUTOFF_HOUR": "NEW 2026-08-03. Currently 12 (noon) -- the hour-of-day boundary _job_matches_shift_period() uses to decide morning vs evening. A single global constant, not per-driver configurable, since the planner only asked for a simple morning/evening split."
       }
     },
     {
@@ -682,7 +706,8 @@
       "layout": "QSplitter: left = entity list (checkbox exclusion toggle, serial numbers, orange color + bottom-sort when excluded); right = QFormLayout hard-rule fields + notes list below",
       "hard_rule_fields": [
         "working_hours_per_day",
-        "shift_start",
+        "max_working_hours_per_day (new 2026-08-03, QLineEdit)",
+        "shift_period (new 2026-08-03, QComboBox: No restriction / Morning / Evening -- replaces the old shift_start QLineEdit)",
         "off_days (comma-separated in UI)",
         "max_overtime_hours_per_month",
         "total_hours_per_month_target",
@@ -820,13 +845,20 @@
             "name": "working_hours_per_day",
             "type": "REAL",
             "migration": true,
-            "business_rule": "baseline daily hours, not automatically a hard ceiling"
+            "business_rule": "baseline/normal daily hours. Also the hard daily MINIMUM as of 2026-08-03 (HR-005): a driver used at all on a day must reach at least this many hours that day, enforced via a post-pass repair (see allocation_engine._repair_minimum_daily_hours)."
           },
           {
             "name": "shift_start",
             "type": "TEXT",
             "migration": true,
-            "business_rule": "job before this time-of-day can never be assigned to this driver"
+            "business_rule": "DEPRECATED 2026-08-03, replaced by shift_period below. No longer read by allocation_engine.py; column kept only so old data isn't lost."
+          },
+          {
+            "name": "shift_period",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-03, HR-002 rework",
+            "business_rule": "'morning' | 'evening' | NULL (no restriction). Replaces shift_start's exact-time model -- the planner sets a simple label, not a clock time; the engine enforces a window (morning=before 12:00, evening=12:00 onward). No automatic rotation logic -- explicitly rejected, see spec SS-002."
           },
           {
             "name": "off_days",
@@ -838,7 +870,14 @@
             "name": "max_overtime_hours_per_month",
             "type": "REAL",
             "migration": true,
-            "business_rule": "NULL=unlimited overtime, 0=no overtime allowed, positive=monthly budget"
+            "business_rule": "NULL/blank=no overtime allowed (same as 0), positive=monthly budget. (This entry previously said 'NULL=unlimited overtime' here -- that was stale/wrong, corrected 2026-08-03; the fail-closed behavior itself was fixed in an earlier session, see CHANGELOG_AI.md Phase 8.)"
+          },
+          {
+            "name": "max_working_hours_per_day",
+            "type": "REAL",
+            "migration": true,
+            "added": "2026-08-03, HR-002 rework",
+            "business_rule": "Hard daily ceiling (including overtime), e.g. 12 paired with working_hours_per_day=9. NULL/blank falls back to working_hours_per_day (zero daily overtime) -- fail-closed. Replaces the old hardcoded MAX_OVERTIME_HOURS_PER_DAY=2.0 module constant, which had no UI field."
           },
           {
             "name": "total_hours_per_month_target",
@@ -1123,9 +1162,9 @@
     "In-house drivers/vehicles are always attempted before any supplier for every job, independently, in time order -- no pre-reservation of jobs for suppliers.",
     "Fairness among in-house drivers is measured by cumulative occupied HOURS, not job count.",
     "A driver's license_types must contain an EXACT (case/whitespace-normalized) match for a job's vehicle_type_required, or the driver is not considered at all for that job.",
-    "A job starting before a driver's configured shift_start can never be assigned to that driver. CONFIRMED FIXED this session (was previously unenforced in both this repo snapshot and the project owner's live copy, despite being documented as fixed).",
+    "A job's time-of-day must match a driver's shift_period ('morning'=before 12:00, 'evening'=12:00 onward, None=no restriction). Replaces the old exact-time shift_start model 2026-08-03 -- the planner no longer fixes an exact clock time before planning, just a Morning/Evening label; no automatic rotation. See HR-002 rework.",
     "Off days are a hard skip unless explicitly overridden for a specific date (allow_override_days parameter, no UI yet).",
-    "max_overtime_hours_per_month: NULL/blank = unlimited overtime; 0 = no overtime allowed at all; positive number = monthly budget checked against finalized_jobs history.",
+    "max_overtime_hours_per_month: NULL/blank = no overtime allowed at all (same as 0); positive number = monthly budget checked against finalized_jobs history.",
     "Supplier hiring always tries to REUSE an already-hired unit before hiring a new one, to minimize the day's headcount, even if it means one supplier driver works more hours.",
     "New supplier hires are chosen from the offering with the LOWEST cumulative historical hours among suppliers with remaining daily capacity, for cross-day fairness.",
     "Supplier unit naming: 1st hire = bare supplier name, 2nd hire = 'NAME 1', Nth = 'NAME {N-1}', reuse = 'SAME <label>'. This is user-confirmed and should not be changed based on old inconsistent manual reference files.",
@@ -1136,9 +1175,10 @@
     "Unresolved jobs (no valid assignment found) are never written to finalized_jobs.",
     "Events (grouped by event_id) with 2+ stages are the unit of reasoning for the AI's stay-on-site-vs-cycle-back judgment; single-stage events are excluded from that reasoning entirely.",
     "The 'Same Driver' Excel column lets the planner flag rows that should be handled by one driver back-and-forth; overlapping times within such a flagged group are allowed for the same driver, and the engine brings in the fewest additional drivers/supplier units possible rather than a hard-coded time or vehicle-type split.",
-    "A blank 'Max overtime/month' for a driver is treated the same as an explicit 0 (no overtime allowed) -- working_hours_per_day still applies as a hard daily cap in that case. Fixed this session; previously a blank overtime cap silently disabled ALL hours enforcement for that driver, allowing unlimited hours in a single day.",
-    "License-type qualification (a driver must hold the exact vehicle type license for a job) was audited this session at the project owner's request and confirmed correctly enforced -- no bug found here.",
-    "A driver's overtime is hard-capped at MAX_OVERTIME_HOURS_PER_DAY (currently 2 hours) in a single day, on top of working_hours_per_day, regardless of remaining monthly overtime budget. Fixed this session after the project owner reported a real ~22-hour single day being assigned."
+    "A blank 'Max overtime/month' for a driver is treated the same as an explicit 0 (no overtime allowed) -- working_hours_per_day still applies as a hard daily cap in that case.",
+    "License-type qualification (a driver must hold the exact vehicle type license for a job) was audited at the project owner's request in an earlier session and confirmed correctly enforced -- no bug found here.",
+    "A driver's daily ceiling is max_working_hours_per_day (planner-set per driver, e.g. 12), on top of working_hours_per_day, regardless of remaining monthly overtime budget. Replaces the old fixed, global MAX_OVERTIME_HOURS_PER_DAY=2.0 constant 2026-08-03 -- see HR-002 rework. Blank falls back to working_hours_per_day (zero daily overtime).",
+    "NEW 2026-08-03 (HR-005): a driver used at all on a day must reach at least working_hours_per_day that day (hard minimum, not just a target). Enforced as a post-allocation repair pass, not a per-job filter, since the engine can't know a day's total until its last job is considered -- see allocation_engine._repair_minimum_daily_hours."
   ],
   "workflows": [
     {
@@ -1222,8 +1262,9 @@
     {
       "name": "DEFAULT_TRAVEL_BUFFER_MINUTES",
       "location": "allocation_engine.py",
-      "value": 30,
-      "purpose": "minimum gap enforced between two jobs assigned to the same driver or vehicle, placeholder until real point-to-point Maps data supplies it"
+      "value": 0,
+      "changed_2026_08_03": "was 30. Confirmed with the project owner (TB-001 in the scheduling rules spec): a planner-set end time already accounts for travel back to base -- e.g. 05:00-08:00 followed by 08:00-11:00 for the same driver is intentional, 08:00 IS the chosen return-to-base time, not a shorthand needing a buffer added on top. A non-zero buffer was double-counting travel time already built into the planner's chosen times and blocking real back-to-back continuations between unrelated orders. Re-running a full real-file reconstruction after this change took it from 42/44 to 44/44 rows auto-assigned. FUTURE WORK: once live Google Maps travel-time lookups are wired in, gaps between jobs at genuinely different locations should be checked against real drive time instead of trusting manual timing -- a distance-aware replacement for this flat constant, not a reason to raise it back to a flat non-zero value in the meantime.",
+      "purpose": "minimum gap enforced between two jobs assigned to the same driver or vehicle; 0 means adjacent/zero-gap jobs are allowed, only genuine time overlap is a conflict"
     },
     {
       "name": "MAX_DIGEST_WORDS",
@@ -1245,10 +1286,10 @@
       "value": "next to the app directory, fleetplanner.db"
     },
     {
-      "name": "MAX_OVERTIME_HOURS_PER_DAY",
-      "value": 2.0,
+      "name": "SHIFT_PERIOD_EVENING_CUTOFF_HOUR",
+      "value": 12,
       "location": "allocation_engine.py",
-      "purpose": "hard daily overtime ceiling, see modules.allocation_engine.py for full rationale"
+      "purpose": "hour-of-day boundary for morning vs evening shift_period. Replaces MAX_OVERTIME_HOURS_PER_DAY (removed 2026-08-03) at this spot in the constants list -- the daily overtime ceiling is now the per-driver max_working_hours_per_day field, not a module constant. See HR-002 rework."
     }
   ],
   "configuration": {
@@ -1271,7 +1312,12 @@
     "AI suggestion Accept does not automatically update the results table -- planner must manually edit",
     "No UI for the allowed_driver_ids/allowed_supplier_ids 'daily shortlist' feature, though the backend function signature supports it",
     "No PDF export -- Excel export only",
-    "No driver shift-rotation logic (e.g. 15-day morning/afternoon cycles) -- explicitly deferred pending sufficient finalized_jobs history",
+    "No driver shift-rotation logic (e.g. 15-day morning/afternoon cycles) -- was previously described here as 'deferred pending history', but explicitly REJECTED by the project owner 2026-08-03 (see HR-002 rework): shift is a planner-set Morning/Evening label with no rotation, full stop. Not a gap to fill in later.",
+    "The HR-005 daily-minimum-hours repair pass (added 2026-08-03, Phase 10): a staleness bug was found and fixed 2026-08-03 (Phase 11) after a live-test report, and it was refined 2026-08-03 (Phase 12) after a real PLANNED.xlsx showed the total-hours check needed to include a driver's grouped-job hours too, not just ungrouped ones. Now validated end-to-end against a full real day (44 rows, 11 drivers) reconstructed from that file -- see CHANGELOG_AI.md Phase 12.",
+    "OPT-002/003 gap-filling (added 2026-08-03, Phase 11): fixes the confirmed real-world case of a driver ending up with a wide idle gap while a job that fit the gap was left unresolved. Does not reclaim jobs already given to a supplier. Validated against a full real day's reconstruction 2026-08-03 (Phase 12), not just synthetic scenarios -- see CHANGELOG_AI.md.",
+    "OPEN, not decided (spec OPT-001): should a driver's duty SPAN (first job to last job, including idle time) count toward daily/monthly hour limits, instead of summed job duration as today? Explained to the project owner 2026-08-03, deliberately left open pending seeing how much the gap-fill fix reduces the underlying scenario on its own.",
+    "Driver's actual first-job time per day isn't reported back anywhere after planning (spec SS-003) -- data exists, not surfaced in export.py/digest_generator.py yet",
+    "Month-to-date overtime-so-far isn't shown on the Drivers tab (spec NEW-006) -- get_driver_month_overtime_hours already computes it correctly, just not displayed there yet",
     "No packaging into a distributable .exe yet",
     "off_day_log and comp_days tables exist with zero CRUD or UI -- reserved schema, not working features",
     "Vehicle-type/license-type matching is exact-string only -- real-world wording inconsistencies (e.g. 'Seated' vs 'Seater') cause silent zero-match failures with no error surfaced to the user",
@@ -1281,7 +1327,6 @@
     "Combined one-click 'Plan My Day' button merging Run Planning + AI Review, once the deterministic engine is proven reliable over more real-world use",
     "Vehicle maintenance/inspection log -- planner-suggested feature (drivers report issues, auto-timestamped, weekly printout), explicitly deferred until core planning flow is solid; would be a new table hanging off vehicles, independent of existing schema",
     "PDF export via Excel COM automation (pywin32), since target machine is Windows and likely has Excel installed",
-    "Driver shift rotation derived from finalized_jobs history (not a fixed calendar anchor) -- user's explicit preference",
     "Daily shortlist UI for restricting planning to specific drivers/suppliers (backend-ready)",
     "PyInstaller packaging into a distributable .exe, deferred during active iteration to avoid rebuild friction",
     "Wiring AI suggestion Accept to automatically mutate the results table instead of requiring manual edits"

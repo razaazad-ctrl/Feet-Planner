@@ -62,7 +62,7 @@ print("--- isolating the hours-cap loophole from the travel-buffer overlap check
 # Same idea, but jobs are spaced far enough apart that the 30-min travel
 # buffer never rejects them -- isolates the hours-cap question specifically.
 jobs2 = [
-    Job(row_number=1, sr="1", start_dt=dt(0), end_dt=dt(8), vehicle_type_required="Bus"),
+    Job(row_number=1, sr="1", start_dt=dt(0), end_dt=dt(9), vehicle_type_required="Bus"),
     Job(row_number=2, sr="2", start_dt=dt(9), end_dt=dt(17), vehicle_type_required="Bus"),
     Job(row_number=3, sr="3", start_dt=dt(18), end_dt=dt(23, 30), vehicle_type_required="Bus"),
 ]
@@ -74,8 +74,8 @@ for j in jobs2:
     print(f"SR{j.sr} {j.start_dt.strftime('%H:%M')}-{j.end_dt.strftime('%H:%M')} -> assigned_driver_id={j.assigned_driver_id}")
 total_hours = sum((j.end_dt - j.start_dt).total_seconds()/3600 for j in jobs2 if j.assigned_driver_id == 1)
 print(f"Total hours given to this single driver in one day: {total_hours}")
-assert jobs2[0].assigned_driver_id == 1, "First 8h job should be assignable (within the 9h daily cap)"
-assert jobs2[1].assigned_driver_id is None, "Second job would push driver to 16h -- must be refused now that blank overtime = hard daily cap"
+assert jobs2[0].assigned_driver_id == 1, "First 9h job should be assignable (exactly at the 9h daily cap and daily minimum)"
+assert jobs2[1].assigned_driver_id is None, "Second job would push driver past 9h -- must be refused now that blank overtime = hard daily cap"
 assert jobs2[2].assigned_driver_id is None, "Third job would also exceed the daily cap -- must be refused"
 print("PASS: working_hours_per_day is now a hard daily cap when max_overtime_hours_per_month is blank (fixed)")
 

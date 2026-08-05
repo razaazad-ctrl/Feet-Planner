@@ -70,30 +70,60 @@ Confirmed behaviour (agreed with the project owner before implementing):
 3. The same reuse-before-hire treatment and overlap relaxation is applied
    to supplier hires for flagged rows that fall through to the supplier
    pass, for the same "fewest units possible" reasoning.
-4. Known simplification, documented rather than hidden: hour totals
-   (`occupied_seconds`, monthly-overtime projection) still SUM every row's
-   duration even when two rows in the same flagged group overlap in time.
-   This can overstate a driver's true occupied hours for overlapping rows,
-   but never understates them -- given Rule 6 (driver safety is a hard
-   constraint, no automatic overtime), overstating hours is the safe
-   direction to err in. If this ever needs to be exact (true elapsed-time
-   union instead of a sum), that is a deliberate follow-up, not something
-   to silently change here.
+4. Hour totals (`occupied_seconds`, monthly-overtime projection) use the
+   TRUE UNION of a driver's time intervals, not a naive sum -- two rows in
+   the same flagged group that overlap in time (e.g. two simultaneous
+   pickups on one truck) count once, not once each. This was originally a
+   documented simplification (summing, and deliberately erring toward
+   overstating hours per Rule 6) but real PLANNED.xlsx data confirmed the
+   overstatement was large enough to falsely trip the daily ceiling in
+   routine cases, not just edge cases -- fixed 2026-08-03. See
+   `_merged_hours()` below and HR-002 in the scheduling rules spec.
 """
 import re
 from dataclasses import dataclass, field
-from datetime import timedelta, date, datetime
+from datetime import timedelta, date, datetime, time
 
-DEFAULT_TRAVEL_BUFFER_MINUTES = 30
+# Confirmed with the project owner, 2026-08-03 (see TB-001 in the
+# scheduling rules spec): a planner-set end time already accounts for
+# travel back to base -- e.g. a 05:00-08:00 job followed by an 08:00-11:00
+# job for the same driver is intentional; 08:00 IS the return-to-base
+# time, chosen by the planner, not a shorthand that still needs a buffer
+# added on top. A non-zero buffer here was double-counting travel time the
+# planner had already built into their chosen times, and was blocking real
+# back-to-back continuations between UNRELATED orders (not just "Same
+# Driver"-flagged ones) that the planner clearly intended. Set to 0:
+# adjacent (touching, zero-gap) jobs for the same driver/vehicle are not a
+# conflict; genuine time overlap still is. FUTURE WORK, not built yet:
+# once live travel-time lookups (Google Maps API) are wired in, gaps
+# between jobs at genuinely different locations should be checked against
+# real drive time instead of trusting the planner's manual timing --
+# that's a distance-aware replacement for this flat constant, not a
+# reason to raise it back to a flat non-zero value now.
+DEFAULT_TRAVEL_BUFFER_MINUTES = 0
 
-# Hard per-day ceiling on overtime, on top of a driver's working_hours_per_day
-# baseline, regardless of how much monthly overtime allowance they have left.
-# Confirmed with the project owner: the monthly overtime bucket alone is not
-# enough -- without this, a driver with plenty of unused monthly overtime
-# could be given one absurd single day (e.g. 7 AM to 5 AM the next day, ~22h)
-# since nothing capped how much of the month's allowance one day could
-# consume. This is a hard safety constraint (Rule 6), not a suggestion.
-MAX_OVERTIME_HOURS_PER_DAY = 2.0
+# --- HR-002 rework --------------------------------------------------------
+# The daily ceiling used to be a single hardcoded constant
+# (MAX_OVERTIME_HOURS_PER_DAY = 2.0) with no UI field to change it. It is
+# now DriverProfile.max_working_hours_per_day -- a real, per-driver,
+# planner-configurable field (paired with working_hours_per_day, e.g. 9/12)
+# -- see _daily_ceiling_for() below. The reasoning for having a hard daily
+# ceiling at all is unchanged: the monthly overtime bucket alone is not
+# enough, since without a same-day cap a driver with plenty of unused
+# monthly overtime could still be given one absurd single day (e.g. 7 AM to
+# 5 AM the next day, ~22h). If a driver has no max_working_hours_per_day
+# configured, the ceiling falls back to their working_hours_per_day (i.e.
+# zero overtime allowed that day) -- fail-closed, matching the existing
+# precedent for max_overtime_hours_per_month=None elsewhere in this file,
+# rather than silently reopening the old unlimited-single-day bug.
+#
+# Also new in this rework: a MINIMUM daily-hours rule -- a driver who is
+# used at all on a given day must reach at least working_hours_per_day that
+# day. This can't be enforced as a simple per-job filter the way the
+# ceiling is, because the engine assigns jobs one at a time in time order
+# and doesn't know a driver's full-day total until the day's last job has
+# been considered. It's enforced instead as a repair pass that runs after
+# the normal allocation -- see _repair_minimum_daily_hours() below.
 
 
 @dataclass
@@ -101,7 +131,8 @@ class DriverProfile:
     id: int
     name: str
     working_hours_per_day: float = None      # None = no daily baseline known
-    shift_start: str = None                  # raw text from db, e.g. "07:00 AM" or "18:00"; None = no restriction
+    shift_period: str = None                 # 'morning' | 'evening' | None = no restriction (see HR-002 rework)
+    max_working_hours_per_day: float = None  # hard daily ceiling; None = falls back to working_hours_per_day
     license_types: list = field(default_factory=list)
     off_days: list = field(default_factory=list)          # lowercase weekday names
     max_overtime_hours_per_month: float = None            # None = unlimited overtime
@@ -168,7 +199,8 @@ def build_driver_profiles(conn, db):
             id=row["id"],
             name=row["name"],
             working_hours_per_day=working_hours,
-            shift_start=row["shift_start"],
+            shift_period=row["shift_period"],
+            max_working_hours_per_day=row["max_working_hours_per_day"],
             license_types=[t.strip() for t in (row["license_types"] or "").split(",") if t.strip()],
             off_days=[d.strip().lower() for d in (row["off_days"] or "").split(",") if d.strip()],
             max_overtime_hours_per_month=row["max_overtime_hours_per_month"],
@@ -230,6 +262,13 @@ def _type_matches(required_type, candidate_type):
     return required_type.strip().lower() == candidate_type.strip().lower()
 
 
+def _vehicle_type_needs_vehicle(vehicle_type_required):
+    """NEW-004 fix (2026-08-03): a 'Driver Only' row needs a qualified
+    driver but no physical vehicle at all -- confirmed by a real
+    PLANNED.xlsx row using this exact type text. Case-insensitive."""
+    return (vehicle_type_required or "").strip().lower() != "driver only"
+
+
 def _driver_qualifies_for_type(driver, vehicle_type):
     if not driver.license_types:
         # No license types configured -> treated as qualified for nothing,
@@ -246,35 +285,353 @@ def _driver_is_off(driver, job_date, allow_override_days):
     return False
 
 
-_SHIFT_START_FORMATS = ("%I:%M %p", "%I:%M%p", "%H:%M")
+# --- HR-002 rework: morning/evening shift window --------------------------
+# The planner never fixes an exact shift-start clock time up front anymore.
+# They just mark a driver "morning" or "evening" (a simple, planner-picked
+# label -- not something the software computes or rotates automatically).
+# The actual first-job time for a given day is whatever the plan produces,
+# and is only known -- and announced to the driver -- after planning.
+# Evening starts at noon; adjust here if the business ever needs a
+# different cutoff (kept as one constant rather than a UI field for now,
+# since the planner only asked for a simple morning/evening split).
+SHIFT_PERIOD_EVENING_CUTOFF_HOUR = 12
 
 
-def _parse_shift_start_time(raw_text):
-    """Parses the free-typed 'Shift start' field (e.g. "07:00 AM" -- the
-    format the Drivers tab placeholder suggests -- or a plain 24-hour
-    "18:00") into a datetime.time. Returns None if blank or unparseable,
-    which means "no shift-start restriction for this driver" -- the same
-    fail-open behaviour as every other optional hard-rule field in this
-    engine (e.g. working_hours_per_day=None), rather than silently
-    blocking every job for a driver whose text didn't parse."""
-    if not raw_text:
-        return None
-    text = str(raw_text).strip()
-    for fmt in _SHIFT_START_FORMATS:
-        try:
-            return datetime.strptime(text, fmt).time()
-        except ValueError:
+def _job_matches_shift_period(job_start_dt, shift_period):
+    """True if this job is allowed for a driver with the given shift_period.
+    shift_period is 'morning', 'evening', or None (no restriction -- same
+    fail-open behaviour as every other optional hard-rule field here)."""
+    if shift_period is None:
+        return True
+    is_evening_job = job_start_dt.time() >= time(SHIFT_PERIOD_EVENING_CUTOFF_HOUR, 0)
+    if shift_period == "evening":
+        return is_evening_job
+    if shift_period == "morning":
+        return not is_evening_job
+    return True  # unrecognized value -- fail open rather than block everything
+
+
+def _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days):
+    """OPT-001/002/003 fix (2026-08-03), confirmed with the project owner
+    against a real UNPLANNED.xlsx run: a driver ended up with two jobs
+    12h apart (13:00-15:00 and 22:00-01:00, only 5h actual work) while a
+    job that would have fit neatly into that 7h hole (16:00-20:00) was
+    left completely unassigned. Root cause: the main pass has no way to
+    know about a gap until AFTER both of its bounding jobs are assigned --
+    jobs are processed strictly in start-time order, so the later bounding
+    job is never assigned yet when an earlier job that would sit inside
+    that gap is being considered (see the NOTE at chosen_driver's
+    selection in allocate(), above).
+
+    This runs once, after the main pass (and after suppliers), and looks
+    at every still-genuinely-unresolved job: if some driver's day now has
+    a bounded gap (an existing job before AND after, with the normal
+    travel buffer) that this job fits into -- respecting every other hard
+    rule (license, off-day, shift, overlap, daily ceiling, monthly
+    overtime) -- it's assigned there instead of staying unresolved.
+
+    Deliberately conservative: only touches jobs that are still fully
+    unresolved (no driver AND no supplier), never reclaims a job already
+    given to a supplier back to in-house -- unwinding a SupplierHire
+    safely (renumbering, freeing capacity) is a separate, riskier piece of
+    work not attempted here. Skips "Same Driver" grouped jobs, left to
+    that mechanism instead. Runs once, not looped: filling one gap only
+    ever removes room for other jobs, never creates new room.
+    """
+    allow_override_days = allow_override_days or {}
+    filled_any = False
+    for job in jobs:
+        if not job.unresolved or job.assigned_driver_id is not None or job.assigned_supplier_unit is not None:
             continue
-    return None
+        if job.start_dt is None or job.end_dt is None:
+            continue
+        if _group_key_of(job):
+            continue
+        job_hours = (job.end_dt - job.start_dt).total_seconds() / 3600.0
+        best_driver = None
+        for d in driver_pool:
+            if not _driver_qualifies_for_type(d, job.vehicle_type_required):
+                continue
+            if _driver_is_off(d, job.start_dt.date(), allow_override_days):
+                continue
+            if not _job_matches_shift_period(job.start_dt, d.shift_period):
+                continue
+            if not _driver_has_bounded_gap_fit(d, job.start_dt, job.end_dt, travel_buffer_minutes):
+                continue  # only interested in a genuine gap-fill here
+            if _overlaps_with_buffer(d.busy_intervals, job.start_dt, job.end_dt, travel_buffer_minutes):
+                continue
+            if d.working_hours_per_day is not None:
+                projected = _merged_hours(d.busy_intervals + [(job.start_dt, job.end_dt)])
+                ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
+                if projected > ceiling + 1e-9:
+                    continue
+                overtime = max(0.0, projected - d.working_hours_per_day)
+                if d.max_overtime_hours_per_month is not None:
+                    if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
+                        continue
+                elif overtime > 0:
+                    continue
+            if best_driver is None or d.occupied_seconds < best_driver.occupied_seconds:
+                best_driver = d
+        if best_driver is None:
+            continue
+        new_vehicle = None
+        if _vehicle_type_needs_vehicle(job.vehicle_type_required):
+            for v in vehicle_pool:
+                if _type_matches(job.vehicle_type_required, v.vehicle_type) and not _overlaps_with_buffer(
+                        v.busy_intervals, job.start_dt, job.end_dt, travel_buffer_minutes):
+                    new_vehicle = v
+                    break
+            if new_vehicle is None:
+                continue
+        job.assigned_driver_id = best_driver.id
+        job.assigned_driver_name = best_driver.name
+        job.assigned_vehicle_id = new_vehicle.id if new_vehicle else None
+        job.assigned_vehicle_plate = new_vehicle.plate if new_vehicle else ""
+        job.unresolved = False
+        job.assignment_note = f"In-house: {best_driver.name} [filled an existing gap in their day]"
+        best_driver.busy_intervals.append((job.start_dt, job.end_dt, None))
+        best_driver.occupied_seconds = _merged_hours(best_driver.busy_intervals) * 3600.0
+        if new_vehicle:
+            new_vehicle.busy_intervals.append((job.start_dt, job.end_dt, None))
+        filled_any = True
+    return filled_any
 
 
-def _job_is_before_shift_start(job_start_dt, shift_start_time):
-    """True if this job would start before the driver's shift begins that
-    day. Compares time-of-day only (not date) -- a driver's shift_start is
-    a daily recurring time, not tied to a specific calendar date."""
-    if shift_start_time is None:
-        return False
-    return job_start_dt.time() < shift_start_time
+def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days):
+    """HR-002 rework: a driver who is used at all on a given day must reach
+    at least their configured working_hours_per_day that day. The main
+    allocation pass above can't guarantee this directly (it assigns jobs
+    one at a time in time order and doesn't know a driver's full-day total
+    until the day's last job has been considered), so this runs afterward
+    as a best-effort repair: for every driver left with a non-zero,
+    under-minimum day, try to move ALL of that driver's jobs for that day
+    to other qualifying drivers with spare room. If every job can be
+    moved, commit the move. If even one can't, release the whole day back
+    to unresolved instead of leaving an illegal short day in place --
+    moving only some of the jobs would just create a different
+    under-minimum day rather than fixing anything.
+
+    Scope: only touches jobs with no "Same Driver" group tag. Grouped jobs
+    are an explicit planner instruction and are left alone.
+
+    This is a greedy, best-effort heuristic, not a global optimizer -- it
+    can leave a fixable case unfixed if an earlier move in the same pass
+    used up the room that would have fixed a later one. allocate() calls
+    this in a small loop (see below) so a fix made in one pass can enable
+    another fix in the next, up to a small iteration cap.
+
+    Correctness notes (fixed 2026-08-03 after a real ping-ponging bug was
+    caught in testing -- see tests/test_gap_filling.py and
+    CHANGELOG_AI.md): (1) each (day, driver) pair's job list and total
+    hours are recomputed FRESH from `jobs` right before it's processed,
+    never from a snapshot taken at the start of this call -- an earlier
+    fix in the same pass can change what a later pair's driver actually
+    has, and processing against a stale list caused jobs to be moved back
+    and forth between two drivers instead of settling. (2) when several
+    of one driver's jobs are being moved to the same new driver in one
+    batch, each already-planned-but-not-yet-committed move in that batch
+    is counted against the new driver's projected hours/overlap check for
+    the next job in the same batch -- otherwise two moves could each look
+    individually legal but together silently exceed that driver's daily
+    ceiling.
+
+    Returns True if anything changed (so the caller knows whether another
+    pass might help), False otherwise.
+    """
+    allow_override_days = allow_override_days or {}
+    driver_by_id = {d.id: d for d in driver_pool}
+    vehicle_by_id = {v.id: v for v in vehicle_pool}
+
+    candidate_keys = set()
+    for job in jobs:
+        if job.assigned_driver_id is None or job.start_dt is None or job.end_dt is None:
+            continue
+        candidate_keys.add((job.start_dt.date(), job.assigned_driver_id))
+
+    changed = False
+    for day, driver_id in sorted(candidate_keys):
+        driver = driver_by_id.get(driver_id)
+        if driver is None or driver.working_hours_per_day is None:
+            continue
+
+        # Recomputed FRESH every time -- see correctness note (1) above.
+        # Includes EVERY job assigned to this driver that day, grouped or
+        # not: total_hours has to reflect the driver's true day, even
+        # though only the ungrouped subset is ever movable (see below).
+        # Uses merged/deduplicated hours (2026-08-03 hour-accounting fix,
+        # see _merged_hours above) -- two overlapping same-time rows in a
+        # flagged group count once, not once each.
+        all_day_jobs = [
+            j for j in jobs
+            if j.assigned_driver_id == driver_id and j.start_dt is not None and j.start_dt.date() == day
+        ]
+        total_hours = _merged_hours([(j.start_dt, j.end_dt) for j in all_day_jobs])
+        if total_hours <= 1e-9 or total_hours >= driver.working_hours_per_day - 1e-9:
+            continue  # unused, already fixed by an earlier pair in this pass, or already meets the minimum
+
+        # If any of the driver's jobs that day are inside a "Same Driver"
+        # group, this day can't be fixed: those jobs are an explicit
+        # planner instruction and are never moved (see docstring scope).
+        # Moving only the ungrouped remainder would never help here --
+        # the group's own hours are what's driving the shortfall, or at
+        # best moving the rest away only makes the driver's day smaller.
+        # Confirmed against a real PLANNED.xlsx that this is a genuine,
+        # accepted real-world pattern (a driver's day built almost
+        # entirely from one flagged group's hours, under the 9h baseline,
+        # with no legal way to top it up) -- not a bug to "fix" by force.
+        if any(_group_key_of(j) for j in all_day_jobs):
+            continue
+
+        day_jobs = all_day_jobs  # all ungrouped, confirmed above
+        moves = []  # (job, new_driver, new_vehicle)
+        feasible = True
+        # Tracks hours/intervals tentatively added to a candidate driver
+        # within THIS batch, before anything is actually committed -- see
+        # correctness note (2) above.
+        tentative_intervals = {}
+        tentative_vehicle_intervals = {}
+        for job in day_jobs:
+            new_driver = None
+            for d in driver_pool:
+                if d.id == driver_id:
+                    continue
+                if not _driver_qualifies_for_type(d, job.vehicle_type_required):
+                    continue
+                if _driver_is_off(d, day, allow_override_days):
+                    continue
+                if not _job_matches_shift_period(job.start_dt, d.shift_period):
+                    continue
+                combined_busy = d.busy_intervals + tentative_intervals.get(d.id, [])
+                if _overlaps_with_buffer(combined_busy, job.start_dt, job.end_dt, travel_buffer_minutes):
+                    continue
+                if d.working_hours_per_day is not None:
+                    projected = _merged_hours(combined_busy + [(job.start_dt, job.end_dt)])
+                    ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
+                    if projected > ceiling + 1e-9:
+                        continue
+                    overtime = max(0.0, projected - d.working_hours_per_day)
+                    if d.max_overtime_hours_per_month is not None:
+                        if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
+                            continue
+                    elif overtime > 0:
+                        continue
+                new_driver = d
+                break
+            if new_driver is None:
+                feasible = False
+                break
+            new_vehicle = None
+            if _vehicle_type_needs_vehicle(job.vehicle_type_required):
+                for v in vehicle_pool:
+                    combined_vehicle_busy = v.busy_intervals + tentative_vehicle_intervals.get(v.id, [])
+                    if _type_matches(job.vehicle_type_required, v.vehicle_type) and not _overlaps_with_buffer(
+                            combined_vehicle_busy, job.start_dt, job.end_dt, travel_buffer_minutes):
+                        new_vehicle = v
+                        break
+                if new_vehicle is None:
+                    feasible = False
+                    break
+                tentative_vehicle_intervals.setdefault(new_vehicle.id, []).append((job.start_dt, job.end_dt, None))
+            tentative_intervals.setdefault(new_driver.id, []).append((job.start_dt, job.end_dt, None))
+            moves.append((job, new_driver, new_vehicle))
+
+        def _release(job):
+            driver.busy_intervals = [iv for iv in driver.busy_intervals if iv != (job.start_dt, job.end_dt, None)]
+            driver.occupied_seconds = _merged_hours(driver.busy_intervals) * 3600.0
+            old_vehicle = vehicle_by_id.get(job.assigned_vehicle_id)
+            if old_vehicle:
+                old_vehicle.busy_intervals = [iv for iv in old_vehicle.busy_intervals if iv != (job.start_dt, job.end_dt, None)]
+
+        if feasible:
+            for job, new_driver, new_vehicle in moves:
+                _release(job)
+                job.assigned_driver_id = new_driver.id
+                job.assigned_driver_name = new_driver.name
+                job.assigned_vehicle_id = new_vehicle.id if new_vehicle else None
+                job.assigned_vehicle_plate = new_vehicle.plate if new_vehicle else ""
+                job.assignment_note = f"In-house: {new_driver.name} [reassigned to meet {driver.name}'s daily minimum]"
+                new_driver.busy_intervals.append((job.start_dt, job.end_dt, None))
+                new_driver.occupied_seconds = _merged_hours(new_driver.busy_intervals) * 3600.0
+                if new_vehicle:
+                    new_vehicle.busy_intervals.append((job.start_dt, job.end_dt, None))
+            changed = True
+        else:
+            for job in day_jobs:
+                _release(job)
+                job.assigned_driver_id = None
+                job.assigned_driver_name = ""
+                job.assigned_vehicle_id = None
+                job.assigned_vehicle_plate = ""
+                job.unresolved = True
+                job.assignment_note = (
+                    f"Below {driver.name}'s minimum daily hours ({total_hours:.1f}h < "
+                    f"{driver.working_hours_per_day:.1f}h required) and no other qualifying "
+                    f"driver had room -- needs manual review"
+                )
+            changed = True
+
+    return changed
+
+
+# --- OPT-001/OPT-002/OPT-003 fix (2026-08-03) ---------------------------
+# Confirmed by the project owner testing against a real UNPLANNED.xlsx:
+# the engine was scattering a driver across a wide time window with a big
+# idle hole in the middle (e.g. 13:00-15:00 then 22:00-01:00 -- a 12h span
+# for only 5h of actual work) while a job that would have fit neatly into
+# that hole (16:00-20:00) was left completely unassigned. Root cause: the
+# engine had no concept of a driver's existing "gap" as something to
+# actively prefer filling -- candidate selection only ever used
+# occupied_seconds (least-occupied-first fairness), which has no reason to
+# favor a driver whose schedule happens to have a hole over an idle driver
+# with none. This didn't cause overlap conflicts (that check was always
+# correct), it just never tried to consolidate.
+def _driver_has_bounded_gap_fit(driver, job_start, job_end, travel_buffer_minutes):
+    """True if this job would sit strictly BETWEEN two of the driver's
+    already-assigned jobs (with the normal travel buffer on both sides) --
+    i.e. genuinely fills an existing hole in their day, as opposed to
+    simply extending their day earlier or later. Deliberately narrow: this
+    does not fire for a driver who is merely idle all day (no existing
+    jobs) or one who'd only be extended forward/back, since those aren't
+    the "wasted idle gap" pattern this is meant to fix."""
+    buffer = timedelta(minutes=travel_buffer_minutes)
+    has_earlier = any(iv_end + buffer <= job_start for iv_start, iv_end, _ in driver.busy_intervals)
+    has_later = any(job_end + buffer <= iv_start for iv_start, iv_end, _ in driver.busy_intervals)
+    return has_earlier and has_later
+
+
+# --- Hour-accounting fix (2026-08-03) ------------------------------------
+# The module docstring above (point 4) documented, as a deliberate known
+# simplification, that occupied_seconds summed every row's duration even
+# when two rows in the same "Same Driver" group overlap in time (e.g. two
+# simultaneous pickups on one truck, same driver, identical start/end).
+# The project owner tested against a real PLANNED.xlsx and confirmed this
+# is a real practical problem, not just a theoretical one: a driver with
+# several such overlapping pairs across a day (worth ~11h of ACTUAL work)
+# was showing ~17h of SUMMED "occupied" time, which falsely exceeds any
+# realistic daily ceiling and blocks legitimate further assignment (or
+# wrongly moves/unresolves jobs via the HR-005 repair pass) even though
+# the driver is nowhere near actually full. This is the "deliberate
+# follow-up" the docstring flagged. Fixed here: occupied_seconds is now
+# always the UNION (deduplicated) total of a driver's busy_intervals, not
+# a running sum -- two overlapping rows for the same real-world duty
+# period count once, exactly like a human dispatcher would count them.
+def _merged_hours(intervals):
+    """Total hours covered by the UNION of the given intervals -- two
+    overlapping or touching intervals count once, not once each. Accepts
+    2-tuples (start, end) or longer tuples (start, end, ...); anything
+    past the first two elements is ignored."""
+    if not intervals:
+        return 0.0
+    spans = sorted((iv[0], iv[1]) for iv in intervals)
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            if e > merged[-1][1]:
+                merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+    return sum((e - s).total_seconds() for s, e in merged) / 3600.0
 
 
 def allocate(jobs, drivers, vehicles, supplier_offerings,
@@ -316,20 +673,41 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
                 continue
             if _driver_is_off(d, job_date, allow_override_days):
                 continue
-            if _job_is_before_shift_start(job.start_dt, _parse_shift_start_time(d.shift_start)):
+            if not _job_matches_shift_period(job.start_dt, d.shift_period):
                 continue
+            # SAME-DRIVER GROUP OVERLAP FIX (2026-08-03): the relaxation
+            # below exists so a driver can legitimately have two
+            # overlapping/simultaneous rows in one flagged group when
+            # they're genuinely the SAME physical vehicle serving two
+            # orders at once (e.g. one truck, two simultaneous pickups).
+            # It must NOT apply when the group's rows need a DIFFERENT
+            # vehicle type -- a driver cannot be behind the wheel of a
+            # Chiller Truck and a Bus at the same time just because both
+            # rows share a "Same Driver" tag. Confirmed as a real bug: a
+            # real test run put one driver on a Chiller Truck 23:00-00:00
+            # AND a Bus 23:00-01:00 simultaneously, both inside the same
+            # flagged group. Only relax the overlap check for THIS driver
+            # if they have no established vehicle for this group yet
+            # (nothing to conflict with), or if their established vehicle
+            # for this group is the same TYPE as what this job needs.
+            established_vehicle = group_vehicle_by_driver.get((group_key, d.id)) if group_key else None
+            vehicle_type_consistent = (
+                established_vehicle is None
+                or _type_matches(job.vehicle_type_required, established_vehicle.vehicle_type)
+            )
+            effective_group_key = group_key if (group_key and vehicle_type_consistent) else None
             if _overlaps_with_buffer(d.busy_intervals, job.start_dt, job.end_dt,
-                                      travel_buffer_minutes, ignore_group_key=group_key):
+                                      travel_buffer_minutes, ignore_group_key=effective_group_key):
                 continue
 
             if d.working_hours_per_day is not None:
-                projected_today_hours = d.occupied_seconds / 3600.0 + job_hours
-                projected_today_overtime = max(0.0, projected_today_hours - d.working_hours_per_day)
-                if projected_today_overtime > MAX_OVERTIME_HOURS_PER_DAY:
-                    # Hard daily ceiling -- applies regardless of how much
-                    # monthly overtime allowance remains. See
-                    # MAX_OVERTIME_HOURS_PER_DAY docstring above.
+                projected_today_hours = _merged_hours(d.busy_intervals + [(job.start_dt, job.end_dt)])
+                # Hard daily ceiling -- applies regardless of how much monthly
+                # overtime allowance remains. See HR-002 rework note above.
+                daily_ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
+                if projected_today_hours > daily_ceiling + 1e-9:
                     continue
+                projected_today_overtime = max(0.0, projected_today_hours - d.working_hours_per_day)
                 if d.max_overtime_hours_per_month is not None:
                     projected_month_overtime = d.month_overtime_so_far + projected_today_overtime
                     if projected_month_overtime > d.max_overtime_hours_per_month:
@@ -354,8 +732,38 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
             # least-occupied driver. Falls back to normal fairness ranking
             # when there's no group yet, or none of the group's current
             # driver(s) qualify for this particular row.
+            #
+            # NOTE (2026-08-03): gap-filling is deliberately NOT done here.
+            # Jobs are processed strictly in start-time order, so a job
+            # that would sit *between* two of a driver's bookings is always
+            # evaluated before the LATER of those two bookings has been
+            # assigned to anyone -- there's no way to know about that gap
+            # yet in a single forward pass. See _fill_gaps_with_unresolved_jobs()
+            # below, which runs as a post-pass instead, once every driver's
+            # day is actually known. See OPT-001/002/003 in the scheduling
+            # rules spec.
             group_candidates = [d for d in candidates if group_key and d in group_drivers.get(group_key, [])]
             chosen_driver = min(group_candidates or candidates, key=lambda d: d.occupied_seconds)
+
+            # NEW-004 fix (2026-08-03): a "Driver Only" row needs a
+            # qualified driver but no physical vehicle at all -- confirmed
+            # by a real PLANNED.xlsx row (a driver-only assignment with no
+            # vehicle involved). Previously this always fell through to
+            # unresolved/supplier since no VehicleProfile could ever match
+            # a type that doesn't correspond to a real vehicle.
+            if not _vehicle_type_needs_vehicle(job.vehicle_type_required):
+                job.assigned_driver_id = chosen_driver.id
+                job.assigned_driver_name = chosen_driver.name
+                job.assigned_vehicle_id = None
+                job.assigned_vehicle_plate = ""
+                job.assignment_note = f"In-house: {chosen_driver.name} (driver only, no vehicle){note_suffix}"
+                chosen_driver.busy_intervals.append((job.start_dt, job.end_dt, group_key))
+                chosen_driver.occupied_seconds = _merged_hours(chosen_driver.busy_intervals) * 3600.0
+                if group_key:
+                    group_drivers.setdefault(group_key, [])
+                    if chosen_driver not in group_drivers[group_key]:
+                        group_drivers[group_key].append(chosen_driver)
+                continue
 
             matching_vehicles = [
                 v for v in vehicle_pool
@@ -375,9 +783,8 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
                 job.assigned_vehicle_plate = chosen_vehicle.plate
                 job.assignment_note = f"In-house: {chosen_driver.name}{note_suffix}"
 
-                job_seconds = (job.end_dt - job.start_dt).total_seconds()
-                chosen_driver.occupied_seconds += job_seconds
                 chosen_driver.busy_intervals.append((job.start_dt, job.end_dt, group_key))
+                chosen_driver.occupied_seconds = _merged_hours(chosen_driver.busy_intervals) * 3600.0
                 chosen_vehicle.busy_intervals.append((job.start_dt, job.end_dt, group_key))
 
                 if group_key:
@@ -463,5 +870,22 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
         job.assigned_supplier_unit = new_hire.label
         job.assigned_supplier_id = new_hire.supplier_id
         job.assignment_note = f"Supplier: {new_hire.supplier_name}{note_suffix}"
+
+    # OPT-001/002/003 fix: try to slot any still-unresolved job into a
+    # genuine gap in an existing driver's day before falling back to the
+    # minimum-hours repair pass below -- see _fill_gaps_with_unresolved_jobs()
+    # docstring. Run before the minimum-hours pass since filling a gap
+    # adds hours to that driver, which can itself resolve an
+    # under-minimum day without any reassignment being needed.
+    _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days)
+
+    # HR-002 rework: enforce the daily-minimum-hours rule now that the full
+    # day's in-house assignments are known. Looped a few times since one
+    # fix can free up room that makes another fix possible. See
+    # _repair_minimum_daily_hours() docstring for what this does and does
+    # not guarantee.
+    for _ in range(5):
+        if not _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days):
+            break
 
     return jobs

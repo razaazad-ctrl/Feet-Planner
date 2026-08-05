@@ -103,7 +103,8 @@ automatically:
    Export Filled Excel. Results table is sortable and filterable by
    driver/supplier.
 2. **Drivers** (`drivers_tab.py`) — structured hard-rule fields (working
-   hours/day, shift start, off days, monthly overtime cap, monthly hour
+   hours/day, max working hours/day, shift (Morning/Evening), off days,
+   monthly overtime cap, monthly hour
    target, license types) plus a free-text "AI context notes" list.
    Exclusion checkbox ("don't use tomorrow") with visual demotion.
 3. **Suppliers** (`suppliers_tab.py`) — structured offerings (vehicle
@@ -165,86 +166,127 @@ tried to regex-match hard rules out of arbitrary planner-typed lines
 didn't exactly match a pattern, and directly caused a real bug (a driver
 scheduled well past their stated hours because the engine simply never
 saw a rule it could enforce). The current model:
-- `drivers.working_hours_per_day`, `drivers.shift_start`,
-  `drivers.off_days`, `drivers.max_overtime_hours_per_month`,
+- `drivers.working_hours_per_day`, `drivers.max_working_hours_per_day`,
+  `drivers.shift_period`, `drivers.off_days`,
+  `drivers.max_overtime_hours_per_month`,
   `drivers.total_hours_per_month_target`, `drivers.license_types` are
   all dedicated columns, edited via explicit form fields with format
-  hints (not detected from prose).
+  hints (not detected from prose). (`drivers.shift_start` still exists in
+  the schema for backward compatibility but is deprecated -- see "Shift
+  enforcement" below.)
 - The free-text `driver_rules` / `supplier_rules` tables (and
   `rules_parser.py`) still exist and are still shown in the UI, but are
   now explicitly scoped to **AI context only** — never enforced as hard
   constraints. This distinction is stated in the UI copy itself ("free
   text — context only, not enforced automatically").
 
-### Overtime model
-- `working_hours_per_day` is a **baseline**, not by itself a hard daily
-  ceiling — but see the hard daily ceiling below, which caps how far
-  past that baseline a single day can go regardless of monthly budget.
-- **`MAX_OVERTIME_HOURS_PER_DAY` (currently `2.0`, a module-level
-  constant in `allocation_engine.py`) is a hard per-day ceiling on
-  overtime, on top of `working_hours_per_day`, regardless of how much
-  monthly overtime allowance the driver has left.** Added after the
-  project owner reported a driver getting jobs from 7 AM to 5 AM the
-  next day (~22h) despite hard rules supposedly being enforced. Root
-  cause: the monthly-bucket check alone (`month_overtime_so_far +
-  today's overtime <= max_overtime_hours_per_month`) has no concept of
-  "per day" — a driver with plenty of unused monthly overtime (e.g. most
-  real drivers here have 60h/month) could have an entire day's worth of
-  that budget (13+ hours of overtime) spent in one single day, since
-  nothing stopped it. Confirmed with the project owner (2 hours/day was
-  the number given) and fixed by checking `projected_today_overtime >
-  MAX_OVERTIME_HOURS_PER_DAY` FIRST, before the monthly-bucket check --
-  this cumulatively caps overtime across however many jobs a driver picks
-  up in one day, not just a single job. This is currently a single global
-  constant (not per-driver configurable) -- see Section 10 for the
-  tradeoff if that ever needs to change.
-- `max_overtime_hours_per_month` is the actual monthly hard cap: `0` =
-  **no overtime allowed at all** (working_hours_per_day becomes a strict
-  daily ceiling); any positive number = that many hours of overtime
-  allowed per month, tracked via `finalized_jobs` history
+### Overtime model (updated 2026-08-03, see CHANGELOG_AI.md Phase 10 for full history)
+- `working_hours_per_day` is a driver's normal/baseline day. As of this
+  session it's ALSO a hard daily **minimum**: if a driver is used at all
+  on a given day, they must reach at least this many hours that day (see
+  "Daily minimum hours" below) -- not just a target, an enforced rule.
+- **The daily overtime ceiling is `max_working_hours_per_day`, a real
+  per-driver field the planner sets alongside `working_hours_per_day`
+  (e.g. 9/12), regardless of how much monthly overtime allowance the
+  driver has left.** This field REPLACES a fixed module-level constant,
+  `MAX_OVERTIME_HOURS_PER_DAY = 2.0`, that had no UI to change it --
+  originally added after the project owner reported a driver getting
+  jobs from 7 AM to 5 AM the next day (~22h) despite hard rules
+  supposedly being enforced (root cause: the monthly-bucket check alone
+  has no concept of "per day"). The project owner later asked for this
+  to become a real configurable field rather than a fixed constant, so
+  `MAX_OVERTIME_HOURS_PER_DAY` was removed entirely and
+  `max_working_hours_per_day` took its place, checked in exactly the
+  same position (before the monthly-bucket check, cumulative across
+  however many jobs a driver picks up that day). If left blank, it
+  falls back to `working_hours_per_day` (zero daily overtime, fail-closed)
+  rather than reopening the old unlimited-single-day bug.
+- `max_overtime_hours_per_month` is the actual monthly hard cap: `0` OR
+  `None`/blank = **no overtime allowed at all** (working_hours_per_day
+  becomes a strict daily ceiling); any positive number = that many hours
+  of overtime allowed per month, tracked via `finalized_jobs` history
   (`db.get_driver_month_overtime_hours`, which sums *per-day excess over
   working_hours_per_day*, not raw totals) -- but capped per-day at
-  `MAX_OVERTIME_HOURS_PER_DAY` regardless of how much of the monthly
-  total remains, per the fix above.
-- **`None`/blank = also treated as 0 overtime allowed** (fixed the same
-  session as the daily-ceiling bug above, was previously "unlimited
-  overtime allowed"). The original code skipped the entire hours-check
-  block whenever `max_overtime_hours_per_month` was `None`, meaning a
-  driver with `working_hours_per_day` configured but no overtime cap
-  could be given unlimited hours in a single day with zero enforcement —
-  a real bug, proven with a test giving one driver 21.5 hours in one day
-  with no rejection. If a driver genuinely needs a large overtime
-  allowance, that must now be set as an explicit number rather than left
-  blank — blank no longer means "no limit."
+  `max_working_hours_per_day` regardless of how much of the monthly
+  total remains, per the fix above. (Blank being treated as "no overtime"
+  rather than "unlimited" was itself a bug fix, from an earlier session
+  -- see CHANGELOG_AI.md Phase 8.)
 - This is why `finalized_jobs` (populated by the "Finalize Day" button)
   matters for the MONTHLY side of this: without it, monthly overtime
   enforcement has no history to check against and behaves as if every
   driver starts every month at zero overtime. It does NOT affect the
-  daily ceiling, which is independent of history.
+  daily ceiling or the new daily minimum, which are independent of
+  history.
+- **Daily minimum hours (new 2026-08-03, HR-005 in the scheduling rules
+  spec).** A driver used at all on a given day must reach at least
+  `working_hours_per_day` that day. This can't be a simple per-job
+  filter the way the daily ceiling is -- the engine assigns jobs one at
+  a time in time order and doesn't know a driver's full-day total until
+  the day's last job has been considered. It's enforced instead as a
+  post-allocation repair pass (`allocation_engine._repair_minimum_daily_hours`,
+  run in a loop up to 5 times): for every driver left with a non-zero,
+  under-minimum day, it tries to move ALL of that driver's jobs for that
+  day to another qualifying driver with spare room (same license/off-
+  day/shift/overlap/ceiling/monthly-cap checks as the main pass). If
+  every job can move, the move is committed; if even one can't, the
+  whole day is released to unresolved with an explicit note rather than
+  silently keeping an illegal short day. Scoped to skip jobs inside a
+  "Same Driver" group (planner-flagged, left alone), and doesn't attempt
+  a supplier fallback (flagged for manual review instead -- that's a
+  planner cost decision, not one this pass should make on its own).
+  **Known limitation, disclosed to and accepted by the project owner:**
+  this is a best-effort greedy heuristic, not a global optimizer, and
+  has only been validated against small synthetic scenarios so far, not
+  a real day's full job volume.
 
-### Shift start enforcement
-A job starting before a driver's configured `shift_start` must never be
-assigned to that driver, regardless of how few hours they've logged.
-**This was stored as a field, shown correctly in the Drivers tab UI, but
+### Shift enforcement (redesigned 2026-08-03, see CHANGELOG_AI.md Phase 10)
+**The model described here changed completely this session.** The
+previous model (`shift_start`, an exact clock time set by the planner
+before planning) is preserved below as history since the reasoning is
+still relevant context, but is no longer how the software works --
+see the new model first.
+
+**Current model:** the planner never fixes an exact shift-start clock
+time before planning. They just mark a driver `shift_period` = `"morning"`,
+`"evening"`, or leave it blank (no restriction) -- a simple label, not a
+computed rotation. The engine enforces this as a window (morning =
+before 12:00, evening = 12:00 onward -- see `SHIFT_PERIOD_EVENING_CUTOFF_HOUR`
+in `allocation_engine.py` if this cutoff ever needs to change) via
+`_job_matches_shift_period()`. The driver's actual first-job time for a
+given day comes out of whatever the plan happens to give them first --
+it is only known, and can only be announced to the driver, after
+planning, never chosen in advance. There is deliberately NO automatic
+15-day-morning/15-day-evening rotation and no off-day-triggered
+transition rule -- this was discussed and explicitly rejected by the
+project owner once it became clear the planner would be setting
+morning/evening manually anyway: "if the planner is deciding which
+driver to bring in morning and evening we dont have to track this." The
+planner can change a driver's label whenever they want; the software
+does not compute, enforce, or remember any rotation schedule.
+
+**Historical context (previous `shift_start` model, now deprecated):** a
+job starting before a driver's configured `shift_start` (an exact clock
+time, e.g. "07:00 AM") could never be assigned to that driver. This field
+was stored correctly and shown in the Drivers tab UI, but was for a time
 never actually wired into `DriverProfile`, `build_driver_profiles`, or
-`allocate()`'s candidate-filtering loop** — a real bug, present in both
-this repo snapshot and the project owner's live local copy, confirmed
-directly by the project owner. Fixed this session by adding all three
-missing pieces: the `DriverProfile.shift_start` field, populating it in
-`build_driver_profiles`, and a new `_job_is_before_shift_start()` /
-`_parse_shift_start_time()` pair actually called in the candidate loop.
-`_parse_shift_start_time` accepts the "07:00 AM"-style text the Drivers
-tab placeholder suggests, or a plain 24-hour "18:00"; unparseable or
-blank text fails open (no restriction), matching every other optional
-hard-rule field in this engine, rather than silently blocking every job
-for a driver whose text didn't parse. See `CHANGELOG_AI.md` and
-`NEXT_SESSION.md` for why this class of bug (field exists, stored
-correctly, UI reads/writes it, but the *engine* never actually checks
-it) is the single most important thing to watch for when adding new
-structured fields — it has now happened at least three times in this
-project's history (`shift_start` twice, effectively, plus the earlier
-documented case) and is worth a deliberate audit pass rather than
-assuming "it's in the dataclass so it must be enforced."
+`allocate()`'s candidate-filtering loop — a real bug, confirmed directly
+by the project owner, fixed in an earlier session by adding the missing
+`DriverProfile.shift_start` field, populating it in `build_driver_profiles`,
+and a `_job_is_before_shift_start()` / `_parse_shift_start_time()` pair
+called in the candidate loop. That whole exact-time model (field, dataclass
+field, parsing/enforcement functions) was then replaced entirely by
+`shift_period` this session, per the "Current model" above -- the
+`drivers.shift_start` database column still exists (so old data isn't
+lost) but is no longer read by any code. See `CHANGELOG_AI.md` for why
+this class of bug (field exists, stored correctly, UI reads/writes it,
+but the *engine* never actually checks it) is worth a deliberate audit
+pass whenever a new structured field is added, regardless of the shift
+model change -- the underlying lesson (verify all three of: database
+column, dataclass field populated in `build_*_profiles`, and actually
+read inside `allocate()`'s candidate loop) still applies to every hard
+rule in this project, including the new `shift_period` and
+`max_working_hours_per_day` fields added this session.
+
 
 ### "Same Driver" column (planner-flagged, deterministic, not AI)
 The daily request Excel file has a "Same Driver" column. The planner
@@ -501,14 +543,32 @@ retyped from memory.
     a driver picks up in one day. Proven with a test reproducing the
     exact 7 AM–5 AM scenario and confirming it's now rejected, plus
     exact-boundary tests (11h exactly = OK, 11h01m = rejected).
+    **Superseded 2026-08-03 -- see item 12 below and the "Overtime model"
+    section (Section 6): `MAX_OVERTIME_HOURS_PER_DAY` was removed and
+    replaced by a real per-driver `max_working_hours_per_day` field.**
+
+12. **HR-002/HR-005 rework, 2026-08-03: shift redesigned, daily ceiling
+    made a real per-driver field, new hard daily minimum added.** Not a
+    bug fix -- a deliberate rework requested by the project owner. Full
+    write-up in `CHANGELOG_AI.md` Phase 10 and Section 6 above
+    ("Overtime model" / "Shift enforcement"). Summary: `shift_start`
+    (exact time) replaced by `shift_period` (Morning/Evening label, no
+    rotation); `MAX_OVERTIME_HOURS_PER_DAY` constant removed, replaced by
+    `max_working_hours_per_day` (per-driver, e.g. 12 paired with
+    `working_hours_per_day`=9); new hard rule that a driver used at all
+    on a day must reach at least `working_hours_per_day` that day,
+    enforced via a post-allocation repair pass since it can't be a
+    per-job filter. This repair pass is a best-effort heuristic not yet
+    validated against real full-day volume -- see Section 12 below and
+    `NEXT_SESSION.md`.
 
 ## 12. Current project status (as of the end of this conversation)
 
 **Built, tested, working:**
 - Excel import (real format), event-ID grouping, deterministic
-  allocation engine (hours-fairness, license-type matching, shift-start
-  and off-day enforcement, monthly-overtime-aware hour capping, dynamic
-  supplier hiring/naming with reuse priority)
+  allocation engine (hours-fairness, license-type matching, shift-period
+  and off-day enforcement, daily-minimum and daily/monthly-overtime-aware
+  hour capping, dynamic supplier hiring/naming with reuse priority)
 - Drivers/Suppliers/Vehicles/Locations tabs with structured hard rules
   and exclusion toggles
 - AI Review layer (Claude + Google Maps) with Accept/Reject suggestion
@@ -531,10 +591,13 @@ retyped from memory.
   needs Excel COM automation via `pywin32` since the target machine is
   Windows and very likely has Excel installed — this was flagged but not
   implemented)
-- Driver shift rotation (e.g. "15 days morning shift, then 15 days
-  afternoon") — explicitly deferred until enough real `finalized_jobs`
-  history exists to derive it from, per the user's own stated preference
-  (not a fixed calendar-anchored rule, but inferred from history)
+- The HR-005 daily-minimum-hours repair pass (added 2026-08-03) has only
+  been tested against small synthetic scenarios, not a real day's full
+  job volume — see Section 9 item 12 and `NEXT_SESSION.md`.
+- Reporting each driver's actual first-job time back to them after
+  planning (spec SS-003), and showing month-to-date overtime-so-far on
+  the Drivers tab (spec NEW-006) — both flagged as small, well-scoped
+  follow-ups from the 2026-08-03 rework, not built yet.
 - Vehicle maintenance/inspection log — a planner-suggested feature,
   explicitly deferred until the core planning flow is solid. Schema-wise
   this is independent of everything else (a new table hanging off

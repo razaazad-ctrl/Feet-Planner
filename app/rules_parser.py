@@ -38,12 +38,6 @@ def _parse_time(s):
 
 
 _register(
-    "shift_start",
-    r"^shift\s*start\s*:\s*(.+)$",
-    lambda m: {"time": _parse_time(m.group(1))},
-)
-
-_register(
     "max_hours",
     r"^max\s*(duty\s*)?hours\s*:\s*(\d+(\.\d+)?)",
     lambda m: {"hours": float(m.group(2))},
@@ -132,8 +126,6 @@ def describe_rule_type(rule_type, parsed_value):
     e.g. "Recognized: Max duty hours = 8". Used purely for planner
     reassurance that the line was understood correctly.
     """
-    if rule_type == "shift_start":
-        return f"Recognized: shift start = {parsed_value['time']}"
     if rule_type == "max_hours":
         return f"Recognized: max duty hours = {parsed_value['hours']}"
     if rule_type == "qualified_vehicle_types":

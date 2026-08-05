@@ -408,3 +408,363 @@ present, not just that the field exists in the database and the UI.
   conversation as the onboarding source for any future AI assistant
   session working on this repository.
 
+## Phase 10 — Shift redesign + daily hours made fully configurable (2026-08-03)
+
+- The project owner requested two related reworks in one session,
+  explicitly framed as "let's untangle this working hours":
+  1. **Shift.** The existing `shift_start` model (an exact clock time,
+     fixed by the planner *before* planning, enforced as an absolute
+     wall) was flagged as backwards -- in real operation the planner
+     never commits to an exact time in advance, they just decide per
+     driver whether that driver runs mornings or evenings, and the
+     actual first-job time is only known -- and announced to the driver
+     -- after the plan is built. A rigid 15-day-morning/15-day-evening
+     rotation with automatic transitions was discussed first, then
+     explicitly rejected by the project owner once it became clear the
+     planner would be picking morning/evening manually anyway: "if the
+     planner is deciding which driver to bring in morning and evening we
+     dont have to track this."
+  2. **Overtime.** The monthly overtime cap (`max_overtime_hours_per_month`)
+     was already solid (see Phase 8/9), but the daily ceiling was still
+     the Phase 9 hardcoded `MAX_OVERTIME_HOURS_PER_DAY = 2.0` constant
+     with no UI. The project owner asked for two real driver-editable
+     fields instead: `working_hours_per_day` (already existed, e.g. 9)
+     and a new `max_working_hours_per_day` (e.g. 12), both hard rules,
+     replacing the constant entirely. They additionally asked for a hard
+     *minimum* -- a driver used at all on a day must reach at least
+     `working_hours_per_day` that day -- and, after being told this can't
+     be a simple per-job filter (the engine assigns jobs one at a time
+     and doesn't know a driver's full-day total until the day's last job
+     is considered), explicitly asked for "full rework now to enforce as
+     a hard minimum" rather than deferring it.
+- **Shift implementation:** `drivers.shift_start` column left in place
+  but deprecated (no longer read); new `drivers.shift_period` column
+  (`'morning'` / `'evening'` / `NULL`). `DriverProfile.shift_start`
+  replaced with `DriverProfile.shift_period`; `_parse_shift_start_time`/
+  `_job_is_before_shift_start` removed, replaced by
+  `_job_matches_shift_period()` (window check: morning = before 12:00,
+  evening = 12:00 onward -- `SHIFT_PERIOD_EVENING_CUTOFF_HOUR` constant
+  if this ever needs to change). Drivers tab: free-text "Shift start"
+  `QLineEdit` replaced with a `QComboBox` (No restriction / Morning /
+  Evening). Stale free-text rule-line example ("Shift start: 07:00 AM")
+  removed from both `rules_parser.py` (the pattern itself) and
+  `entity_rules_widget.py` (the UI tip text), since it no longer matches
+  how shift works and was actively misleading.
+- **Overtime implementation:** new `drivers.max_working_hours_per_day`
+  column; `DriverProfile.max_working_hours_per_day` field. The daily
+  ceiling check in `allocate()` now uses
+  `d.max_working_hours_per_day if d.max_working_hours_per_day is not None
+  else d.working_hours_per_day` -- i.e. blank falls back to zero daily
+  overtime (fail-closed), matching the existing precedent for a blank
+  monthly cap, rather than reopening the Phase 9 unlimited-single-day
+  bug. Drivers tab gained a "Max working hours per day" field alongside
+  the existing "Working hours per day" one.
+- **New minimum-hours hard rule:** added
+  `allocation_engine._repair_minimum_daily_hours()`, run in a loop (up to
+  5 passes) after the normal allocation pass completes. For every
+  (day, driver) left with a non-zero, under-minimum total: tries to move
+  ALL of that driver's jobs for that day to another qualifying driver
+  with spare room (checking the same license/off-day/shift/overlap/daily-
+  ceiling/monthly-overtime rules as the main pass). If every job can
+  move, the move is committed (freeing the short driver entirely, giving
+  the day to whoever absorbed it). If even one job can't move, the whole
+  day is released to unresolved with an explicit note rather than left
+  as an illegal partial day. Deliberately scoped to skip jobs inside a
+  "Same Driver" group (planner-flagged pairings left alone) and does not
+  attempt a supplier fallback for a released day (flagged for manual
+  review instead -- moving cost to a supplier is a planner decision, not
+  one the repair pass should make silently).
+  - **Known limitation, disclosed to and accepted by the project owner
+    at the time:** this is a best-effort greedy heuristic, not a global
+    optimizer -- it can leave a fixable case unfixed if an earlier move
+    in the same pass used up room that would have fixed a later one
+    (the 5-pass loop mitigates but doesn't eliminate this). It has only
+    been validated against small synthetic scenarios (1-3 jobs, 1-2
+    drivers) so far, not a real day's full job volume, because (as with
+    the Phase 8/9 work) the real `finalized_jobs`/driver-configuration
+    data needed for a meaningful large-scale test isn't available yet.
+- **Tests:** `tests/test_shift_start.py` deleted, replaced by
+  `tests/test_shift_period.py` (window-check unit tests + full
+  `allocate()` morning/evening/no-restriction scenarios).
+  `tests/test_daily_overtime_ceiling.py` rewritten for the two-field
+  model (12h ceiling, fail-closed blank default, an under-minimum solo
+  day correctly released, and -- the key new case -- a genuine repair-
+  pass success where a short day is moved onto a driver with spare room
+  instead of being left unresolved). `tests/test_license_and_hours.py`
+  had one fixture adjusted (a job changed from 8h to 9h) so it keeps
+  testing what it originally intended (the daily-ceiling behaviour)
+  without tripping the new minimum-hours rule at the same time --
+  documented inline in the test file itself. Full existing suite
+  (`test_same_driver.py`, `test_same_driver_supplier.py`) re-run
+  unchanged and still passing, confirming the "Same Driver" group logic
+  and supplier reuse were unaffected by this rework.
+- Considered and explicitly decided *against* changing the general
+  driver-selection fairness ranking (least-occupied-driver-first, see
+  Rule 5/`SE-003`) to a "pack the already-active driver first" strategy,
+  even though that would reduce how often the new minimum-hours repair
+  pass has to do any work. Reason: `test_same_driver.py`'s regression
+  case (G3 forced split) explicitly depends on least-occupied-first
+  fairness to prove a licensed-for-both driver doesn't monopolize a
+  group unrelated to the one they're already busy with. Changing the
+  ranking would have silently broken that guarantee. The repair pass
+  exists specifically so the minimum-hours rule doesn't require touching
+  this fairness logic at all.
+- Not done this session (explicitly scoped out, flagged as follow-ups):
+  reporting each driver's actual first-job time back to them once a day
+  is finalized (spec SS-003 in the scheduling rules doc -- the data
+  exists in a finalized day, just isn't surfaced in `export.py`/
+  `digest_generator.py` yet), and showing month-to-date overtime-so-far
+  on the Drivers tab (spec NEW-006 -- `get_driver_month_overtime_hours`
+  already computes this correctly, the tab just shows total hours
+  instead right now).
+- All AI documentation (`AI_CONTEXT.md`, `ARCHITECTURE.md`,
+  `DATABASE.md`, `BUSINESS_RULES.md`, this file, `NEXT_SESSION.md`,
+  `AI_INDEX.json`) and the separate numbered scheduling-rules spec
+  (bumped to v4) updated to match, per Rule 14/17.
+
+## Phase 11 — Gap-filling fix + a real repair-pass bug found and fixed (2026-08-03, same day as Phase 10)
+
+- The project owner tested Phase 10's build directly against a real
+  UNPLANNED.xlsx and reported the exact symptom OPT-001/002/003 (spec)
+  had already flagged as a known gap: a driver was given a 13:00-15:00
+  job and a 22:00-01:00 job (5h actual work across a 12h span, 7h idle
+  in the middle) while a 16:00-20:00 job that would have fit neatly in
+  that gap was left completely unassigned.
+- **First attempt (later reverted):** tried adding a gap-fill preference
+  directly inside the main greedy candidate-selection loop. Testing it
+  immediately showed it was structurally dead code: jobs are processed
+  strictly in start-time order, so by the time an earlier-starting job
+  that would sit inside a gap is being considered, the LATER of that
+  gap's two bounding jobs has never been assigned to anyone yet (it
+  hasn't been reached in the sorted iteration). A "does this driver have
+  a booking both before AND after this job" check can therefore never be
+  true in that position. Reverted in favor of a post-pass instead (kept
+  as an explanatory comment in the code so a future session doesn't
+  re-attempt the same dead end).
+- **Actual fix:** `allocation_engine._fill_gaps_with_unresolved_jobs()`,
+  a new post-pass that runs once after the main greedy loop (and after
+  suppliers) but before the HR-005 minimum-hours repair pass. For every
+  job still fully unresolved, it checks every driver for a genuine
+  bounded gap (`_driver_has_bounded_gap_fit()`: an existing job before
+  AND one after, with the normal travel buffer) that the job fits into,
+  respecting every other hard rule, and assigns it there instead of
+  leaving it unresolved. Runs before HR-005's pass deliberately: filling
+  a gap adds hours to that driver, which can itself resolve an
+  under-minimum day without HR-005 needing to reassign anything.
+  Deliberately does NOT reclaim a job already given to a supplier back to
+  an in-house driver's newly-available gap -- unwinding a `SupplierHire`
+  safely (renumbering, freeing capacity) is separate, riskier work not
+  attempted this session; only fully-unresolved jobs (no driver AND no
+  supplier) are considered.
+- **A real, independent bug was found and fixed in `_repair_minimum_daily_hours`
+  (the HR-005 pass from Phase 10) while building the test for the above.**
+  It computed a snapshot of every driver's job list ONCE at the start of
+  the pass (`by_day_driver`), then iterated over that static snapshot.
+  When fixing one under-minimum driver required moving their jobs onto a
+  second driver, that move correctly updated the real job/driver
+  objects -- but the SECOND driver's entry in the snapshot was never
+  refreshed, so when the pass later got to "fix" that second driver
+  (using the now-stale snapshot showing their OLD, pre-move job list), it
+  moved jobs around based on outdated information. Caught directly by
+  `tests/test_gap_filling.py`: two drivers' jobs visibly ping-ponged back
+  and forth between them across iterations instead of settling on a
+  single, sensible assignment. Fixed by recomputing each (day, driver)
+  pair's actual current job list and total hours FRESH, directly from
+  `jobs`, immediately before processing it -- never from a snapshot taken
+  before this pass started.
+- **A second, latent correctness bug was fixed in the same function while
+  in there:** when multiple jobs belonging to one under-minimum driver
+  were being moved to the same replacement driver in one batch, each
+  job's feasibility (overlap, daily ceiling, monthly overtime) was
+  checked against that replacement driver's real `occupied_seconds` /
+  `busy_intervals` only -- NOT accounting for the other job(s) already
+  tentatively planned for the same driver earlier in that same batch.
+  Two moves could therefore each look individually legal but jointly
+  push the replacement driver over their daily ceiling. This hadn't
+  manifested as a visible test failure yet (the specific scenario tested
+  didn't happen to cross a ceiling), but was a real latent risk given how
+  central this function now is. Fixed by tracking tentative
+  hours/intervals added within a single batch (both for drivers and for
+  vehicles) and checking new candidates against `real + tentative`,
+  committing nothing until the whole batch is confirmed feasible.
+- New test: `tests/test_gap_filling.py` -- reproduces the exact reported
+  scenario (confirms the gap gets filled onto the SAME driver, not a
+  fresh idle one) and confirms gap-filling still refuses to fire when it
+  would break the daily ceiling. Full existing suite re-run unchanged and
+  still passing.
+- **Open, explicitly not decided this session:** whether a driver's
+  DUTY SPAN (first job to last job, including idle time) should count
+  toward daily/monthly hour limits instead of (or alongside) summed job
+  duration. Explained the tradeoff to the project owner (span-based is
+  more realistic about unavailability during a gap, but hits hour
+  ceilings faster than actual hours worked and may not match driver pay)
+  -- left open pending seeing how much the gap-fill fix above reduces
+  this scenario on its own. See spec OPT-001 and `NEXT_SESSION.md`.
+- Scheduling rules spec bumped to v5; `AI_INDEX.json`,
+  `NEXT_SESSION.md`, `ARCHITECTURE.md`, and this file updated per
+  Rule 14/17. (`AI_CONTEXT.md`, `DATABASE.md`, `BUSINESS_RULES.md` were
+  checked and didn't need changes for this specific fix -- no schema or
+  business-rule change this time, purely an algorithm fix -- see
+  `NEXT_SESSION.md` for the still-open duty-span policy question, which
+  WILL need those files updated once decided.)
+
+## Phase 12 — Real PLANNED.xlsx study: hour-accounting bug, NEW-004, HR-005 refinement, TB-001 (2026-08-03, same day as Phase 10/11)
+
+- The project owner supplied a real, human-planned PLANNED.xlsx (44 rows,
+  11 drivers, 13 vehicles, 8 "Same Driver" flagged events) and asked for
+  a detailed study: why isn't the software following the 9h min/12h max
+  rule, and can the engine reproduce this exact real-world output from
+  scratch (same job-to-driver grouping structure; driver NAMES don't need
+  to match)?
+- **Root cause confirmed exactly as the project owner suspected:**
+  `occupied_seconds` was a naive SUM of every row's duration, including
+  when two rows in the same "Same Driver" group are the exact same time
+  slot (two simultaneous pickups on one truck for two different orders --
+  confirmed as routine in the real file, not an edge case). One real
+  driver showed ~17h "occupied" against ~11h of true work. This was
+  flagged as a known, deliberate simplification in the module docstring
+  since an earlier session ("if this ever needs to be exact... that is a
+  deliberate follow-up") -- this session is that follow-up, prompted by
+  real data proving it necessary rather than a guess.
+- **Fix:** added `_merged_hours(intervals)` -- returns the TRUE UNION of
+  a set of time intervals, so overlapping/touching intervals count once.
+  Replaced every direct read/write of `occupied_seconds` (main loop,
+  gap-filler, minimum-hours repair pass) with calculations through this
+  function: `occupied_seconds` is now always recomputed from
+  `busy_intervals` via `_merged_hours()` immediately after any change,
+  never incremented/decremented directly. Projected-hours checks (before
+  committing a job) now compute `_merged_hours(existing + [candidate])`
+  instead of `existing_sum + candidate_duration`.
+- **NEW-004 resolved** ("Driver Only" jobs): the real file has a genuine
+  row of this type (SR52, a Driver Only admin task, successfully
+  hand-assigned by the human with no vehicle). Added
+  `_vehicle_type_needs_vehicle(vehicle_type_required)` -- False for
+  "Driver Only" (case-insensitive) -- and special-cased it across the
+  main pass, gap-filler, and repair pass to skip vehicle-matching
+  entirely for this type.
+- **HR-005 (minimum-hours repair pass) refined against real data.** The
+  reconstruction showed several real drivers legitimately ending their
+  day under 9h -- always because their whole day (or the shortfall
+  portion of it) was inside a "Same Driver" flagged group. The pass's
+  scope note ("doesn't touch grouped jobs") was correct, but its
+  total-hours CALCULATION had a gap: it only summed a driver's UNGROUPED
+  jobs, so a driver's grouped-job hours were invisible to the minimum
+  check entirely -- meaning a driver with 3h ungrouped + 8h grouped
+  (11h true, fine) could have been incorrectly flagged as an 3h
+  under-minimum day, or a driver whose shortfall was entirely inside a
+  group could have had their ungrouped remainder pointlessly moved
+  (which could never fix anything, since the group's hours are what's
+  driving the shortfall). Fixed: `total_hours` is now the true merged
+  total across EVERY job the driver has that day; if ANY of those jobs
+  are grouped, the day is now correctly recognized as
+  unfixable-without-touching-a-protected-group and left alone entirely.
+- **TB-001, a new finding, found and resolved in the same investigation:**
+  after the two fixes above, 42 of 44 real rows auto-assigned in-house
+  with zero supplier fallback. The remaining 2 both traced to the same
+  pattern: the human ran two completely unrelated orders (different
+  event IDs, no "Same Driver" flag) back-to-back with zero gap for one
+  driver -- rejected by the engine's 30-minute default travel buffer,
+  since that relaxation previously only applied within a flagged group.
+  Raised with the project owner, who confirmed directly: a planner-set
+  end time already accounts for travel back to base (e.g.
+  05:00-08:00 → 08:00-11:00 for the same driver is intentional; 08:00 IS
+  the chosen return-to-base time, not a shorthand needing a buffer added
+  on top). `DEFAULT_TRAVEL_BUFFER_MINUTES` changed from 30 to 0 --
+  adjacent (zero-gap) jobs for the same driver/vehicle are no longer a
+  conflict regardless of group flag; genuine time overlap still is.
+  Re-running the reconstruction after this change: **all 44 real rows
+  auto-assign in-house, zero unresolved, zero supplier, zero hard-rule
+  violations.** Future work flagged, not built: once live Google Maps
+  travel-time lookups are wired in (the project owner's stated plan),
+  gaps between jobs at genuinely different locations should be checked
+  against real drive time instead of trusting manual timing -- a
+  distance-aware replacement for this flat constant.
+- **Reconstruction methodology** (repeatable for future validation): the
+  real file's driver/vehicle assignments were stripped; jobs rebuilt
+  keeping only time, vehicle-type-required, and the "Same Driver"
+  grouping text; a comparable 11-driver pool built with license types
+  inferred from what each real driver was observed driving (2 drivers
+  configured 9h/9h no-overtime, matching the 2 real drivers who happened
+  to land exactly on 9h true hours; the rest 9h/12h with a 60h/month
+  overtime allowance); run through `allocate()` from scratch. Every
+  "Same Driver" group split only where the real file's own group also
+  required a type-driven split (cross-checked the vehicle types within
+  each split group to confirm), matching the existing, previously-tested
+  "fewest drivers, split only when forced" behavior (`test_same_driver.py`).
+- New tests: `tests/test_hour_accounting.py` (direct `_merged_hours()`
+  unit tests, the exact duplicate-simultaneous-pickup scenario from the
+  real file, and a Driver-Only assignment test) and
+  `tests/test_travel_buffer.py` (zero-gap back-to-back unrelated orders
+  now assignable; genuine overlap still correctly rejected). Full
+  existing suite re-run unchanged and still passing throughout every fix
+  in this phase.
+- Scheduling rules spec bumped to v7 (HR-002 addendum, NEW-004 resolved,
+  HR-005 addendum, TB-001 added then resolved same day, new testing
+  addendum with the full reconstruction methodology and result).
+  `AI_INDEX.json` and `ARCHITECTURE.md` updated to match (new function
+  entries, corrected stale "default 30" / "still sums" references found
+  along the way -- some of these were stale even before this session and
+  got corrected opportunistically). `NEXT_SESSION.md` updated to remove
+  the now-resolved HR-005/OPT-002/003 "not validated against real data"
+  caveats and replace with the real validation result.
+## Phase 13 — Same-Driver two-vehicles-at-once bug, confirmed and fixed (2026-08-03, same day as Phase 10-12)
+
+- The project owner supplied a real software-output test file (post-v7,
+  after the hour-accounting/NEW-004/HR-005/TB-001 fixes) comparing actual
+  output against expected, specifically for "Same Driver" grouping. Found
+  a concrete, provable bug: one driver was assigned a 10 Ton Chiller
+  Truck 23:00-00:00 AND a 20 Seater Bus 23:00-01:00 SIMULTANEOUSLY, both
+  rows sharing the same flagged group -- physically impossible, exactly
+  the "one driver can't drive 2 vehicles at once" pattern the project
+  owner described.
+- **Root cause:** the overlap-relaxation that lets a "Same Driver"
+  group's rows overlap in time (needed for the legitimate case -- one
+  truck doing two simultaneous pickups for two different orders) was
+  keyed PURELY on the group tag matching (`ignore_group_key=group_key`
+  in `_overlaps_with_buffer`), with no check on whether it was actually
+  the same vehicle/type involved. It relaxed the conflict check for ANY
+  two rows sharing a group tag, including ones needing genuinely
+  different vehicles.
+- **Fix:** in the main allocation loop's driver-candidate filter, the
+  relaxation is now conditional per-candidate-driver: it only applies if
+  the driver's already-established vehicle for that group
+  (`group_vehicle_by_driver[(group_key, driver.id)]`) is the same TYPE as
+  what the current row needs, or if they have no established vehicle for
+  that group yet. If a driver's group vehicle is a Chiller Truck and the
+  next row in that group needs a Bus, the overlap check now runs
+  NORMALLY for that driver -- if they're already busy at that time (as in
+  the real bug), they're correctly excluded from candidacy, and the group
+  naturally splits into two consistent driver-vehicle threads instead
+  (matching the real ground-truth pattern from the earlier PLANNED.xlsx
+  study -- one driver handles a group's Chiller-type rows, another
+  handles its Bus-type rows).
+- Confirmed the fix doesn't regress the legitimate cases: (1) genuine
+  simultaneous SAME-vehicle-type orders in one group still both assign to
+  one driver (the original point of the feature), and (2) a driver
+  picking up a DIFFERENT vehicle type within the same group at a
+  NON-overlapping time is still allowed (matches real ground-truth
+  behavior seen previously, e.g. a driver doing Bus jobs all day plus one
+  later Chiller job for the same event).
+- New test: `tests/test_same_driver_vehicle_consistency.py` -- covers all
+  three cases (the bug reproduction, the legitimate simultaneous case,
+  and the legitimate non-overlapping switch case). Full existing suite
+  re-run unchanged and still passing.
+- **Also investigated, NOT confirmed as a bug, NOT fixed:** the project
+  owner also flagged drivers ending up with very short days (e.g. a
+  single 2h job) while other jobs sat unresolved. Checked one concrete
+  case (a driver with only a 2h Chiller/DryTruck-type job assigned) against
+  that day's unresolved jobs (Open Truck, 10 Ton Chiller, 14 Seater Bus,
+  20 Seater Bus types) -- none appeared to match that driver's likely
+  license, so this may be a correct license-mismatch outcome rather than
+  a bug. The underlying architecture gap is real regardless and separate
+  from the vehicle-consistency bug above: `_fill_gaps_with_unresolved_jobs()`
+  (Phase 11) only helps a driver with a genuine BOUNDED gap (booking
+  before AND after); it does nothing for a driver who is simply
+  underutilized with wide-open capacity and no bracketing bookings.
+  Logged as NEW-007 in the scheduling rules spec (now v8) -- flagged for
+  the project owner's confirmation before building, since extending
+  gap-fill to cover wide-open capacity (not just bounded gaps) is a real
+  scope increase, not a quick tweak.
+- Scheduling rules spec bumped to v8 (SD-004 added and resolved, NEW-007
+  added as an open, unconfirmed question). `AI_INDEX.json`'s `allocate()`
+  algorithm_summary updated to reflect the SD-004 fix.

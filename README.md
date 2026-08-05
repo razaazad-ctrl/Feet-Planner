@@ -11,11 +11,13 @@ changes" data layer and its screens.
 ## What's included
 
 - **Drivers tab** — add/delete drivers; each driver has free-form rule
-  lines (one rule per line). Lines like `Shift start: 07:00 AM`,
-  `Max duty hours: 8`, `Qualified for: 5 Ton Chiller Truck`, `Off day: Friday`
+  lines (one rule per line). Lines like `Max duty hours: 8`,
+  `Qualified for: 5 Ton Chiller Truck`, `Off day: Friday`
   are automatically recognized and will be enforced as hard rules by the
   allocation engine later. Anything else you type is still saved and shown
   — it just gets passed to the AI as context instead of being enforced.
+  (Shift and daily/monthly hour limits are structured fields on the same
+  tab, not free-text lines -- see below.)
 - **Suppliers tab** — same pattern: add/delete suppliers, then rule lines
   like `Rate: 350 AED per truck per day`, `Unit: PINK PEPPER CHILLER TRUCK #1
   (5 Ton Chiller Truck)`, `Max hours per unit: 12`.
@@ -153,9 +155,32 @@ suggestions read in practice.
   the bug where a driver was scheduled well past their stated hours
 
 **Drivers now have structured hard-rule fields** (Drivers tab): working
-hours/day, shift start, off day(s), max overtime hours/month (blank =
-unlimited overtime), total hours/month target, license types. Free-text
-notes are still there below, for AI context only.
+hours/day, max working hours/day, shift (Morning / Evening / no
+restriction), off day(s), max overtime hours/month (blank = unlimited
+overtime), total hours/month target, license types. Free-text notes are
+still there below, for AI context only.
+
+**HR-002 rework (this session):** the old "Shift start" field forced the
+planner to commit to an exact clock time before planning, and the daily
+overtime ceiling was a hardcoded 2h constant with no UI to change it.
+Both are fixed now:
+- Shift is just "Morning" or "Evening" (evening = 12:00 onward) or left
+  blank -- a simple planner-set label, not a computed rotation. The
+  driver's actual first-job time each day comes out of the plan itself
+  and is reported back afterward, never fixed in advance.
+- The daily ceiling is now `max_working_hours_per_day`, a real per-driver
+  field (paired with `working_hours_per_day`, e.g. 9/12), both hard
+  rules. Leaving it blank falls back to zero daily overtime (fail-closed),
+  matching the same precedent as a blank monthly overtime cap.
+- New: a driver used at all on a given day must reach at least their
+  `working_hours_per_day` that day (hard minimum). Since the engine
+  assigns jobs one at a time and can't know a driver's full-day total
+  until the day's last job is considered, this is enforced as a repair
+  pass after normal allocation: an under-minimum driver's jobs are moved
+  to another qualifying driver with room, or released as unresolved (with
+  a clear note) if nobody has room -- never silently kept as an illegal
+  short day. See the project spec (HR-002, HR-005, SS-001..SS-003) for
+  the full write-up and open follow-ups.
 
 **Suppliers now have structured offerings** (Suppliers tab): vehicle
 type + rate/hour + max available/day, one row per type a supplier
@@ -184,5 +209,7 @@ by driver/supplier via a dropdown (groups "SAME X" with "X").
 reverting, which could flash contents briefly.
 
 **Still to do**: PDF export (likely via Excel COM automation/pywin32
-since you're on Windows), driver shift rotation derived from history,
-vehicle maintenance log, and the daily driver/supplier shortlist toggle.
+since you're on Windows), vehicle maintenance log, the daily driver/supplier
+shortlist toggle, and (optional follow-up) reporting each driver's actual
+first-job time per day back to them once a day is finalized -- the data
+is already there in the plan, just not surfaced in export/digest yet.

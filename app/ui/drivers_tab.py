@@ -13,7 +13,7 @@ just context for the AI's judgment (not a hard constraint).
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QLineEdit, QInputDialog, QMessageBox, QSplitter,
-    QFormLayout
+    QFormLayout, QComboBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -69,12 +69,22 @@ class DriversTab(QWidget):
         form = QFormLayout()
 
         self.working_hours_input = QLineEdit()
-        self.working_hours_input.setPlaceholderText("e.g. 8")
+        self.working_hours_input.setPlaceholderText("e.g. 9  (normal full day)")
         form.addRow("Working hours per day:", self.working_hours_input)
 
-        self.shift_start_input = QLineEdit()
-        self.shift_start_input.setPlaceholderText("e.g. 07:00 AM")
-        form.addRow("Shift start:", self.shift_start_input)
+        self.max_working_hours_input = QLineEdit()
+        self.max_working_hours_input.setPlaceholderText("e.g. 12  (hard daily ceiling incl. overtime; blank = same as working hours, i.e. no overtime)")
+        form.addRow("Max working hours per day:", self.max_working_hours_input)
+
+        # HR-002 rework: the planner just marks the driver morning or
+        # evening -- not an exact clock time. The actual first-job time
+        # for a given day comes out of the plan itself and is reported to
+        # the driver afterward, never fixed in advance.
+        self.shift_period_input = QComboBox()
+        self.shift_period_input.addItem("(No restriction)", None)
+        self.shift_period_input.addItem("Morning (before 12:00)", "morning")
+        self.shift_period_input.addItem("Evening (12:00 onward)", "evening")
+        form.addRow("Shift:", self.shift_period_input)
 
         self.off_days_input = QLineEdit()
         self.off_days_input.setPlaceholderText("e.g. friday  (or friday,saturday)")
@@ -187,16 +197,19 @@ class DriversTab(QWidget):
         self._load_form(self.current_driver_id)
 
     def _clear_form(self):
-        for field in [self.working_hours_input, self.shift_start_input, self.off_days_input,
+        for field in [self.working_hours_input, self.max_working_hours_input, self.off_days_input,
                       self.max_overtime_input, self.monthly_target_input, self.license_types_input]:
             field.clear()
+        self.shift_period_input.setCurrentIndex(0)
         self.notes_list.clear()
         self.month_hours_label.setText("")
 
     def _load_form(self, driver_id):
         row = self.conn.execute("SELECT * FROM drivers WHERE id = ?", (driver_id,)).fetchone()
         self.working_hours_input.setText(str(row["working_hours_per_day"]) if row["working_hours_per_day"] is not None else "")
-        self.shift_start_input.setText(row["shift_start"] or "")
+        self.max_working_hours_input.setText(str(row["max_working_hours_per_day"]) if row["max_working_hours_per_day"] is not None else "")
+        shift_period_index = self.shift_period_input.findData(row["shift_period"])
+        self.shift_period_input.setCurrentIndex(shift_period_index if shift_period_index >= 0 else 0)
         self.off_days_input.setText(row["off_days"] or "")
         self.max_overtime_input.setText(str(row["max_overtime_hours_per_month"]) if row["max_overtime_hours_per_month"] is not None else "")
         self.monthly_target_input.setText(str(row["total_hours_per_month_target"]) if row["total_hours_per_month_target"] is not None else "")
@@ -230,6 +243,7 @@ class DriversTab(QWidget):
         if self.current_driver_id is None:
             return
         working_hours = self._parse_float_or_none(self.working_hours_input.text())
+        max_working_hours = self._parse_float_or_none(self.max_working_hours_input.text())
         max_overtime = self._parse_float_or_none(self.max_overtime_input.text())
         monthly_target = self._parse_float_or_none(self.monthly_target_input.text())
         off_days = [d.strip().lower() for d in self.off_days_input.text().split(",") if d.strip()]
@@ -238,11 +252,12 @@ class DriversTab(QWidget):
         db.set_driver_hard_rules(
             self.conn, self.current_driver_id,
             working_hours_per_day=working_hours,
-            shift_start=self.shift_start_input.text().strip() or None,
+            shift_period=self.shift_period_input.currentData(),
             off_days=off_days,
             max_overtime_hours_per_month=max_overtime,
             total_hours_per_month_target=monthly_target,
             license_types=license_types,
+            max_working_hours_per_day=max_working_hours,
         )
         QMessageBox.information(self, "Saved", "Hard rules saved.")
 

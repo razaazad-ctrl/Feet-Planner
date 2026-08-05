@@ -72,7 +72,12 @@ Finalize/Export).
 ```
 DriverProfile
 ├── id, name                                   # from drivers table
-├── working_hours_per_day, shift_start          # structured hard rules
+├── working_hours_per_day, max_working_hours_per_day  # structured hard rules
+│                                                  (normal day / hard daily ceiling --
+│                                                  see HR-002 rework, 2026-08-03)
+├── shift_period: str | None                    # 'morning' | 'evening' | None
+│                                                  (replaces the old shift_start
+│                                                  exact-time field -- see Section 6)
 ├── license_types: list[str]
 ├── off_days: list[str]
 ├── max_overtime_hours_per_month
@@ -227,7 +232,7 @@ intermediate controller/presenter class.
 ```
 allocate(jobs, drivers, vehicles, supplier_offerings,
          allowed_driver_ids=None, allowed_supplier_ids=None,
-         allow_override_days=None, travel_buffer_minutes=30):
+         allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES  # 0, see below):
 
   sort jobs by start_dt (unparsed jobs -> flagged unresolved immediately)
 
@@ -245,17 +250,22 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
     candidates = [d for d in driver_pool if:
         d qualifies for job.vehicle_type_required (exact license_types match)
         AND NOT d is off that weekday (off_days, unless overridden)
-        AND NOT job starts before d.shift_start (parsed from free text like
-            "07:00 AM" or "18:00"; unparseable/blank = no restriction)
-        AND NOT d has a time-overlapping (with 30-min buffer) existing job
+        AND job's time-of-day matches d.shift_period ('morning' = before
+            12:00, 'evening' = 12:00 onward, None = no restriction -- see
+            HR-002 rework, Section 6; replaces the old exact-time
+            shift_start check)
+        AND NOT d has a time-overlapping (with the travel buffer, 0 by
+            default as of 2026-08-03 -- see TB-001) existing job
             -- UNLESS the overlapping job belongs to this SAME group_key,
                in which case overlap is allowed (see "Same Driver" note below)
         AND (if d.working_hours_per_day is set) the day's cumulative
-             overtime-so-far (across every job already given to this
-             driver today) plus this job's contribution does not exceed
-             MAX_OVERTIME_HOURS_PER_DAY (a hard, fixed daily ceiling --
-             currently 2.0h -- checked FIRST, regardless of how much
-             monthly overtime budget remains)
+             hours-so-far (across every job already given to this driver
+             today) plus this job's contribution does not exceed
+             d.max_working_hours_per_day (a hard, PER-DRIVER, planner-set
+             daily ceiling -- falls back to d.working_hours_per_day, i.e.
+             zero daily overtime, if left blank; see HR-002 rework,
+             Section 6 -- replaces the old fixed
+             MAX_OVERTIME_HOURS_PER_DAY=2.0 module constant)
              AND adding this job would not push d.month_overtime_so_far +
              today's projected overtime over d.max_overtime_hours_per_month
              -- OR, if no monthly overtime cap is configured at all for
@@ -311,6 +321,40 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
       label = hire.label   # bare name if instance_number==1, else "NAME {n-1}"
       assign; continue
 
+  # ---- POST-PASS: gap-filling (OPT-002/003, added 2026-08-03) ----
+  # Runs after every job above has been through the in-house/supplier
+  # pass, and BEFORE the minimum-hours repair pass below (filling a gap
+  # adds hours to that driver, which can itself resolve an under-minimum
+  # day without any reassignment needed). Confirmed real-world trigger:
+  # a driver ends up with jobs at 13:00-15:00 and 22:00-01:00 (a 12h span
+  # for 5h of work) while a 16:00-20:00 job that fits the gap is left
+  # unresolved -- can't be fixed inside the main loop above since jobs
+  # are processed in strict start-time order, so the LATER of a gap's two
+  # bounding jobs isn't assigned yet when an earlier job that would sit in
+  # that gap is being considered. For every still-fully-unresolved job
+  # (no driver AND no supplier), check every driver for a genuine bounded
+  # gap (an existing job before AND after, with the travel buffer) that
+  # the job fits into, respecting every other hard rule, and assign it
+  # there instead of leaving it unresolved. Does NOT reclaim a job
+  # already given to a supplier.
+  fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, ...)
+
+  # ---- POST-PASS: daily-minimum-hours repair (HR-005, added 2026-08-03) ----
+  # Runs after every job above has been through the in-house/supplier pass.
+  # A driver used at all on a given day must reach at least
+  # working_hours_per_day that day -- this can't be a per-job filter like
+  # the daily ceiling above, since the engine doesn't know a driver's
+  # full-day total until the day's last job has been considered. For every
+  # (day, driver) left with a non-zero, under-minimum total: try to move
+  # ALL of that driver's jobs that day to another qualifying driver with
+  # spare room (same license/off-day/shift/overlap/ceiling/monthly-cap
+  # rules as above). If every job can move, commit the move. If even one
+  # can't, release the WHOLE day back to unresolved with a clear note --
+  # never leave a partial illegal day in place. Repeats up to 5 passes
+  # (fixing one driver can free room that fixes another). Scope: skips
+  # jobs inside a "Same Driver" group (left alone, planner-flagged).
+  repeat up to 5 times: repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, ...)
+
   return jobs  # mutated in place, also returned for convenience
 ```
 
@@ -339,14 +383,16 @@ owner before implementing (do not change without re-confirming):
    exhausted, off day, etc). In real test data this naturally reproduces
    both a vehicle-type split and an hours-driven split, whichever the
    actual constraint is, without guessing which one applies.
-3. Known, documented simplification: `occupied_seconds` and the monthly
-   overtime projection still SUM every row's duration even when two rows
-   in the same group overlap in time, rather than computing a true
-   elapsed-time union. This can overstate a driver's real occupied hours
-   for overlapping same-group rows but never understates them — an
-   intentional, safety-conservative choice (Rule 6: driver hour limits
-   are a hard constraint), not an oversight. Revisit only as a deliberate
-   follow-up if it starts producing noticeably wrong fairness ranking.
+3. `occupied_seconds` and the monthly overtime projection use the TRUE
+   UNION of a driver's time intervals (`_merged_hours()`), not a naive
+   sum -- two rows in the same group that overlap in time (e.g. two
+   simultaneous pickups on one truck) count once, not once each. This was
+   originally a documented simplification (sum, deliberately erring
+   toward overstating hours per Rule 6) but real PLANNED.xlsx data
+   confirmed 2026-08-03 that the overstatement was large enough to
+   falsely trip the daily ceiling in routine cases (one real driver:
+   ~17h "occupied" vs. ~11h true) -- fixed the same day. See
+   CHANGELOG_AI.md Phase 12.
 
 ## 6. Data flow diagram (text form)
 
