@@ -398,7 +398,24 @@ def _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buff
     return filled_any
 
 
-def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days):
+def _established_group_vehicle_type(jobs, driver_id, group_key):
+    """Returns the vehicle_type_required already used by this driver for
+    this Same-Driver group (from any job already assigned to them, group-
+    wide, not just today), or None if they have no rows in this group yet.
+    Used by the widened HR-005 repair pass (2026-08-04) so a group being
+    moved onto a new driver still respects the SD-004 rule -- a driver
+    can't be put on two different vehicle types at once just because both
+    rows share a group tag."""
+    if not group_key:
+        return None
+    for j in jobs:
+        if j.assigned_driver_id == driver_id and _group_key_of(j) == group_key:
+            return j.vehicle_type_required
+    return None
+
+
+def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days,
+                                 settled_job_ids=None):
     """HR-002 rework: a driver who is used at all on a given day must reach
     at least their configured working_hours_per_day that day. The main
     allocation pass above can't guarantee this directly (it assigns jobs
@@ -412,8 +429,16 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
     moving only some of the jobs would just create a different
     under-minimum day rather than fixing anything.
 
-    Scope: only touches jobs with no "Same Driver" group tag. Grouped jobs
-    are an explicit planner instruction and are left alone.
+    Scope (widened 2026-08-04): can now move a driver's grouped ("Same
+    Driver") jobs too, not just ungrouped ones -- confirmed with the
+    project owner as a real fix, not an assumption, after a day where 84%
+    of rows were flagged meant this pass almost never ran at all (see
+    CHANGELOG_AI.md). A whole group is always moved to ONE new driver
+    together (never split across the move) and SD-004 vehicle-type
+    consistency is still enforced on the new driver. If no single driver
+    can legally take the group, the day is still released to unresolved,
+    same as before -- this remains a real, expected outcome sometimes,
+    not a bug.
 
     This is a greedy, best-effort heuristic, not a global optimizer -- it
     can leave a fixable case unfixed if an earlier move in the same pass
@@ -436,10 +461,27 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
     individually legal but together silently exceed that driver's daily
     ceiling.
 
+    settled_job_ids: a set of Python id(job) values, shared across every
+    call within one allocate() run (see the 2026-08-04 note below). Once a
+    job has been moved by this function, its id is added here and it is
+    never moved again for the rest of this run. WITHOUT this, widening the
+    scope to grouped days (2026-08-04) caused real thrashing: a short
+    group would be moved onto a driver with room, but that driver's OWN
+    day (now including the freshly-received group) could itself look
+    under-minimum to the next pass, so a DIFFERENT group would get moved
+    onto them next, and so on -- groups visibly bounced between drivers
+    across the 5-pass loop instead of settling. Marking moved jobs as
+    settled trades a small amount of theoretical optimality (a group
+    moved early might not be the best possible final placement) for a
+    guaranteed, deterministic stop -- consistent with this function's
+    documented "best-effort heuristic, not a global optimizer" framing.
+
     Returns True if anything changed (so the caller knows whether another
     pass might help), False otherwise.
     """
     allow_override_days = allow_override_days or {}
+    if settled_job_ids is None:
+        settled_job_ids = set()
     driver_by_id = {d.id: d for d in driver_pool}
     vehicle_by_id = {v.id: v for v in vehicle_pool}
 
@@ -470,91 +512,166 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
         if total_hours <= 1e-9 or total_hours >= driver.working_hours_per_day - 1e-9:
             continue  # unused, already fixed by an earlier pair in this pass, or already meets the minimum
 
-        # If any of the driver's jobs that day are inside a "Same Driver"
-        # group, this day can't be fixed: those jobs are an explicit
-        # planner instruction and are never moved (see docstring scope).
-        # Moving only the ungrouped remainder would never help here --
-        # the group's own hours are what's driving the shortfall, or at
-        # best moving the rest away only makes the driver's day smaller.
-        # Confirmed against a real PLANNED.xlsx that this is a genuine,
-        # accepted real-world pattern (a driver's day built almost
-        # entirely from one flagged group's hours, under the 9h baseline,
-        # with no legal way to top it up) -- not a bug to "fix" by force.
-        if any(_group_key_of(j) for j in all_day_jobs):
+        # Stability guard (2026-08-04) -- see settled_job_ids note above.
+        # If any job here was already moved earlier in this same run, this
+        # day is considered settled: leave it exactly as the earlier move
+        # placed it, even if it's still technically under-minimum. This is
+        # what stops groups from being bounced between drivers pass after
+        # pass without ever converging.
+        if any(id(j) in settled_job_ids for j in all_day_jobs):
             continue
 
-        day_jobs = all_day_jobs  # all ungrouped, confirmed above
+        # WIDENED 2026-08-04 (project owner confirmed, see CHANGELOG_AI.md):
+        # grouped ("Same Driver") days used to be skipped entirely here --
+        # confirmed against a real PLANNED.xlsx as sometimes genuinely
+        # unfixable (a group's own hours ARE the shortfall). But on a
+        # dataset where most rows carry a Same Driver tag, that skip meant
+        # this whole repair pass rarely ran at all, and severe imbalance
+        # (some drivers at 2h, others near their ceiling) went completely
+        # unaddressed. Now grouped days are attempted too: the WHOLE
+        # group is moved together onto one new driver where possible
+        # (never split across the move, since that would break the
+        # planner's explicit "same driver" instruction), respecting every
+        # hard rule including SD-004 vehicle-type consistency. If the move
+        # genuinely isn't feasible (no single driver can take the whole
+        # group), the day is released to unresolved exactly as before --
+        # this is still a real possibility and not treated as a bug.
+        day_jobs = all_day_jobs
         moves = []  # (job, new_driver, new_vehicle)
         feasible = True
         # Tracks hours/intervals tentatively added to a candidate driver
         # within THIS batch, before anything is actually committed -- see
-        # correctness note (2) above.
+        # correctness note (2) above. Intervals are tagged with each job's
+        # own group_key (not always None) so the same-group overlap
+        # relaxation still applies correctly to later jobs in this batch.
         tentative_intervals = {}
         tentative_vehicle_intervals = {}
+        # group_key -> driver.id already chosen for this group WITHIN this
+        # batch -- tried first for the group's later rows, so a group
+        # being moved lands on as few new drivers as possible (mirrors
+        # SD-002/SD-003 in the main pass) instead of fragmenting.
+        tentative_group_leader = {}
+
+        tentative_group_vehicle = {}  # (driver_id, group_key) -> vehicle_type_required
+
+        def tentative_group_vehicle_for(new_driver_id, group_key):
+            if (new_driver_id, group_key) in tentative_group_vehicle:
+                return tentative_group_vehicle[(new_driver_id, group_key)]
+            return _established_group_vehicle_type(jobs, new_driver_id, group_key)
+
+        def _driver_is_feasible_for(d, job, group_key):
+            """Returns (True, effective_group_key) if d can legally take this
+            job right now (given tentative state so far in this batch), or
+            (False, None) if not. effective_group_key is the group_key to
+            use for the overlap check -- None means "no group relaxation",
+            which is a normal, successful outcome for an ungrouped job or
+            for a grouped job whose vehicle type doesn't match what d
+            already has established for that group (SD-004)."""
+            if d.id == driver_id:
+                return False, None  # can't move a job back onto the driver we're trying to fix
+            if not _driver_qualifies_for_type(d, job.vehicle_type_required):
+                return False, None
+            if _driver_is_off(d, day, allow_override_days):
+                return False, None
+            if not _job_matches_shift_period(job.start_dt, d.shift_period):
+                return False, None
+            established_type = tentative_group_vehicle_for(d.id, group_key) if group_key else None
+            vehicle_type_consistent = established_type is None or _type_matches(job.vehicle_type_required, established_type)
+            effective_group_key = group_key if (group_key and vehicle_type_consistent) else None
+            combined_busy = d.busy_intervals + tentative_intervals.get(d.id, [])
+            if _overlaps_with_buffer(combined_busy, job.start_dt, job.end_dt,
+                                      travel_buffer_minutes, ignore_group_key=effective_group_key):
+                return False, None
+            if d.working_hours_per_day is not None:
+                projected = _merged_hours(combined_busy + [(job.start_dt, job.end_dt)])
+                ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
+                if projected > ceiling + 1e-9:
+                    return False, None
+                overtime = max(0.0, projected - d.working_hours_per_day)
+                if d.max_overtime_hours_per_month is not None:
+                    if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
+                        return False, None
+                elif overtime > 0:
+                    return False, None
+            return True, effective_group_key
+
         for job in day_jobs:
+            job_group_key = _group_key_of(job)
             new_driver = None
-            for d in driver_pool:
-                if d.id == driver_id:
-                    continue
-                if not _driver_qualifies_for_type(d, job.vehicle_type_required):
-                    continue
-                if _driver_is_off(d, day, allow_override_days):
-                    continue
-                if not _job_matches_shift_period(job.start_dt, d.shift_period):
-                    continue
-                combined_busy = d.busy_intervals + tentative_intervals.get(d.id, [])
-                if _overlaps_with_buffer(combined_busy, job.start_dt, job.end_dt, travel_buffer_minutes):
-                    continue
-                if d.working_hours_per_day is not None:
-                    projected = _merged_hours(combined_busy + [(job.start_dt, job.end_dt)])
-                    ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
-                    if projected > ceiling + 1e-9:
-                        continue
-                    overtime = max(0.0, projected - d.working_hours_per_day)
-                    if d.max_overtime_hours_per_month is not None:
-                        if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
-                            continue
-                    elif overtime > 0:
-                        continue
-                new_driver = d
-                break
+            effective_group_key = None
+
+            # Prefer whichever driver this batch already picked for the
+            # SAME group, if they still qualify -- keeps the group intact
+            # on one driver instead of fragmenting it across the move.
+            if job_group_key and job_group_key in tentative_group_leader:
+                preferred = driver_by_id.get(tentative_group_leader[job_group_key])
+                if preferred is not None:
+                    ok, egk = _driver_is_feasible_for(preferred, job, job_group_key)
+                    if ok:
+                        new_driver, effective_group_key = preferred, egk
+
+            if new_driver is None:
+                # Search in least-occupied-first order, not driver_pool's
+                # natural (alphabetical) order (fixed 2026-08-04). Picking
+                # the first alphabetical match meant a driver who simply
+                # hadn't had their own turn processed yet in this same
+                # pass could look "busy" and get skipped in favor of one
+                # who happened to already be freed moments earlier by an
+                # unrelated fix -- a real, observed processing-order
+                # artifact, not a fairness decision. Ranking by current
+                # occupied hours picks the genuinely freest qualifying
+                # driver regardless of iteration order.
+                for d in sorted(driver_pool, key=lambda x: x.occupied_seconds):
+                    ok, egk = _driver_is_feasible_for(d, job, job_group_key)
+                    if ok:
+                        new_driver, effective_group_key = d, egk
+                        break
+
             if new_driver is None:
                 feasible = False
                 break
+
             new_vehicle = None
             if _vehicle_type_needs_vehicle(job.vehicle_type_required):
                 for v in vehicle_pool:
                     combined_vehicle_busy = v.busy_intervals + tentative_vehicle_intervals.get(v.id, [])
                     if _type_matches(job.vehicle_type_required, v.vehicle_type) and not _overlaps_with_buffer(
-                            combined_vehicle_busy, job.start_dt, job.end_dt, travel_buffer_minutes):
+                            combined_vehicle_busy, job.start_dt, job.end_dt,
+                            travel_buffer_minutes, ignore_group_key=job_group_key):
                         new_vehicle = v
                         break
                 if new_vehicle is None:
                     feasible = False
                     break
-                tentative_vehicle_intervals.setdefault(new_vehicle.id, []).append((job.start_dt, job.end_dt, None))
-            tentative_intervals.setdefault(new_driver.id, []).append((job.start_dt, job.end_dt, None))
-            moves.append((job, new_driver, new_vehicle))
+                tentative_vehicle_intervals.setdefault(new_vehicle.id, []).append((job.start_dt, job.end_dt, job_group_key))
+            tentative_intervals.setdefault(new_driver.id, []).append((job.start_dt, job.end_dt, job_group_key))
+            if job_group_key:
+                tentative_group_leader[job_group_key] = new_driver.id
+                tentative_group_vehicle[(new_driver.id, job_group_key)] = job.vehicle_type_required
+            moves.append((job, new_driver, new_vehicle, job_group_key))
 
         def _release(job):
-            driver.busy_intervals = [iv for iv in driver.busy_intervals if iv != (job.start_dt, job.end_dt, None)]
+            tag = _group_key_of(job)
+            driver.busy_intervals = [iv for iv in driver.busy_intervals if iv != (job.start_dt, job.end_dt, tag)]
             driver.occupied_seconds = _merged_hours(driver.busy_intervals) * 3600.0
             old_vehicle = vehicle_by_id.get(job.assigned_vehicle_id)
             if old_vehicle:
-                old_vehicle.busy_intervals = [iv for iv in old_vehicle.busy_intervals if iv != (job.start_dt, job.end_dt, None)]
+                old_vehicle.busy_intervals = [iv for iv in old_vehicle.busy_intervals if iv != (job.start_dt, job.end_dt, tag)]
 
         if feasible:
-            for job, new_driver, new_vehicle in moves:
+            for job, new_driver, new_vehicle, job_group_key in moves:
                 _release(job)
                 job.assigned_driver_id = new_driver.id
                 job.assigned_driver_name = new_driver.name
                 job.assigned_vehicle_id = new_vehicle.id if new_vehicle else None
                 job.assigned_vehicle_plate = new_vehicle.plate if new_vehicle else ""
-                job.assignment_note = f"In-house: {new_driver.name} [reassigned to meet {driver.name}'s daily minimum]"
-                new_driver.busy_intervals.append((job.start_dt, job.end_dt, None))
+                group_note = " [Same Driver group]" if job_group_key else ""
+                job.assignment_note = f"In-house: {new_driver.name} [reassigned to meet {driver.name}'s daily minimum]{group_note}"
+                new_driver.busy_intervals.append((job.start_dt, job.end_dt, job_group_key))
                 new_driver.occupied_seconds = _merged_hours(new_driver.busy_intervals) * 3600.0
                 if new_vehicle:
-                    new_vehicle.busy_intervals.append((job.start_dt, job.end_dt, None))
+                    new_vehicle.busy_intervals.append((job.start_dt, job.end_dt, job_group_key))
+                settled_job_ids.add(id(job))
             changed = True
         else:
             for job in day_jobs:
@@ -654,6 +771,28 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
     group_drivers = {}          # group_key -> [DriverProfile, ...] in first-used order
     group_vehicle_by_driver = {}  # (group_key, driver_id) -> VehicleProfile last used for this driver in this group
     group_supplier_hires = {}   # group_key -> [SupplierHire, ...] already used for this group
+
+    # NEW (2026-08-04): projected fairness for picking a group's FIRST
+    # driver. Confirmed with the project owner as a real problem, not a
+    # guess: on a real day where most rows carry a Same Driver tag, the
+    # old rule ("pick whoever has fewest occupied hours RIGHT NOW") only
+    # looks at the single opening row of a group -- it has no idea whether
+    # that group is a 2h errand or an 11h event. A driver who happens to
+    # be idle when a big group starts can end up carrying that whole
+    # group while everyone else stays comparatively empty, and there is
+    # no mechanism to reconsider once picked (SD-002/SD-003 lock the group
+    # to that driver from then on). Precomputing each group's total merged
+    # hours up front lets the initial pick account for the WHOLE group's
+    # likely load, not just its first row -- a real look-ahead instead of
+    # a one-instant snapshot. This does not change anything for jobs with
+    # no group, or for a group's SECOND+ row (which still prefers staying
+    # on the group's already-established driver per SD-002/SD-003).
+    group_total_hours = {}
+    for j in jobs:
+        gk = _group_key_of(j)
+        if gk and j.start_dt and j.end_dt:
+            group_total_hours.setdefault(gk, []).append((j.start_dt, j.end_dt))
+    group_total_hours = {gk: _merged_hours(spans) for gk, spans in group_total_hours.items()}
 
     for job in sorted(jobs, key=lambda j: j.start_dt or j.row_number):
         if job.start_dt is None or job.end_dt is None:
@@ -768,8 +907,18 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
             # takes priority; this heuristic only kicks in once there's no
             # group to defer to.
             group_candidates = [d for d in candidates if group_key and d in group_drivers.get(group_key, [])]
-            if group_candidates or group_key:
-                chosen_driver = min(group_candidates or candidates, key=lambda d: d.occupied_seconds)
+            if group_candidates:
+                # Group already has a leader for this job's type -- keep it
+                # (SD-002/SD-003), same as before.
+                chosen_driver = min(group_candidates, key=lambda d: d.occupied_seconds)
+            elif group_key:
+                # Fresh group: project each candidate's occupied hours PLUS
+                # this group's total estimated hours, not just this row's --
+                # see the group_total_hours note above. Falls back to
+                # job_hours if the group's total wasn't precomputed for any
+                # reason (defensive only, should always be present).
+                projected_group_hours = group_total_hours.get(group_key, job_hours)
+                chosen_driver = min(candidates, key=lambda d: d.occupied_seconds + projected_group_hours * 3600.0)
             else:
                 chosen_driver = min(candidates, key=lambda d: (-len(d.license_types), d.occupied_seconds))
 
@@ -912,8 +1061,10 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
     # fix can free up room that makes another fix possible. See
     # _repair_minimum_daily_hours() docstring for what this does and does
     # not guarantee.
+    settled_job_ids = set()  # see _repair_minimum_daily_hours docstring -- stops groups thrashing between drivers
     for _ in range(5):
-        if not _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days):
+        if not _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes,
+                                            allow_override_days, settled_job_ids=settled_job_ids):
             break
 
     return jobs
