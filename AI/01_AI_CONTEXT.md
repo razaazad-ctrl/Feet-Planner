@@ -218,26 +218,49 @@ saw a rule it could enforce). The current model:
   daily ceiling or the new daily minimum, which are independent of
   history.
 - **Daily minimum hours (new 2026-08-03, HR-005 in the scheduling rules
-  spec).** A driver used at all on a given day must reach at least
-  `working_hours_per_day` that day. This can't be a simple per-job
-  filter the way the daily ceiling is -- the engine assigns jobs one at
-  a time in time order and doesn't know a driver's full-day total until
-  the day's last job has been considered. It's enforced instead as a
-  post-allocation repair pass (`allocation_engine._repair_minimum_daily_hours`,
-  run in a loop up to 5 times): for every driver left with a non-zero,
-  under-minimum day, it tries to move ALL of that driver's jobs for that
-  day to another qualifying driver with spare room (same license/off-
-  day/shift/overlap/ceiling/monthly-cap checks as the main pass). If
-  every job can move, the move is committed; if even one can't, the
-  whole day is released to unresolved with an explicit note rather than
-  silently keeping an illegal short day. Scoped to skip jobs inside a
-  "Same Driver" group (planner-flagged, left alone), and doesn't attempt
-  a supplier fallback (flagged for manual review instead -- that's a
-  planner cost decision, not one this pass should make on its own).
+  spec; WIDENED 2026-08-06, see CHANGELOG_AI.md Phase 14).** A driver used
+  at all on a given day must reach at least `working_hours_per_day` that
+  day. This can't be a simple per-job filter the way the daily ceiling is
+  -- the engine assigns jobs one at a time in time order and doesn't know
+  a driver's full-day total until the day's last job has been considered.
+  It's enforced instead as a post-allocation repair pass
+  (`allocation_engine._repair_minimum_daily_hours`, run in a loop up to 5
+  times): for every driver left with a non-zero, under-minimum day, it
+  tries to move ALL of that driver's jobs for that day to another
+  qualifying driver with spare room (same license/off-day/shift/overlap/
+  ceiling/monthly-cap checks as the main pass). If every job can move, the
+  move is committed; if even one can't, the whole day is released to
+  unresolved with an explicit note rather than silently keeping an illegal
+  short day.
+  **2026-08-06 update:** this pass originally skipped ANY day containing a
+  "Same Driver" grouped job entirely (planner-flagged, left alone). That
+  was correct in principle -- a group's own hours are sometimes genuinely
+  the cause of a shortfall and shouldn't be force-split -- but on a real
+  day where 84% of rows were grouped, it meant this pass almost never ran
+  at all, and severe hour imbalance went completely unaddressed. Confirmed
+  with the project owner and widened: a grouped day can now be moved WHOLE
+  onto one other qualifying driver (never split, so the "same driver"
+  instruction is still honored), with SD-004 vehicle-type consistency
+  enforced on the receiving driver via a new helper,
+  `_established_group_vehicle_type()`. Still doesn't attempt a supplier
+  fallback (flagged for manual review instead -- that's a planner cost
+  decision, not one this pass should make on its own).
   **Known limitation, disclosed to and accepted by the project owner:**
-  this is a best-effort greedy heuristic, not a global optimizer, and
-  has only been validated against small synthetic scenarios so far, not
-  a real day's full job volume.
+  this is a best-effort greedy heuristic, not a global optimizer. Widening
+  it to move whole groups initially caused a real, observed thrashing bug
+  (a short group moved onto a driver with room could make THAT driver's
+  own day look under-minimum to the next pass, triggering yet another
+  group to bounce onto them) -- fixed with a `settled_job_ids` stability
+  guard (a job, once moved, is never moved again within the same
+  `allocate()` call). A second, smaller processing-order bug (the search
+  for a new driver picked the first alphabetical match rather than the
+  most-free one) was also found and fixed the same session. Validated
+  against the real `UNPLANNED.xlsx` + `fleetplanner.db`: driver-hour
+  spread went from 2.0h-16.0h to 4.0h-11.0h on the same real day (human
+  reference: 5.0h-12.0h). Not yet full parity -- a few drivers can still
+  land under minimum or fully idle, as an artifact of greedy processing
+  order, not a further known bug. See CHANGELOG_AI.md Phase 14 for the
+  full root-cause writeup.
 
 ### Shift enforcement (redesigned 2026-08-03, see CHANGELOG_AI.md Phase 10)
 **The model described here changed completely this session.** The
@@ -313,10 +336,27 @@ planner instruction (Rule 3/9), not a judgment call. Confirmed rules
   when no driver is licensed for every vehicle type in the group, and a
   regression check confirming normal (unflagged) overlapping jobs still
   conflict as before.
-- Documented simplification: hour totals still SUM every row's duration
-  even when two same-group rows overlap (doesn't compute a true
-  elapsed-time union) -- overstates rather than understates occupied
-  hours, which is the safe direction given Rule 6.
+- **Group-leader selection now looks ahead (added 2026-08-06, SD-005 in
+  the scheduling rules spec).** A fresh group's opening row used to pick
+  its driver purely by who had the fewest occupied hours AT THAT INSTANT
+  -- with no idea whether the group about to land on them was a 2h errand
+  or an 11h event, and no way to reconsider once picked (see SD-002/
+  SD-003 below). Confirmed as a real driver of hour imbalance on a real
+  day. Each group's total merged hours are now precomputed once before
+  the main loop, and a fresh group's opening row picks whichever
+  candidate minimizes `occupied_seconds + the group's projected total
+  hours`, not just the opening row's own duration. A group's second and
+  later rows are unaffected -- they still prefer the group's
+  already-established driver first.
+- Hour totals use the TRUE UNION of a driver's time intervals
+  (`_merged_hours()`), not a naive sum -- two rows in the same group that
+  overlap in time (e.g. two simultaneous pickups on one truck) count
+  once, not once each. This was originally a documented simplification
+  (sum, deliberately erring toward overstating hours per Rule 6) but real
+  `PLANNED.xlsx` data confirmed 2026-08-03 the overstatement was large
+  enough to falsely trip the daily ceiling in routine cases (one real
+  driver: ~17h "occupied" vs. ~11h true) -- fixed the same day. See
+  CHANGELOG_AI.md Phase 12.
 - `export.py` was fixed at the same time to read a new clean
   `Job.assigned_driver_name` field instead of parsing the driver's name
   back out of `assignment_note` -- `assignment_note` is now allowed to
@@ -562,6 +602,93 @@ retyped from memory.
     validated against real full-day volume -- see Section 12 below and
     `NEXT_SESSION.md`.
 
+13. **HR-005 essentially defeated on real data by its own "skip grouped
+    days" scope, 2026-08-06.** The project owner reported the software
+    still wasn't reproducing the balance in a real human-planned
+    `PLANNED.xlsx` (some drivers at 12h, others at 2h). Confirmed by
+    cloning the real repo and running `allocate()` against the real
+    `UNPLANNED.xlsx` + `fleetplanner.db`: 84% of that day's rows carried
+    a "Same Driver" tag, and HR-005's repair pass unconditionally skipped
+    any driver-day containing a grouped job -- correct in principle (see
+    item 12 and Phase 12), but on a day this heavily grouped it meant the
+    pass almost never ran at all. Fixed with two changes approved
+    together by the project owner (Rule 16 -- asked, not assumed): (a) a
+    fresh "Same Driver" group's opening row now picks its driver by
+    projecting the group's TOTAL merged hours, not just the opening row's
+    duration (SD-005 in the scheduling rules spec); (b) HR-005's repair
+    pass can now move a grouped day WHOLE onto one other qualifying
+    driver (never split), with SD-004 vehicle-type consistency enforced
+    on the receiving driver via `_established_group_vehicle_type()`.
+    **Two further real bugs found and fixed while building this, before
+    reaching the project owner:** widening the repair pass to move whole
+    groups caused genuine thrashing -- a short group moved onto a driver
+    with room could make that driver's own day look under-minimum to the
+    very next pass, so a different group got moved onto them next, and so
+    on, never settling (caught by tracing driver state pass-by-pass
+    against the real file). Fixed with a `settled_job_ids` stability
+    guard: once the repair pass moves a job, it's never moved again
+    within the same `allocate()` call. Separately, the repair pass's
+    search for a new driver picked the first alphabetically-listed
+    eligible driver rather than the most-free one, which on real data
+    meant a driver who simply hadn't had their own fix processed YET in
+    the same pass could get skipped in favor of one freed moments earlier
+    by an unrelated move -- fixed by searching least-occupied-first.
+    Real-data result: driver-hour spread went from 2.0h-16.0h to
+    4.0h-11.0h on the same real day (human reference: 5.0h-12.0h) -- a
+    real, verified improvement, though not yet full parity; a few
+    drivers can still land under minimum or fully idle as a processing-
+    order artifact of the greedy heuristic, disclosed honestly rather
+    than overstated. Full write-up: `CHANGELOG_AI.md` Phase 14,
+    scheduling rules spec v10 (SD-005, updated HR-005/SE-003, NEW-008).
+    A separate, unrelated data-quality issue was also surfaced in the
+    same investigation and flagged (not fixed): one driver's
+    `license_types` contains a literal embedded newline before
+    "(with lift)", silently defeating exact-string matching the same way
+    the documented "Seated" vs "Seater" case did -- see NEW-008 and
+    Section 6/9's existing exact-matching precedent.
+
+14. **Two new allocation strategies built and compared, idle-driver
+    rescue added, and the newline data issue turned out to be
+    fleet-wide, 2026-08-06 (same day as item 13).** After item 13, the
+    project owner raised two structural concerns: "Same Driver" grouping
+    felt like it was ruling the allocation rather than assisting it
+    (though deleting it made results worse, confirming it's genuinely
+    load-bearing), and driver selection was effectively alphabetical in
+    places rather than merit-based. Rather than patch `allocate()`
+    further, two full alternative strategies were built alongside it
+    (never replacing it, per Rule 13): `allocate_by_merit()`
+    (shift-partitioned, pairs-only Same-Driver pre-merge, event-diverse
+    seeding with license-scarcity override) and `allocate_by_anchor()`
+    (anchor each driver's first AND last job intentionally -- most-
+    constrained drivers first -- then fill the middle, then a bounded
+    swap-repair search). Real-data result: `allocate_by_merit`
+    underperformed the baseline (16 vs. 12 unresolved); `allocate_by_anchor`
+    tied on unresolved count but used all 9 active drivers instead of
+    leaving 2 idle. Also added, and wired into BOTH `allocate()` and the
+    new strategies: `_rebalance_idle_drivers()`, making "every driver has
+    real work" a first-class goal after a direct comparison against the
+    real `PLANNED.xlsx` showed the software leaving drivers at a legal
+    but unrealistic 0h. Two real bugs were found and fixed while building
+    this (an oscillation where a genuinely-unfixable released job got
+    immediately rescued right back onto the same driver; a donor
+    remaining-hours miscalculation that let a consolidation get silently
+    undone) -- both caught by the EXISTING test suite, not new tests,
+    underscoring the value of that suite. Separately, investigating the
+    NEW-008 newline bug found it was NOT isolated to one driver as first
+    thought -- it was present in all 11 active drivers' `license_types`,
+    one vehicle's `vehicle_type`, and two excluded drivers (15 records,
+    clearly copy-pasted from the same wrapped Excel cell). Fixed as a
+    pure data correction (not a code change). Real result: 2 of 3
+    affected rows now resolve correctly, but total unresolved count
+    didn't drop overall -- more legal options reshuffled the whole
+    downstream allocation and created different shortfalls elsewhere, the
+    honest signature of a greedy heuristic rather than a new bug. The
+    10-Ton-Chiller-Truck scarcity flagged alongside NEW-008 was confirmed
+    as a genuine capacity constraint (one physical vehicle, no matching
+    supplier offering exists) -- not a data or code issue, reported to
+    the project owner as a real gap to close if they want to. Full
+    write-up: `CHANGELOG_AI.md` Phase 15, scheduling rules spec v11.
+
 ## 12. Current project status (as of the end of this conversation)
 
 **Built, tested, working:**
@@ -586,14 +713,41 @@ retyped from memory.
   in the user's own database**, not code bugs — see Section 6's
   "Vehicle-type matching" and Section 9 item 8).
 
+**Built, tested, EXPERIMENTAL -- not wired into the UI, not yet
+production-ready (2026-08-06, see Section 9 item 14 and
+CHANGELOG_AI.md Phase 15):**
+- `allocate_by_merit()` -- shift-partitioned strategy with event-diverse
+  seeding. Underperforms the baseline `allocate()` on real data (16 vs.
+  12 unresolved) -- kept in the codebase as a tested alternative, not
+  recommended for use as-is.
+- `allocate_by_anchor()` -- anchors each driver's first and last job
+  intentionally (most-constrained drivers first), then a bounded
+  swap-repair search. Ties the baseline on unresolved count but uses all
+  9 active drivers instead of leaving 2 idle -- directionally promising,
+  not yet proven better overall.
+- `_rebalance_idle_drivers()` -- makes "every driver has real work" a
+  first-class goal; wired into all three strategies' rearrangement
+  loops. Two real bugs were found and fixed building this (see item 14).
+- **None of the above have dedicated synthetic test files yet** -- all
+  validation so far is direct real-data testing against `UNPLANNED.xlsx`
+  + `fleetplanner.db`. This is a real, disclosed gap, not an oversight:
+  see NEXT_SESSION.md.
+- `plan_day_tab.py` still calls only `allocate()` -- switching the UI to
+  either new strategy has not been discussed or decided.
+
 **Explicitly NOT yet built** (see `NEXT_SESSION.md` for prioritization):
 - PDF export (Excel export is done and preserves formatting; PDF likely
   needs Excel COM automation via `pywin32` since the target machine is
   Windows and very likely has Excel installed — this was flagged but not
   implemented)
-- The HR-005 daily-minimum-hours repair pass (added 2026-08-03) has only
-  been tested against small synthetic scenarios, not a real day's full
-  job volume — see Section 9 item 12 and `NEXT_SESSION.md`.
+- The HR-005 daily-minimum-hours repair pass (added 2026-08-03, widened
+  2026-08-06) has now been validated against a real day's full job volume
+  (`UNPLANNED.xlsx` + `fleetplanner.db`, see item 13 above) -- it's no
+  longer synthetic-only. Real result: driver-hour spread compressed from
+  2.0h-16.0h to 4.0h-11.0h against a 5.0h-12.0h human-planned reference.
+  Not yet full parity, and still a greedy heuristic (not a global
+  optimizer) -- see item 13 and `NEXT_SESSION.md` for the honest
+  remaining gap and what a further fix would need.
 - Reporting each driver's actual first-job time back to them after
   planning (spec SS-003), and showing month-to-date overtime-so-far on
   the Drivers tab (spec NEW-006) — both flagged as small, well-scoped

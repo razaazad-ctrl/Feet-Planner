@@ -314,3 +314,21 @@ SELECT * FROM decision_log WHERE plan_date > ? ORDER BY plan_date
   vehicle-type text mismatch "23 Seater Bus" vs "23 Seated Bus") — these
   are data problems in that specific snapshot, not schema defects. See
   `CHANGELOG_AI.md` for the full findings.
+- **FIXED 2026-08-06 (Phase 15):** an embedded newline character (from a
+  wrapped Excel cell, copy-pasted into the database directly rather than
+  through `excel_import._clean_text()`'s normalization) was found inside
+  `"4.2 Ton Double cabin Open Truck\n(with lift)"` — not just in one
+  driver's `license_types` as first suspected, but in **all 11 active
+  drivers' `license_types`, one vehicle's `vehicle_type` (plate
+  `Z 43915`), and two excluded/inactive drivers** — 15 records total,
+  clearly propagated from the same source cell into every record. Fixed
+  with a direct SQL sweep (`.replace('\n', ' ')` on each affected value);
+  a follow-up scan across `drivers.license_types`,
+  `vehicles.vehicle_type`, and `supplier_offerings.vehicle_type`
+  confirmed zero embedded newlines remain anywhere in the database. This
+  is the same failure class as the "Seated"/"Seater" mismatch above —
+  invisible in most UI text fields, but a real character difference that
+  silently defeats `_type_matches()`'s exact comparison. If a future
+  session sees an unexplained zero-match on text that looks identical in
+  the UI, check for a literal `\n` (or other whitespace variant) before
+  assuming it's a code bug.

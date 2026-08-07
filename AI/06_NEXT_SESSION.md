@@ -334,11 +334,107 @@ Section 3 below).
   mismatch existed ("23 Seater Bus" vs "23 Seated Bus"). If working
   against that same repo snapshot, expect these same issues unless the
   user has since corrected them.
+- **Hour-fairness fix, 2026-08-06 (Phase 14, scheduling spec v10) --
+  RESOLVED, but with an honest remaining gap.** The project owner
+  reported a real day where drivers landed anywhere from 2h to 16h,
+  despite SD-004 and TB-001 already being fixed. Root cause: 84% of that
+  day's rows were "Same Driver" grouped, and HR-005's repair pass
+  unconditionally skipped any grouped driver-day -- so the daily-minimum
+  safety net almost never actually ran. Fixed with a look-ahead
+  group-leader pick (SD-005) plus widening HR-005 to move whole grouped
+  days (never split). Two further real bugs were caught and fixed while
+  building this (a thrashing/ping-pong issue once whole groups became
+  movable, fixed with a `settled_job_ids` stability guard; and a
+  processing-order artifact where the repair pass's driver search picked
+  the first alphabetical match instead of the most-free one). Real-data
+  result: spread compressed from 2.0h-16.0h to 4.0h-11.0h against a
+  5.0h-12.0h human-planned reference for the same day -- real, verified
+  progress, but not yet full parity. See CHANGELOG_AI.md Phase 14 for the
+  full writeup.
+- **NEW-008, 2026-08-06, open, data issue not a code bug:** one driver's
+  `license_types` contains a literal embedded newline before
+  "(with lift)", silently defeating exact-string matching -- same failure
+  class as the "Seated"/"Seater" mismatch. Accounts for a few of the real
+  run's unresolved rows in Phase 14. Needs correcting at the data layer
+  (Drivers tab), not a code change -- flagged for the project owner.
+- **RESOLVED into real, tested alternatives (2026-08-06, same day) -- see
+  CHANGELOG_AI.md Phase 15.** The open design question above (was "Same
+  Driver" ruling the allocation, and should driver selection be
+  merit-based) led to two full alternative strategies being built
+  alongside `allocate()`, not a patch to it:
+  - `allocate_by_merit()` -- shift-partitioned, event-diverse seeding,
+    pairs-only Same-Driver pre-merge. Real-data result: WORSE than
+    baseline (16 vs. 12 unresolved). Kept as a tested alternative, not
+    recommended for use as-is.
+  - `allocate_by_anchor()` -- anchors each driver's first AND last job
+    intentionally (most-constrained drivers first, via
+    `_driver_ordered_most_constrained_first`), then a bounded swap-repair
+    search (`_swap_repair`, capped rounds). Real-data result: ties
+    baseline on unresolved count, but uses all 9 active drivers instead
+    of leaving 2 idle -- directionally promising.
+  - `_rebalance_idle_drivers()` -- new, wired into all three strategies:
+    "every driver has real work" is now a first-class goal, not just "no
+    driver is illegally under-minimum." Two real bugs were found and
+    fixed building this (an oscillation that undid a correct
+    unresolved-release decision; a donor-workload miscalculation that
+    silently undid a valid consolidation) -- both caught by the EXISTING
+    test suite.
+  **Neither new strategy is wired into the UI.** `plan_day_tab.py` still
+  calls only `allocate()`. Whether/when to switch is an explicit decision
+  still to be made with the project owner, not something to do
+  unilaterally -- see the priority list in Section 6 below.
+- **NEW-008's newline bug was fleet-wide, not isolated -- FIXED
+  2026-08-06.** Investigating it further (per the project owner's
+  request) found it in ALL 11 active drivers' `license_types`, one
+  vehicle's `vehicle_type` (plate `Z 43915`), and two excluded/inactive
+  drivers -- 15 records total, all cleanly fixed with a direct SQL sweep
+  (not a code change). A follow-up sweep confirmed zero embedded
+  newlines remain anywhere in `drivers.license_types`,
+  `vehicles.vehicle_type`, or `supplier_offerings.vehicle_type`. Real
+  result: 2 of 3 affected rows now resolve correctly. Total unresolved
+  count did NOT drop overall (ticked up slightly in all three
+  strategies) -- confirmed as the honest signature of a greedy
+  heuristic (more legal options reshuffled the whole allocation and
+  created different shortfalls elsewhere), not a new bug. This confirms
+  the remaining gap to zero-unresolved is now an algorithm-sophistication
+  limit, not a data problem.
+- **10-Ton-Chiller-Truck scarcity confirmed as a genuine capacity
+  constraint, not fixable in software.** Only one physical vehicle of
+  that type exists (plate `A 67338`), and no supplier offers that exact
+  type either (closest are "10 Ton Dry Truck", different, or "5 Ton
+  Chiller Truck", different capacity). Flagged to the project owner as a
+  real gap they may want to close (a second vehicle, or adding a
+  matching supplier offering) -- do not attempt a code workaround for
+  this if it comes up again.
+- **OPEN, real gap: no dedicated synthetic tests for any of Phase 15's
+  new code.** `allocate_by_merit`, `allocate_by_anchor`, `_swap_repair`,
+  `build_planning_units`, and `_rebalance_idle_drivers` (the last one now
+  has real-data-driven bug fixes, but no synthetic regression tests of
+  its own) have only been validated via direct real-data runs against
+  `UNPLANNED.xlsx` + `fleetplanner.db` so far, not the small, targeted
+  synthetic tests every other piece of this engine has (see the
+  `tests/` folder for the established pattern). This is a real,
+  disclosed gap -- worth closing before either new strategy is
+  considered for production use, following this project's own testing
+  discipline (see Section 4, "Areas of the code that require extra
+  care").
 
 ## 6. Recommended next improvements, roughly in priority order
 
 Based on what's explicitly still open and what would unblock the most
 value:
+
+0. **Decide whether/how to move `allocate_by_anchor` or `allocate_by_merit`
+   toward production, or keep iterating on them, before doing anything
+   else fairness-related.** The open design question from Phase 14 was
+   resolved into two real, tested alternative strategies (Phase 15) --
+   see Section 5 above. Neither is wired into the UI yet. Before writing
+   more allocation logic, get an explicit decision from the project
+   owner: keep tuning `allocate_by_anchor` (currently the more promising
+   of the two, ties baseline on unresolved count with better driver
+   utilization), write proper synthetic tests for the Phase 15 code
+   first, or pause this line of work. Do not unilaterally switch
+   `plan_day_tab.py` to either new function without that conversation.
 
 1. **Decide the duty-span question (spec OPT-001), explicitly left open
    2026-08-03.** Should a driver's SPAN (first job to last job that day,

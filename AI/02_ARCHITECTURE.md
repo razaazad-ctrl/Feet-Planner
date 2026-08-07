@@ -276,11 +276,25 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
     if candidates:
       # Fewest-drivers preference for flagged groups: prefer a driver
       # already used for this same group_key, if one of them still
-      # qualifies for this row. Only fall back to the normal
-      # least-occupied-hours pick across ALL candidates when there's no
-      # group yet, or none of the group's current driver(s) qualify here.
+      # qualifies for this row.
       group_candidates = [d for d in candidates if group_key and d in group_drivers[group_key]]
-      chosen_driver = min(group_candidates or candidates, key=occupied_seconds)
+      if group_candidates:
+        chosen_driver = min(group_candidates, key=occupied_seconds)
+      elif group_key:
+        # FRESH group (2026-08-06, SD-005): project each candidate's
+        # occupied hours PLUS the group's TOTAL merged hours (precomputed
+        # once per group before this loop), not just this opening row's
+        # duration -- otherwise a driver idle for one instant could end up
+        # carrying an entire large event alone, with no way to reconsider
+        # once picked. See CHANGELOG_AI.md Phase 14.
+        chosen_driver = min(candidates, key=lambda d: occupied_seconds(d) + group_total_hours[group_key])
+      else:
+        # UNGROUPED job, no existing group to defer to (2026-08-03,
+        # NEW-007/specialist-reservation): prefer the more broadly-
+        # licensed ("generalist") candidate over a narrowly-licensed
+        # ("specialist") one, reserving specialist hours for exclusive-
+        # type demand; occupied_seconds is only the tiebreak.
+        chosen_driver = min(candidates, key=lambda d: (-len(d.license_types), occupied_seconds(d)))
 
       matching_vehicles = [free (same group_key overlap exception applies),
                             type-matching, non-workshop vehicles]
@@ -339,7 +353,8 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
   # already given to a supplier.
   fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, ...)
 
-  # ---- POST-PASS: daily-minimum-hours repair (HR-005, added 2026-08-03) ----
+  # ---- POST-PASS: daily-minimum-hours repair (HR-005, added 2026-08-03,
+  #      WIDENED 2026-08-06 -- see CHANGELOG_AI.md Phase 14) ----
   # Runs after every job above has been through the in-house/supplier pass.
   # A driver used at all on a given day must reach at least
   # working_hours_per_day that day -- this can't be a per-job filter like
@@ -348,12 +363,28 @@ allocate(jobs, drivers, vehicles, supplier_offerings,
   # (day, driver) left with a non-zero, under-minimum total: try to move
   # ALL of that driver's jobs that day to another qualifying driver with
   # spare room (same license/off-day/shift/overlap/ceiling/monthly-cap
-  # rules as above). If every job can move, commit the move. If even one
-  # can't, release the WHOLE day back to unresolved with a clear note --
-  # never leave a partial illegal day in place. Repeats up to 5 passes
-  # (fixing one driver can free room that fixes another). Scope: skips
-  # jobs inside a "Same Driver" group (left alone, planner-flagged).
-  repeat up to 5 times: repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, ...)
+  # rules as above, PLUS SD-004 vehicle-type consistency if the job is
+  # grouped -- see _established_group_vehicle_type()). If every job can
+  # move, commit the move. If even one can't, release the WHOLE day back
+  # to unresolved with a clear note -- never leave a partial illegal day
+  # in place. Repeats up to 5 passes (fixing one driver can free room that
+  # fixes another).
+  # 2026-08-06: previously this whole pass SKIPPED any day containing a
+  # "Same Driver" grouped job -- correct in principle (a group's own hours
+  # are sometimes genuinely the shortfall), but on a real day where 84% of
+  # rows were grouped, it meant the pass almost never ran at all. Now a
+  # grouped day can be moved WHOLE onto one other driver (never split).
+  # Two things had to be added to make that safe: (1) a `settled_job_ids`
+  # guard, shared across all 5 passes -- once a job is moved, it's never
+  # moved again this run, which stops groups from thrashing/ping-ponging
+  # between drivers pass after pass (a real bug caught while building
+  # this); (2) the search for a new driver now checks candidates in
+  # least-occupied-first order, not driver_pool's natural (alphabetical)
+  # order -- otherwise a driver who hadn't had their own fix processed YET
+  # in the same pass could look "busy" and get skipped in favor of one
+  # freed moments earlier by an unrelated move, purely due to processing
+  # order (also caught and fixed the same session).
+  repeat up to 5 times: repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, ..., settled_job_ids)
 
   return jobs  # mutated in place, also returned for convenience
 ```
@@ -393,6 +424,113 @@ owner before implementing (do not change without re-confirming):
    falsely trip the daily ceiling in routine cases (one real driver:
    ~17h "occupied" vs. ~11h true) -- fixed the same day. See
    CHANGELOG_AI.md Phase 12.
+
+## 5b. Experimental alternative strategies (2026-08-06, allocation_engine.py)
+
+**Not wired into the UI.** `plan_day_tab.py` still calls only
+`allocate()`. These exist alongside it, built to be compared against real
+data before any decision to switch (Rule 13) -- see CHANGELOG_AI.md
+Phase 15 for the real-data results and AI_CONTEXT.md Section 9 item 14
+for the full story.
+
+### `PlanningUnit` and `build_planning_units()`
+
+Both new strategies operate on `PlanningUnit` (jobs: list of 1 or 2 Job
+objects, start_dt, end_dt, vehicle_type_required, same_driver_key,
+event_id) instead of raw `Job` objects. `build_planning_units(jobs)`
+pre-merges Same-Driver row PAIRS (never 3+) that share a vehicle type and
+start/end within 1h into one internal unit -- e.g. two rows both
+06:00-10:00 on a 10-Ton truck become one unit spanning that time. This
+turns the genuinely-simultaneous case into a single decision instead of
+the runtime overlap-relaxation machinery `allocate()` uses
+(`ignore_group_key`, SD-004 consistency checks). Every result is copied
+onto all of a unit's original Job objects at commit time, so the export
+always shows each original row separately, all pointing to the same
+driver/vehicle.
+
+### `allocate_by_merit(jobs, drivers, vehicles, supplier_offerings, ...)`
+
+```
+units = build_planning_units(valid_jobs)
+for shift in ("morning", "evening"):
+    shift_units = units where _shift_of(start) == shift
+    shift_drivers = drivers where _driver_matches_shift_pool(driver, shift)
+    leftover += _allocate_shift(shift_units, shift_drivers, ...)
+      # within _allocate_shift, per unit in time order:
+      #   1. continuity: an established group driver who still qualifies
+      #      always takes it first (mirrors SD-002/SD-003)
+      #   2. license scarcity ALWAYS overrides seeding -- the only
+      #      qualified driver takes it immediately if free
+      #   3. seeding: prefer a driver not yet seeded this shift AND an
+      #      event not yet claimed this shift, over a second job from an
+      #      event someone else already started
+      #   4. (second loop) FILL: everything left goes to whoever it fits,
+      #      least-occupied-first, specialist-reservation as tiebreak
+supplier fallback for leftover units (same reuse-before-hire logic as allocate())
+rearrangement loop: _fill_gaps_with_unresolved_jobs + _repair_minimum_daily_hours
+                     + _rebalance_idle_drivers, looped to 6 passes, sharing
+                     one settled_job_ids set
+```
+
+Real-data result: 16 unresolved vs. baseline's 12 -- the aggressive
+event-diverse seeding spends driver availability faster than the
+rearrangement stage recovers it. Disclosed as underperforming, not
+hidden.
+
+### `allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings, ..., swap_rounds=3)`
+
+```
+units = build_planning_units(valid_jobs)
+for shift in ("morning", "evening"):
+    leftover += _anchor_and_fill_shift(shift_units, shift_drivers, ...)
+      # per driver, MOST-CONSTRAINED (narrowest license) first:
+      #   1. FIRST anchor: earliest-starting qualifying unit
+      #   2. compute ceiling = _driver_ceiling(driver) -- max_working_hours_per_day
+      #      if set, else working_hours_per_day itself (a fixed day, not
+      #      a range, when max is blank -- confirmed against real
+      #      PLANNED.xlsx: the only 9h-exact drivers are the ones with no
+      #      max configured)
+      #   3. target_end = first_job.end_dt + ceiling
+      #   4. LAST anchor: whichever remaining qualifying unit ends
+      #      closest to (but not after) target_end
+      #   5. (second loop) MIDDLE FILL: everything else, least-occupied-first
+mark remaining leftover units unresolved
+_swap_repair(units, ..., max_rounds=swap_rounds)
+  # bounded local search: for each unresolved unit, look for a driver
+  # who could take it if exactly ONE of their existing single-job,
+  # UNGROUPED units moved elsewhere -- commits ONLY if that displaced
+  # unit finds a legal new home elsewhere (strict improvement, never a
+  # net-zero shuffle). Capped rounds, not full backtracking search.
+supplier fallback (same logic as allocate_by_merit)
+rearrangement loop: same three-pass loop as allocate_by_merit
+```
+
+Real-data result: 12 unresolved (tied with baseline), but 9/9 active
+drivers had real work vs. baseline's 9/11 with 2 idle -- better
+utilization, not yet a strictly better result overall.
+
+### `_rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, ..., settled_job_ids=None)`
+
+New rearrangement-stage pass, wired into `allocate()`,
+`allocate_by_merit()`, and `allocate_by_anchor()` alike. Makes "every
+driver has real work" a first-class goal, not just "no driver is
+illegally under-minimum" -- a driver sitting at a legal-but-unrealistic
+0h (often a side effect of `_repair_minimum_daily_hours` freeing a short
+day to fix someone else's minimum) is otherwise never revisited. For
+each 0h driver: accumulate candidates TENTATIVELY (first from anything
+still unresolved, then from genuine surplus on other drivers -- hours
+above THEIR OWN minimum, never dropping a donor below it) -- nothing is
+committed to real state until the full accumulated total clears the
+idle driver's own minimum; if it can't be reached, everything tentative
+is simply discarded (free, since nothing was ever mutated) and the
+driver stays legally idle. Two real bugs were found and fixed building
+this (see CHANGELOG_AI.md Phase 15): an oscillation where a genuinely-
+unfixable released job got rescued right back onto the same driver
+(fixed by the all-or-nothing commit rule above), and a donor
+remaining-hours miscalculation that silently undid a valid consolidation
+(fixed by using the donor's TRUE full workload, including already-settled
+jobs, as the baseline for "would this leave them short" -- separate from
+the narrower list of jobs actually eligible to be pulled).
 
 ## 6. Data flow diagram (text form)
 
