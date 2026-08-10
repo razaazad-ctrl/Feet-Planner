@@ -58,9 +58,14 @@ If no assignment:
 When the planner clicks **Summary**:
 
 → Read the current in-memory job results
-→ Count total trips, assigned in-house drivers, suppliers used, supplier trips, and unresolved jobs
+→ Count total trips, assigned in-house drivers, in-house-assigned trips, suppliers used, supplier trips, and unresolved jobs
 → Group assigned jobs by driver and supplier from the result objects only
 → Calculate each driver's duty span, trip count, and merged worked hours
-→ Display the read-only popup
+→ Display modern metric cards for the primary totals (including `In-house trips`)
+→ Display a structured table with in-house drivers by default
+→ If `In-house drivers only` is unchecked, append supplier records after the
+  in-house group and label both groups explicitly
+→ Display Total trips and Unresolved trips in the footer without repeating the
+  other header-card totals
 
 No database read, API call, allocation rerun, or workbook modification occurs.

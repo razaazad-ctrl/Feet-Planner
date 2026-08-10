@@ -1,3 +1,12 @@
+## Phase 20 — In-house Trip Count in Summary Header (2026-08-10)
+
+- Corrected the second summary metric card so it reports **In-house trips** only.
+- The value is calculated from the current in-memory result assignments where a
+  driver is assigned, rather than using the total number of jobs (which includes
+  supplier and unresolved jobs).
+- The separate footer `Total trips` remains the overall trip/job count.
+- No allocation, database, API, export, or surrounding UI behavior was changed.
+
 # CHANGELOG_AI.md — Fleet Planner
 
 Major architectural and logical changes only, in chronological order.
@@ -1444,6 +1453,36 @@ second, adds one new dependency) before building.
   updated per Rule 14/17. (`DATABASE.md` and `WORKFLOWS.md` checked and
   needed only a minor note -- no schema or workflow-level change this
   phase, purely algorithm and a new optional dependency.)
+
+## Phase 19 — Optional Supplier Rows in Summary Table (2026-08-10)
+
+- Updated `DriverSupplierSummaryDialog` so the detailed table is no longer
+  permanently restricted to in-house drivers.
+- Added an `In-house drivers only` checkbox, enabled by default. Unchecking it
+  shows supplier records as well, using the same result-only data source.
+- When all records are displayed, the table always orders the complete
+  `IN-HOUSE DRIVERS` group first and the `SUPPLIERS` group second, with explicit
+  group headers.
+- Supplier rows now include first-job start, last-job end, duty span, trip count,
+  and merged worked hours calculated from the current planning results.
+- No database, allocation-engine, API, or surrounding Plan a Day UI changes were
+  introduced.
+
+## Phase 18 — Modern Summary Table Refinement (2026-08-10)
+
+- Refined the existing `DriverSupplierSummaryDialog` without changing the
+  planning engine, database, or surrounding Plan a Day UI.
+- Replaced the individual driver/supplier result cards with a structured
+  in-house driver table containing driver name, first-job start, last-job end,
+  duty span, trips, and total worked hours.
+- Retained the modern four-card header for in-house drivers, trips, suppliers,
+  and supplier trips.
+- Removed repeated aggregate totals from the bottom of the popup. The footer now
+  shows only `Total trips` and `Unresolved trips`, followed by Close.
+- Kept all calculations result-only: the popup still reads exclusively from
+  `PlanDayTab.self.jobs` and performs no database or API calls.
+- Updated the architecture and workflow documentation to describe the refined
+  summary presentation.
 
 ## Phase 17 — Result-only Driver & Supplier Summary Popup (2026-08-10)
 

@@ -173,14 +173,28 @@ intermediate controller/presenter class.
 reporting layer over `PlanDayTab.self.jobs` only:
 
 - It never queries SQLite or master-data tables.
-- It counts total trips, unique in-house drivers present in the results, unique
-  suppliers present in the results, supplier-assigned trips, and unresolved jobs.
+- It counts total trips, unique in-house drivers present in the results, in-house-assigned
+  trips, unique suppliers present in the results, supplier-assigned trips, and unresolved jobs.
+- The popup uses a modern card-style header for the four primary totals; the second
+  card is specifically `In-house trips`, not total trips.
+- The main report is a proper table with rows for assigned in-house drivers and,
+  when enabled, supplier records. Columns cover first-job start, last-job end,
+  duty span, trip count, and merged worked hours. This keeps detailed workload
+  information aligned and easy to scan instead of rendering each record as a card.
+- The table includes an `In-house drivers only` checkbox. It is enabled by default
+  to keep the focused driver view. When unchecked, supplier rows are added after
+  the complete in-house-driver group. Explicit `IN-HOUSE DRIVERS` and `SUPPLIERS`
+  group headers make the ordering unambiguous.
+- The footer intentionally avoids repeating the four header-card totals. It shows
+  only `Total trips` and `Unresolved trips`, plus the Close action.
 - For each assigned in-house driver it calculates first-job -> last-job duty span,
   trip count, and worked hours. Worked hours use merged time intervals so
   overlapping Same-Driver rows are not double-counted, matching the engine's
   occupied-hour accounting.
 - Supplier detail is grouped from the assignment results themselves; numbered
   supplier hires and `SAME ...` labels are treated as the same supplier company.
+  Supplier rows are optional through the table checkbox and always appear after
+  the in-house-driver group when enabled. No database lookup is introduced.
 - Opening the popup does not modify jobs, assignments, the database, or the
   uploaded workbook.
 

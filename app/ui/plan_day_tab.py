@@ -15,7 +15,7 @@ The daily workflow screen:
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit,
     QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QHeaderView,
-    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout
+    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout, QCheckBox
 )
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt
@@ -503,8 +503,11 @@ def build_summary(jobs):
             unit_key = unit_label.removeprefix("SAME ") or unit_label
             units.setdefault(unit_key, []).append(job)
         supplier_hours = sum(_summary_merged_hours(unit_jobs) for unit_jobs in units.values())
+        span, span_hours = _summary_span(supplier_jobs)
         suppliers_detail.append({
             "name": entry["name"],
+            "span": span,
+            "span_hours": span_hours,
             "trips": len(supplier_jobs),
             "worked_hours": supplier_hours,
         })
@@ -512,6 +515,7 @@ def build_summary(jobs):
 
     return {
         "in_house_drivers": len(drivers),
+        "in_house_trips": sum(x["trips"] for x in drivers),
         "total_trips": len(jobs),
         "suppliers": len(suppliers_detail),
         "supplier_trips": sum(x["trips"] for x in suppliers_detail),
@@ -527,20 +531,46 @@ class DriverSupplierSummaryDialog(QDialog):
     def __init__(self, jobs, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Driver & Supplier Summary")
-        self.resize(1050, 720)
+        self.resize(1120, 760)
+        self.setMinimumSize(980, 650)
         self.setModal(True)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #161616; }
             QLabel { color: #161616; }
-            QFrame#headerCard, QFrame#statCard {
+            QFrame#statCard {
                 background: #f5f8fd; border: 1px solid #e4e9f2; border-radius: 14px;
             }
-            QFrame#statCard { min-height: 82px; }
             QLabel#statTitle { color: #444444; font-size: 13px; }
-            QLabel#statValue { color: #111111; font-size: 21px; font-weight: 600; }
-            QLabel#sectionTitle { font-size: 17px; font-weight: 600; }
-            QLabel#driverName, QLabel#supplierName { font-size: 14px; font-weight: 500; }
-            QLabel#driverDetail, QLabel#supplierDetail { font-size: 14px; }
+            QLabel#statValue { color: #111111; font-size: 25px; font-weight: 600; }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #fafbfd;
+                border: 1px solid #e1e6ef;
+                border-radius: 12px;
+                gridline-color: #e5e9f0;
+                color: #161616;
+                font-size: 13px;
+                selection-background-color: #eef4ff;
+                selection-color: #161616;
+            }
+            QTableWidget::item { padding: 9px 8px; border: none; }
+            QHeaderView::section {
+                background: #f5f7fa;
+                color: #222222;
+                border: none;
+                border-bottom: 1px solid #dfe4ec;
+                padding: 10px 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QScrollBar:vertical { width: 10px; background: transparent; }
+            QScrollBar::handle:vertical { background: #cfd6e2; border-radius: 5px; min-height: 30px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QFrame#footerCard {
+                background: #f8fafc; border: 1px solid #e4e9f2; border-radius: 12px;
+            }
+            QLabel#footerTitle { color: #555555; font-size: 12px; }
+            QLabel#footerValue { color: #111111; font-size: 17px; font-weight: 600; }
             QPushButton#closeButton {
                 background: #3f7ee8; color: white; border: none; border-radius: 10px;
                 padding: 10px 24px; font-size: 14px;
@@ -550,31 +580,39 @@ class DriverSupplierSummaryDialog(QDialog):
 
         data = build_summary(jobs)
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(18)
+        root.setContentsMargins(30, 24, 30, 24)
+        root.setSpacing(16)
 
         title_row = QHBoxLayout()
         icon = QLabel("▤")
         icon.setAlignment(Qt.AlignCenter)
         icon.setFixedSize(48, 48)
-        icon.setStyleSheet("background: #3f7ee8; color: white; border-radius: 12px; font-size: 25px;")
+        icon.setStyleSheet(
+            "background: #3f7ee8; color: white; border-radius: 12px; font-size: 25px;"
+        )
         title_row.addWidget(icon)
+
         title = QLabel("Driver & Supplier Summary")
         title.setStyleSheet("font-size: 25px; font-weight: 600;")
         title_row.addWidget(title)
         title_row.addStretch()
+
         close_x = QPushButton("×")
         close_x.setFixedSize(38, 38)
-        close_x.setStyleSheet("font-size: 28px; color: #707070; border: none; background: transparent;")
+        close_x.setStyleSheet(
+            "font-size: 28px; color: #707070; border: none; background: transparent;"
+        )
         close_x.clicked.connect(self.accept)
         title_row.addWidget(close_x)
         root.addLayout(title_row)
 
+        # Modern metric cards: the top row is the single source for the
+        # high-level totals, so the footer does not repeat these four values.
         stats = QGridLayout()
         stats.setHorizontalSpacing(12)
         stat_values = [
             ("In-house drivers", data["in_house_drivers"]),
-            ("Trips", data["total_trips"]),
+            ("In-house trips", data["in_house_trips"]),
             ("Suppliers", data["suppliers"]),
             ("Supplier trips", data["supplier_trips"]),
         ]
@@ -583,6 +621,7 @@ class DriverSupplierSummaryDialog(QDialog):
             card.setObjectName("statCard")
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(18, 12, 18, 12)
+            card_layout.setSpacing(2)
             label = QLabel(label_text)
             label.setObjectName("statTitle")
             value_label = QLabel(str(value))
@@ -592,65 +631,177 @@ class DriverSupplierSummaryDialog(QDialog):
             stats.addWidget(card, 0, col)
         root.addLayout(stats)
 
-        body = QScrollArea()
-        body.setWidgetResizable(True)
-        body.setFrameShape(QFrame.NoFrame)
-        body_widget = QWidget()
-        body_layout = QVBoxLayout(body_widget)
-        body_layout.setContentsMargins(4, 2, 4, 2)
-        body_layout.setSpacing(10)
+        # Proper report table. By default only in-house drivers are shown;
+        # unchecking the filter adds supplier rows after the in-house group.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(10)
+        filter_label = QLabel("Display:")
+        filter_label.setStyleSheet("font-size: 13px; color: #555555;")
+        filter_row.addWidget(filter_label)
+        self.inhouse_only = QCheckBox("In-house drivers only")
+        self.inhouse_only.setChecked(True)
+        self.inhouse_only.setStyleSheet(
+            "QCheckBox { font-size: 13px; color: #222222; spacing: 7px; }"
+            "QCheckBox::indicator { width: 17px; height: 17px; }"
+        )
+        self.inhouse_only.toggled.connect(self._refresh_summary_table)
+        filter_row.addWidget(self.inhouse_only)
+        filter_row.addStretch()
+        root.addLayout(filter_row)
 
-        section = QLabel("In-house drivers")
-        section.setObjectName("sectionTitle")
-        body_layout.addWidget(section)
-        for driver in data["drivers"]:
-            row = QFrame()
-            row.setObjectName("headerCard")
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(16, 11, 16, 11)
-            name = QLabel(driver["name"])
-            name.setObjectName("driverName")
-            name.setMinimumWidth(390)
-            detail = QLabel(
-                f'{driver["span"]} = {_summary_hours_text(driver["span_hours"])}  |  '
-                f'{driver["trips"]} trips = {_summary_hours_text(driver["worked_hours"])}'
-            )
-            detail.setObjectName("driverDetail")
-            row_layout.addWidget(name)
-            row_layout.addWidget(detail, 1)
-            body_layout.addWidget(row)
+        self.summary_table = QTableWidget()
+        table = self.summary_table
+        table.setColumnCount(7)
+        table.setHorizontalHeaderLabels([
+            "#",
+            "Driver / Supplier",
+            "First Job Start",
+            "Last Job End",
+            "Duty Span",
+            "Trips",
+            "Total Hours",
+        ])
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.NoSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(True)
+        table.setMinimumHeight(280)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.resizeSection(0, 52)
+        header.resizeSection(2, 125)
+        header.resizeSection(3, 125)
+        header.resizeSection(4, 150)
+        header.resizeSection(5, 70)
+        header.resizeSection(6, 105)
+        root.addWidget(table, 1)
 
-        if data["suppliers_detail"]:
-            supplier_section = QLabel("Suppliers used")
-            supplier_section.setObjectName("sectionTitle")
-            body_layout.addSpacing(8)
-            body_layout.addWidget(supplier_section)
-            for supplier in data["suppliers_detail"]:
-                row = QFrame()
-                row.setObjectName("headerCard")
-                row_layout = QHBoxLayout(row)
-                row_layout.setContentsMargins(16, 11, 16, 11)
-                name = QLabel(supplier["name"])
-                name.setObjectName("supplierName")
-                name.setMinimumWidth(390)
-                detail = QLabel(
-                    f'{supplier["trips"]} trips = {_summary_hours_text(supplier["worked_hours"])}'
-                )
-                detail.setObjectName("supplierDetail")
-                row_layout.addWidget(name)
-                row_layout.addWidget(detail, 1)
-                body_layout.addWidget(row)
+        self._summary_data = data
+        self._refresh_summary_table()
 
-        if not data["drivers"] and not data["suppliers_detail"]:
-            body_layout.addWidget(QLabel("No assigned drivers or suppliers in the current results."))
-        body_layout.addStretch()
-        body.setWidget(body_widget)
-        root.addWidget(body, 1)
-
+        # Footer contains only the requested additional checks; the main
+        # totals remain in the metric cards above.
         footer = QHBoxLayout()
-        footer.addStretch()
+        footer.setSpacing(12)
+
+        total_card = QFrame()
+        total_card.setObjectName("footerCard")
+        total_layout = QHBoxLayout(total_card)
+        total_layout.setContentsMargins(16, 9, 16, 9)
+        total_title = QLabel("Total trips")
+        total_title.setObjectName("footerTitle")
+        total_value = QLabel(str(data["total_trips"]))
+        total_value.setObjectName("footerValue")
+        total_layout.addWidget(total_title)
+        total_layout.addStretch()
+        total_layout.addWidget(total_value)
+
+        unresolved_card = QFrame()
+        unresolved_card.setObjectName("footerCard")
+        unresolved_layout = QHBoxLayout(unresolved_card)
+        unresolved_layout.setContentsMargins(16, 9, 16, 9)
+        unresolved_title = QLabel("Unresolved trips")
+        unresolved_title.setObjectName("footerTitle")
+        unresolved_value = QLabel(str(data["unresolved"]))
+        unresolved_value.setObjectName("footerValue")
+        unresolved_layout.addWidget(unresolved_title)
+        unresolved_layout.addStretch()
+        unresolved_layout.addWidget(unresolved_value)
+
+        footer.addWidget(total_card)
+        footer.addWidget(unresolved_card)
+        footer.addStretch(1)
+
         close_btn = QPushButton("Close")
         close_btn.setObjectName("closeButton")
         close_btn.clicked.connect(self.accept)
         footer.addWidget(close_btn)
         root.addLayout(footer)
+
+    def _refresh_summary_table(self):
+        """Refresh the summary rows without re-reading the database."""
+        data = self._summary_data
+        rows = []
+
+        # Group 1: in-house drivers.
+        for driver in data["drivers"]:
+            rows.append(("driver", driver))
+
+        # Group 2: suppliers, only when the in-house-only filter is disabled.
+        if not self.inhouse_only.isChecked():
+            rows.extend(("supplier", supplier) for supplier in data["suppliers_detail"])
+
+        table = self.summary_table
+        table.setRowCount(0)
+
+        if not rows:
+            table.setRowCount(1)
+            empty = QTableWidgetItem("No assigned records in the current results.")
+            empty.setTextAlignment(Qt.AlignCenter)
+            table.setItem(0, 0, empty)
+            table.setSpan(0, 0, 1, 7)
+            return
+
+        # When suppliers are enabled, keep the two populations explicitly grouped:
+        # in-house first, suppliers second.
+        display_index = 0
+        supplier_group_inserted = False
+        inhouse_group_inserted = False
+        show_group_headers = not self.inhouse_only.isChecked()
+        for kind, record in rows:
+            if kind == "driver" and show_group_headers and not inhouse_group_inserted:
+                inhouse_group_inserted = True
+                table.insertRow(table.rowCount())
+                group_row = table.rowCount() - 1
+                group_item = QTableWidgetItem("IN-HOUSE DRIVERS")
+                group_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                group_item.setForeground(QColor("#3f7ee8"))
+                group_item.setBackground(QColor("#eef4ff"))
+                table.setItem(group_row, 0, group_item)
+                table.setSpan(group_row, 0, 1, 7)
+            elif kind == "supplier" and not supplier_group_inserted:
+                supplier_group_inserted = True
+                table.insertRow(table.rowCount())
+                group_row = table.rowCount() - 1
+                group_item = QTableWidgetItem("SUPPLIERS")
+                group_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                group_item.setForeground(QColor("#7b4bc4"))
+                group_item.setBackground(QColor("#f7f0ff"))
+                table.setItem(group_row, 0, group_item)
+                table.setSpan(group_row, 0, 1, 7)
+
+            table.insertRow(table.rowCount())
+            row = table.rowCount() - 1
+            display_index += 1
+            span = record["span"]
+            if " – " in span:
+                span_start, span_end = span.split(" – ", 1)
+            else:
+                span_start = span_end = "--"
+
+            values = [
+                f"{display_index:02d}",
+                record["name"],
+                span_start,
+                span_end,
+                _summary_hours_text(record["span_hours"]),
+                str(record["trips"]),
+                _summary_hours_text(record["worked_hours"]),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col in (0, 2, 3, 4, 5, 6):
+                    item.setTextAlignment(Qt.AlignCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                if kind == "supplier":
+                    item.setBackground(QColor("#fcfaff"))
+                table.setItem(row, col, item)
