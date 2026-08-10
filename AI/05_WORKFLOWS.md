@@ -5,6 +5,9 @@
 1. Upload Excel
 2. Add day notes
 3. Run engine
+4. Review the result table and optional driver/supplier filter
+5. Click **Summary** beside **Export Filled Excel** when a workload snapshot is needed
+6. Close the summary and continue reviewing/editing the plan
 
 ---
 
@@ -48,3 +51,16 @@ Based on:
 If no assignment:
 → Mark unresolved
 → Show reason
+---
+
+## Result Summary
+
+When the planner clicks **Summary**:
+
+→ Read the current in-memory job results
+→ Count total trips, assigned in-house drivers, suppliers used, supplier trips, and unresolved jobs
+→ Group assigned jobs by driver and supplier from the result objects only
+→ Calculate each driver's duty span, trip count, and merged worked hours
+→ Display the read-only popup
+
+No database read, API call, allocation rerun, or workbook modification occurs.

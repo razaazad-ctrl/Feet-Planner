@@ -1444,3 +1444,27 @@ second, adds one new dependency) before building.
   updated per Rule 14/17. (`DATABASE.md` and `WORKFLOWS.md` checked and
   needed only a minor note -- no schema or workflow-level change this
   phase, purely algorithm and a new optional dependency.)
+
+## Phase 17 — Result-only Driver & Supplier Summary Popup (2026-08-10)
+
+- Added a **Summary** button beside **Export Filled Excel** on the Plan a Day
+  screen. The existing UI layout and controls were otherwise left unchanged.
+- Added a read-only `DriverSupplierSummaryDialog` styled as a compact report
+  popup matching the supplied visual reference.
+- Summary data is calculated **only from the current `PlanDayTab.self.jobs`
+  result objects**, never from SQLite/master data, so it represents exactly the
+  plan currently on screen.
+- The popup reports total trips, unique in-house drivers present in the results,
+  unique suppliers used, supplier-assigned trips, and unresolved jobs.
+- Each assigned in-house driver shows first-job/last-job duty span, trip count,
+  and merged worked hours. Overlapping result intervals are counted once,
+  consistent with the deterministic engine's occupied-hour accounting.
+- Supplier details are derived from result labels/IDs, including `SAME ...` and
+  numbered supplier-unit labels, without another database lookup.
+- The feature is read-only: opening/closing the popup does not change jobs,
+  assignments, history, APIs, or the uploaded workbook.
+- No database schema changes, allocation-engine changes, or external API calls
+  were introduced.
+- `AI_INDEX.json` was reviewed and does not require a folder/module entry
+  change because the feature extends the existing `plan_day_tab.py` module
+  rather than adding a new module or changing the architecture boundaries.

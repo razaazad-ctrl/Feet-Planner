@@ -30,7 +30,7 @@ FleetPlanner/
 │   └── ui/
 │       ├── __init__.py
 │       ├── main_window.py         # QMainWindow, tab container, PIN gating
-│       ├── plan_day_tab.py        # Daily workflow screen (largest UI file)
+│       ├── plan_day_tab.py        # Daily workflow screen, result table, filters, summary popup (largest UI file)
 │       ├── drivers_tab.py         # Structured driver hard rules + AI notes
 │       ├── suppliers_tab.py       # Structured supplier offerings + AI notes
 │       ├── vehicles_tab.py        # Vehicle roster + workshop/exclusion toggle
@@ -165,6 +165,27 @@ MainWindow (QMainWindow)
 Every tab widget receives the single shared `conn` (sqlite3 Connection)
 in its constructor and calls `db.*` functions directly — there is no
 intermediate controller/presenter class.
+
+## 3.1 Result Summary Popup
+
+`PlanDayTab` owns a read-only `DriverSupplierSummaryDialog` opened by the
+`Summary` button beside `Export Filled Excel`. The dialog is deliberately a
+reporting layer over `PlanDayTab.self.jobs` only:
+
+- It never queries SQLite or master-data tables.
+- It counts total trips, unique in-house drivers present in the results, unique
+  suppliers present in the results, supplier-assigned trips, and unresolved jobs.
+- For each assigned in-house driver it calculates first-job -> last-job duty span,
+  trip count, and worked hours. Worked hours use merged time intervals so
+  overlapping Same-Driver rows are not double-counted, matching the engine's
+  occupied-hour accounting.
+- Supplier detail is grouped from the assignment results themselves; numbered
+  supplier hires and `SAME ...` labels are treated as the same supplier company.
+- Opening the popup does not modify jobs, assignments, the database, or the
+  uploaded workbook.
+
+This keeps the summary a true snapshot of the plan currently visible in memory,
+including any future planner edits made before export/finalization.
 
 ## 4. Function flow — the daily workflow, end to end
 

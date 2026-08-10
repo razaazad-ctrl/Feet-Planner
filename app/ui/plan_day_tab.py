@@ -15,7 +15,7 @@ The daily workflow screen:
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit,
     QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QHeaderView,
-    QScrollArea, QFrame, QComboBox
+    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout
 )
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt
@@ -77,11 +77,15 @@ class PlanDayTab(QWidget):
         self.export_btn = QPushButton("Export Filled Excel")
         self.export_btn.clicked.connect(self._on_export)
         self.export_btn.setEnabled(False)
+        self.summary_btn = QPushButton("Summary")
+        self.summary_btn.clicked.connect(self._on_summary)
+        self.summary_btn.setEnabled(False)
         self.summary_label = QLabel("")
         run_row.addWidget(self.run_btn)
         run_row.addWidget(self.ai_review_btn)
         run_row.addWidget(self.finalize_btn)
         run_row.addWidget(self.export_btn)
+        run_row.addWidget(self.summary_btn)
         run_row.addWidget(self.summary_label, stretch=1)
         layout.addLayout(run_row)
 
@@ -155,6 +159,7 @@ class PlanDayTab(QWidget):
         self.ai_review_btn.setEnabled(True)
         self.finalize_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
+        self.summary_btn.setEnabled(True)
 
         unresolved_count = sum(1 for j in self.jobs if j.unresolved)
         in_house_count = sum(1 for j in self.jobs if j.assigned_driver_id is not None)
@@ -288,6 +293,12 @@ class PlanDayTab(QWidget):
 
         self.suggestions_container.addWidget(frame)
 
+    def _on_summary(self):
+        if not self.jobs:
+            return
+        dialog = DriverSupplierSummaryDialog(self.jobs, self)
+        dialog.exec()
+
     def _on_export(self):
         if not self.jobs or not self.uploaded_path:
             return
@@ -401,3 +412,245 @@ class PlanDayTab(QWidget):
             cell_text = item.text().removeprefix("SAME ") if item is not None else ""
             match = selected_text == "All" or cell_text == selected_text
             self.table.setRowHidden(row, not match)
+
+
+# ---------------------------------------------------------------------------
+# Result-only summary helpers
+# ---------------------------------------------------------------------------
+def _summary_merged_hours(jobs):
+    intervals = sorted(
+        (j.start_dt, j.end_dt)
+        for j in jobs
+        if j.start_dt is not None and j.end_dt is not None and j.end_dt > j.start_dt
+    )
+    if not intervals:
+        return 0.0
+    total_seconds = 0.0
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            if end > current_end:
+                current_end = end
+        else:
+            total_seconds += (current_end - current_start).total_seconds()
+            current_start, current_end = start, end
+    total_seconds += (current_end - current_start).total_seconds()
+    return total_seconds / 3600.0
+
+
+def _summary_span(jobs):
+    valid = [j for j in jobs if j.start_dt is not None and j.end_dt is not None]
+    if not valid:
+        return "--", 0.0
+    start = min(j.start_dt for j in valid)
+    end = max(j.end_dt for j in valid)
+    span_hours = (end - start).total_seconds() / 3600.0
+    return f"{start.strftime('%H:%M')} – {end.strftime('%H:%M')}", span_hours
+
+
+def _summary_hours_text(hours):
+    if abs(hours - round(hours)) < 1e-9:
+        return f"{int(round(hours))} hrs."
+    return f"{hours:.1f} hrs."
+
+
+def _summary_supplier_name(job):
+    import re
+    label = (job.assigned_supplier_unit or "").strip()
+    label = re.sub(r"^SAME\s+", "", label, flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+\d+$", "", label).strip() or label
+
+
+def build_summary(jobs):
+    """Build the popup report entirely from current in-memory Job results."""
+    from collections import OrderedDict
+    assigned_jobs = [j for j in jobs if not j.unresolved]
+    driver_groups = OrderedDict()
+    supplier_groups = OrderedDict()
+
+    for job in assigned_jobs:
+        if job.assigned_driver_id is not None:
+            key = job.assigned_driver_id
+            name = job.assigned_driver_name or "Unknown driver"
+            driver_groups.setdefault(key, {"name": name, "jobs": []})["jobs"].append(job)
+        elif job.assigned_supplier_unit:
+            key = job.assigned_supplier_id
+            if key is None:
+                key = _summary_supplier_name(job)
+            supplier_groups.setdefault(
+                key, {"name": _summary_supplier_name(job), "jobs": []}
+            )["jobs"].append(job)
+
+    drivers = []
+    for entry in driver_groups.values():
+        driver_jobs = entry["jobs"]
+        span, span_hours = _summary_span(driver_jobs)
+        drivers.append({
+            "name": entry["name"],
+            "span": span,
+            "span_hours": span_hours,
+            "trips": len(driver_jobs),
+            "worked_hours": _summary_merged_hours(driver_jobs),
+        })
+    drivers.sort(key=lambda x: x["name"].upper())
+
+    suppliers_detail = []
+    for entry in supplier_groups.values():
+        supplier_jobs = entry["jobs"]
+        units = OrderedDict()
+        for job in supplier_jobs:
+            unit_label = (job.assigned_supplier_unit or "").strip()
+            unit_key = unit_label.removeprefix("SAME ") or unit_label
+            units.setdefault(unit_key, []).append(job)
+        supplier_hours = sum(_summary_merged_hours(unit_jobs) for unit_jobs in units.values())
+        suppliers_detail.append({
+            "name": entry["name"],
+            "trips": len(supplier_jobs),
+            "worked_hours": supplier_hours,
+        })
+    suppliers_detail.sort(key=lambda x: x["name"].upper())
+
+    return {
+        "in_house_drivers": len(drivers),
+        "total_trips": len(jobs),
+        "suppliers": len(suppliers_detail),
+        "supplier_trips": sum(x["trips"] for x in suppliers_detail),
+        "unresolved": sum(1 for j in jobs if j.unresolved),
+        "drivers": drivers,
+        "suppliers_detail": suppliers_detail,
+    }
+
+
+class DriverSupplierSummaryDialog(QDialog):
+    """Read-only summary calculated exclusively from the current in-memory results."""
+
+    def __init__(self, jobs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Driver & Supplier Summary")
+        self.resize(1050, 720)
+        self.setModal(True)
+        self.setStyleSheet("""
+            QDialog { background: #ffffff; color: #161616; }
+            QLabel { color: #161616; }
+            QFrame#headerCard, QFrame#statCard {
+                background: #f5f8fd; border: 1px solid #e4e9f2; border-radius: 14px;
+            }
+            QFrame#statCard { min-height: 82px; }
+            QLabel#statTitle { color: #444444; font-size: 13px; }
+            QLabel#statValue { color: #111111; font-size: 21px; font-weight: 600; }
+            QLabel#sectionTitle { font-size: 17px; font-weight: 600; }
+            QLabel#driverName, QLabel#supplierName { font-size: 14px; font-weight: 500; }
+            QLabel#driverDetail, QLabel#supplierDetail { font-size: 14px; }
+            QPushButton#closeButton {
+                background: #3f7ee8; color: white; border: none; border-radius: 10px;
+                padding: 10px 24px; font-size: 14px;
+            }
+            QPushButton#closeButton:hover { background: #336dcc; }
+        """)
+
+        data = build_summary(jobs)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(18)
+
+        title_row = QHBoxLayout()
+        icon = QLabel("▤")
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setFixedSize(48, 48)
+        icon.setStyleSheet("background: #3f7ee8; color: white; border-radius: 12px; font-size: 25px;")
+        title_row.addWidget(icon)
+        title = QLabel("Driver & Supplier Summary")
+        title.setStyleSheet("font-size: 25px; font-weight: 600;")
+        title_row.addWidget(title)
+        title_row.addStretch()
+        close_x = QPushButton("×")
+        close_x.setFixedSize(38, 38)
+        close_x.setStyleSheet("font-size: 28px; color: #707070; border: none; background: transparent;")
+        close_x.clicked.connect(self.accept)
+        title_row.addWidget(close_x)
+        root.addLayout(title_row)
+
+        stats = QGridLayout()
+        stats.setHorizontalSpacing(12)
+        stat_values = [
+            ("In-house drivers", data["in_house_drivers"]),
+            ("Trips", data["total_trips"]),
+            ("Suppliers", data["suppliers"]),
+            ("Supplier trips", data["supplier_trips"]),
+        ]
+        for col, (label_text, value) in enumerate(stat_values):
+            card = QFrame()
+            card.setObjectName("statCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(18, 12, 18, 12)
+            label = QLabel(label_text)
+            label.setObjectName("statTitle")
+            value_label = QLabel(str(value))
+            value_label.setObjectName("statValue")
+            card_layout.addWidget(label)
+            card_layout.addWidget(value_label)
+            stats.addWidget(card, 0, col)
+        root.addLayout(stats)
+
+        body = QScrollArea()
+        body.setWidgetResizable(True)
+        body.setFrameShape(QFrame.NoFrame)
+        body_widget = QWidget()
+        body_layout = QVBoxLayout(body_widget)
+        body_layout.setContentsMargins(4, 2, 4, 2)
+        body_layout.setSpacing(10)
+
+        section = QLabel("In-house drivers")
+        section.setObjectName("sectionTitle")
+        body_layout.addWidget(section)
+        for driver in data["drivers"]:
+            row = QFrame()
+            row.setObjectName("headerCard")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(16, 11, 16, 11)
+            name = QLabel(driver["name"])
+            name.setObjectName("driverName")
+            name.setMinimumWidth(390)
+            detail = QLabel(
+                f'{driver["span"]} = {_summary_hours_text(driver["span_hours"])}  |  '
+                f'{driver["trips"]} trips = {_summary_hours_text(driver["worked_hours"])}'
+            )
+            detail.setObjectName("driverDetail")
+            row_layout.addWidget(name)
+            row_layout.addWidget(detail, 1)
+            body_layout.addWidget(row)
+
+        if data["suppliers_detail"]:
+            supplier_section = QLabel("Suppliers used")
+            supplier_section.setObjectName("sectionTitle")
+            body_layout.addSpacing(8)
+            body_layout.addWidget(supplier_section)
+            for supplier in data["suppliers_detail"]:
+                row = QFrame()
+                row.setObjectName("headerCard")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(16, 11, 16, 11)
+                name = QLabel(supplier["name"])
+                name.setObjectName("supplierName")
+                name.setMinimumWidth(390)
+                detail = QLabel(
+                    f'{supplier["trips"]} trips = {_summary_hours_text(supplier["worked_hours"])}'
+                )
+                detail.setObjectName("supplierDetail")
+                row_layout.addWidget(name)
+                row_layout.addWidget(detail, 1)
+                body_layout.addWidget(row)
+
+        if not data["drivers"] and not data["suppliers_detail"]:
+            body_layout.addWidget(QLabel("No assigned drivers or suppliers in the current results."))
+        body_layout.addStretch()
+        body.setWidget(body_widget)
+        root.addWidget(body, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("closeButton")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        root.addLayout(footer)
