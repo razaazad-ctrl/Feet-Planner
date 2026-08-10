@@ -297,12 +297,33 @@ def _driver_is_off(driver, job_date, allow_override_days):
 SHIFT_PERIOD_EVENING_CUTOFF_HOUR = 12
 
 
-def _job_matches_shift_period(job_start_dt, shift_period):
+def _job_matches_shift_period(job_start_dt, shift_period, busy_intervals=None):
     """True if this job is allowed for a driver with the given shift_period.
     shift_period is 'morning', 'evening', or None (no restriction -- same
-    fail-open behaviour as every other optional hard-rule field here)."""
+    fail-open behaviour as every other optional hard-rule field here).
+
+    HR-002 addendum (confirmed against a real human-planned day, where a
+    'morning' driver was routinely given jobs running into the afternoon
+    as a natural continuation of a day already under way -- e.g. a job
+    07:00-15:00 followed by another at 16:00-19:00 for the same 'morning'
+    driver): shift_period is NOT a wall across the driver's whole day, it
+    only gates which half of the day their FIRST job can start in. Once a
+    driver already has any job on this same calendar date, later jobs that
+    day are governed purely by the normal overlap/hour-ceiling rules, not
+    re-checked against the shift window -- exactly the project owner's own
+    framing: "if a driver is in morning shift 07:00 that means his shift
+    will end 16:00 if the 12hr max field is empty... he can definitely get
+    a job or two after 12:00." busy_intervals (the driver's existing
+    committed intervals, real or a hypothetical override) is what "already
+    has a job that day" is checked against; passing None preserves the
+    original always-enforce behaviour, so any call site not yet updated to
+    pass real state fails safe rather than silently getting the relaxation."""
     if shift_period is None:
         return True
+    if busy_intervals:
+        job_date = job_start_dt.date()
+        if any(iv[0].date() == job_date for iv in busy_intervals):
+            return True  # already working this day -- the window only gates the FIRST job
     is_evening_job = job_start_dt.time() >= time(SHIFT_PERIOD_EVENING_CUTOFF_HOUR, 0)
     if shift_period == "evening":
         return is_evening_job
@@ -354,7 +375,7 @@ def _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buff
                 continue
             if _driver_is_off(d, job.start_dt.date(), allow_override_days):
                 continue
-            if not _job_matches_shift_period(job.start_dt, d.shift_period):
+            if not _job_matches_shift_period(job.start_dt, d.shift_period, busy_intervals=d.busy_intervals):
                 continue
             if not _driver_has_bounded_gap_fit(d, job.start_dt, job.end_dt, travel_buffer_minutes):
                 continue  # only interested in a genuine gap-fill here
@@ -573,12 +594,12 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
                 return False, None
             if _driver_is_off(d, day, allow_override_days):
                 return False, None
-            if not _job_matches_shift_period(job.start_dt, d.shift_period):
+            combined_busy = d.busy_intervals + tentative_intervals.get(d.id, [])
+            if not _job_matches_shift_period(job.start_dt, d.shift_period, busy_intervals=combined_busy):
                 return False, None
             established_type = tentative_group_vehicle_for(d.id, group_key) if group_key else None
             vehicle_type_consistent = established_type is None or _type_matches(job.vehicle_type_required, established_type)
             effective_group_key = group_key if (group_key and vehicle_type_consistent) else None
-            combined_busy = d.busy_intervals + tentative_intervals.get(d.id, [])
             if _overlaps_with_buffer(combined_busy, job.start_dt, job.end_dt,
                                       travel_buffer_minutes, ignore_group_key=effective_group_key):
                 return False, None
@@ -651,12 +672,27 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
             moves.append((job, new_driver, new_vehicle, job_group_key))
 
         def _release(job):
-            tag = _group_key_of(job)
-            driver.busy_intervals = [iv for iv in driver.busy_intervals if iv != (job.start_dt, job.end_dt, tag)]
+            # Matches by (start, end) only, NOT the group tag -- a real bug
+            # found here: the interval was originally stored with the
+            # EFFECTIVE group key (which SD-004's vehicle-consistency rule
+            # can set to None even for a job that DOES have a same_driver_key,
+            # if its vehicle type didn't match what the group had already
+            # established). Matching against _group_key_of(job) -- the RAW
+            # key -- could silently fail to find the real stored tuple,
+            # leaving a phantom busy interval behind on the driver or
+            # vehicle forever (confirmed: a vehicle showed a busy interval
+            # with no job behind it at all, permanently blocking that slot).
+            # (start, end)-only matching is what _release_unit already uses
+            # everywhere else in this module, and is safe here for the same
+            # reason: this function only ever touches UNGROUPED jobs (see
+            # the group-day skip above), and two different ungrouped jobs
+            # can never legitimately share an identical (start, end) on the
+            # same driver in the first place.
+            driver.busy_intervals = [iv for iv in driver.busy_intervals if not (iv[0] == job.start_dt and iv[1] == job.end_dt)]
             driver.occupied_seconds = _merged_hours(driver.busy_intervals) * 3600.0
             old_vehicle = vehicle_by_id.get(job.assigned_vehicle_id)
             if old_vehicle:
-                old_vehicle.busy_intervals = [iv for iv in old_vehicle.busy_intervals if iv != (job.start_dt, job.end_dt, tag)]
+                old_vehicle.busy_intervals = [iv for iv in old_vehicle.busy_intervals if not (iv[0] == job.start_dt and iv[1] == job.end_dt)]
 
         if feasible:
             for job, new_driver, new_vehicle, job_group_key in moves:
@@ -752,7 +788,7 @@ def _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minut
             return False
         if _driver_is_off(idle, job.start_dt.date(), allow_override_days):
             return False
-        if not _job_matches_shift_period(job.start_dt, idle.shift_period):
+        if not _job_matches_shift_period(job.start_dt, idle.shift_period, busy_intervals=accumulated):
             return False
         if _overlaps_with_buffer(accumulated, job.start_dt, job.end_dt, travel_buffer_minutes):
             return False
@@ -989,7 +1025,7 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
                 continue
             if _driver_is_off(d, job_date, allow_override_days):
                 continue
-            if not _job_matches_shift_period(job.start_dt, d.shift_period):
+            if not _job_matches_shift_period(job.start_dt, d.shift_period, busy_intervals=d.busy_intervals):
                 continue
             # SAME-DRIVER GROUP OVERLAP FIX (2026-08-03): the relaxation
             # below exists so a driver can legitimately have two
@@ -1391,15 +1427,22 @@ def _driver_ceiling(driver):
     return driver.working_hours_per_day
 
 
-def _unit_driver_feasible(d, unit, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver):
+def _unit_driver_feasible(d, unit, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver,
+                           busy_intervals_override=None):
     """Same hard-rule set as allocate()'s main candidate filter, applied to
     a PlanningUnit instead of a single Job. Returns (True, effective_group_key)
-    or (False, None)."""
+    or (False, None).
+
+    busy_intervals_override: when given, checked INSTEAD of d.busy_intervals --
+    used by _swap_repair's whole-bundle feasibility check, which needs to ask
+    "would this fit against a hypothetical (reduced, or tentatively-extended)
+    set of intervals" without mutating the real driver yet."""
     if not _driver_qualifies_for_type(d, unit.vehicle_type_required):
         return False, None
     if _driver_is_off(d, unit.start_dt.date(), allow_override_days):
         return False, None
-    if not _job_matches_shift_period(unit.start_dt, d.shift_period):
+    busy_intervals = d.busy_intervals if busy_intervals_override is None else busy_intervals_override
+    if not _job_matches_shift_period(unit.start_dt, d.shift_period, busy_intervals=busy_intervals):
         return False, None
     group_key = unit.same_driver_key or None
     established_vehicle = group_vehicle_by_driver.get((group_key, d.id)) if group_key else None
@@ -1407,11 +1450,11 @@ def _unit_driver_feasible(d, unit, allow_override_days, travel_buffer_minutes, g
         established_vehicle is None or _type_matches(unit.vehicle_type_required, established_vehicle.vehicle_type)
     )
     effective_group_key = group_key if (group_key and vehicle_type_consistent) else None
-    if _overlaps_with_buffer(d.busy_intervals, unit.start_dt, unit.end_dt,
+    if _overlaps_with_buffer(busy_intervals, unit.start_dt, unit.end_dt,
                               travel_buffer_minutes, ignore_group_key=effective_group_key):
         return False, None
     if d.working_hours_per_day is not None:
-        projected = _merged_hours(d.busy_intervals + [(unit.start_dt, unit.end_dt)])
+        projected = _merged_hours(busy_intervals + [(unit.start_dt, unit.end_dt)])
         ceiling = _driver_ceiling(d)
         if ceiling is not None and projected > ceiling + 1e-9:
             return False, None
@@ -1538,12 +1581,19 @@ def _allocate_shift(shift_units, shift_drivers, vehicle_pool, travel_buffer_minu
     return still_remaining
 
 
-def _find_vehicle_for_unit(unit, vehicle_pool, travel_buffer_minutes, effective_group_key):
+def _find_vehicle_for_unit(unit, vehicle_pool, travel_buffer_minutes, effective_group_key, extra_busy=None):
+    """extra_busy: optional {vehicle_id: [(start, end, group_key), ...]} of
+    tentative reservations not yet written onto the real VehicleProfile
+    objects -- used when checking a whole bundle of units against one
+    candidate vehicle pool without mutating anything until every unit in
+    the bundle is confirmed feasible."""
     if not _vehicle_type_needs_vehicle(unit.vehicle_type_required):
         return None, True
+    extra_busy = extra_busy or {}
     for v in vehicle_pool:
+        combined = v.busy_intervals + extra_busy.get(v.id, [])
         if _type_matches(unit.vehicle_type_required, v.vehicle_type) and not _overlaps_with_buffer(
-                v.busy_intervals, unit.start_dt, unit.end_dt,
+                combined, unit.start_dt, unit.end_dt,
                 travel_buffer_minutes, ignore_group_key=effective_group_key):
             return v, True
     return None, False
@@ -1813,20 +1863,179 @@ def _anchor_and_fill_shift(shift_units, shift_drivers, vehicle_pool, travel_buff
     return remaining
 
 
+def _bundle_units_for_driver(units, driver_id):
+    """Every displaceable 'bundle' currently sitting on this driver: each
+    ungrouped unit stands alone as its own 1-item bundle, and each distinct
+    Same-Driver group this driver is part of becomes ONE multi-item bundle
+    covering every unit that group has on this driver. Grouped work is
+    always displaced as a whole, never split -- the same whole-group-move
+    principle already established for HR-005 (_repair_minimum_daily_hours):
+    partially relocating a flagged group would just create a different,
+    equally-illegal shortfall elsewhere rather than fixing anything.
+    Smallest-hours-first, since displacing less is more likely to still
+    leave room for everything else on this driver's day."""
+    driver_units = [u for u in units if u.jobs[0].assigned_driver_id == driver_id]
+    bundles = []
+    seen_groups = set()
+    for u in driver_units:
+        if not u.same_driver_key:
+            bundles.append([u])
+        elif u.same_driver_key not in seen_groups:
+            seen_groups.add(u.same_driver_key)
+            bundles.append([x for x in driver_units if x.same_driver_key == u.same_driver_key])
+    bundles.sort(key=lambda b: sum(x.hours for x in b))
+    return bundles
+
+
+def _bundle_fits_driver(bundle, E, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver, start_busy=None):
+    """Checks whether an ENTIRE bundle (a single ungrouped unit, or every
+    unit belonging to one Same-Driver group) could be committed to driver E
+    all together -- each unit's feasibility checked against a starting
+    schedule (E's real one by default, or a hypothetical reduced one if
+    start_busy is given -- used by the chain search below to ask "would
+    this fit on E if E's own bundle X were moved out of the way first")
+    PLUS every earlier unit in this same bundle already tentatively
+    placed, so two individually-legal-looking moves can't jointly bust a
+    daily ceiling the way a naive one-at-a-time check could miss. Returns a
+    list of (unit, effective_group_key) in commit order on success, or None
+    if any unit in the bundle can't fit."""
+    tentative = list(E.busy_intervals) if start_busy is None else list(start_busy)
+    plan = []
+    for u in sorted(bundle, key=lambda x: x.start_dt):
+        ok, egk = _unit_driver_feasible(E, u, allow_override_days, travel_buffer_minutes,
+                                         group_vehicle_by_driver, busy_intervals_override=tentative)
+        if not ok:
+            return None
+        tentative = tentative + [(u.start_dt, u.end_dt, egk)]
+        plan.append((u, egk))
+    return plan
+
+
+def _find_vehicles_for_bundle(plan, vehicle_pool, travel_buffer_minutes):
+    """Finds a vehicle for every (unit, effective_group_key) in a bundle
+    plan, tracking tentative reservations across the bundle so two units in
+    the same plan don't silently double-book one physical vehicle unless
+    their group tag explicitly allows the overlap. Returns a list of
+    (unit, vehicle_or_None) on success, or None if any unit can't get one."""
+    extra_busy = {}
+    result = []
+    for u, egk in plan:
+        v, found = _find_vehicle_for_unit(u, vehicle_pool, travel_buffer_minutes, egk, extra_busy=extra_busy)
+        if not found:
+            return None
+        if v is not None:
+            extra_busy.setdefault(v.id, []).append((u.start_dt, u.end_dt, egk))
+        result.append((u, v))
+    return result
+
+
+SWAP_REPAIR_CHAIN_DEPTH = 2  # bounded augmenting-path depth for _try_place_bundle_chain --
+                              # small dataset (dozens of jobs, ~11 drivers), so even this is
+                              # cheap; each extra hop covers one more "driver who's only
+                              # blocked because THEY'RE blocking someone else" layer.
+
+
+def _try_place_bundle_chain(bundle, units, driver_pool, vehicle_pool, allow_override_days, travel_buffer_minutes,
+                             group_vehicle_by_driver, visited_driver_ids, depth_remaining):
+    """Bounded-depth augmenting-path search (the same idea used in classic
+    bipartite-matching/assignment algorithms): finds a legal home for
+    `bundle` (a single unit, or a whole Same-Driver group -- see
+    _bundle_units_for_driver), either by placing it directly onto some
+    not-yet-visited driver with genuine room, or -- if depth_remaining > 0
+    -- by displacing one of THAT driver's own bundles and recursively
+    finding a home for the displaced bundle too, chaining through as many
+    drivers as depth_remaining allows. Each driver can appear at most once
+    per chain (visited_driver_ids), so this can never cycle and is always
+    bounded by min(depth_remaining, len(driver_pool)).
+
+    This exists because a single-hop swap (_swap_repair's main loop) can
+    fail even when a fix genuinely exists: sometimes driver E could take
+    the displaced bundle, but only if ONE of E's own jobs moved to a THIRD
+    driver first -- a two-hop chain, invisible to a search that only ever
+    tries "does it fit right now."
+
+    Returns a list of (bundle, target_driver, plan, vehicle_plan) describing
+    every relocation needed, outermost bundle first, or None if no chain up
+    to this depth works. Purely a search -- nothing is mutated. The caller
+    only commits once the ENTIRE returned chain has been confirmed
+    feasible end to end (see _commit_chain)."""
+    for E in driver_pool:
+        if E.id in visited_driver_ids:
+            continue
+        plan = _bundle_fits_driver(bundle, E, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver)
+        if plan is None:
+            continue
+        vehicle_plan = _find_vehicles_for_bundle(plan, vehicle_pool, travel_buffer_minutes)
+        if vehicle_plan is not None:
+            return [(bundle, E, plan, vehicle_plan)]
+
+    if depth_remaining <= 0:
+        return None
+
+    for E in driver_pool:
+        if E.id in visited_driver_ids:
+            continue
+        for E_bundle in _bundle_units_for_driver(units, E.id):
+            reduced = [
+                iv for iv in E.busy_intervals
+                if not any(iv[0] == x.start_dt and iv[1] == x.end_dt for x in E_bundle)
+            ]
+            plan = _bundle_fits_driver(bundle, E, allow_override_days, travel_buffer_minutes,
+                                        group_vehicle_by_driver, start_busy=reduced)
+            if plan is None:
+                continue
+            vehicle_plan = _find_vehicles_for_bundle(plan, vehicle_pool, travel_buffer_minutes)
+            if vehicle_plan is None:
+                continue
+            rest = _try_place_bundle_chain(E_bundle, units, driver_pool, vehicle_pool, allow_override_days,
+                                            travel_buffer_minutes, group_vehicle_by_driver,
+                                            visited_driver_ids | {E.id}, depth_remaining - 1)
+            if rest is not None:
+                return [(bundle, E, plan, vehicle_plan)] + rest
+    return None
+
+
+def _commit_chain(chain, driver_pool, vehicle_pool, group_drivers, group_vehicle_by_driver):
+    """Commits every relocation found by _try_place_bundle_chain, in order:
+    releases every bundle from wherever it's CURRENTLY sitting first (read
+    fresh off the job's own assigned_driver_id -- never stored ahead of
+    time, since nothing has moved yet when this starts), then lands every
+    bundle on its new home. Releasing everything before committing anything
+    keeps a mid-chain slot from looking falsely occupied by a bundle that's
+    about to vacate it anyway."""
+    driver_by_id = {d.id: d for d in driver_pool}
+    for bundle, target_driver, plan, vehicle_plan in chain:
+        current_driver = driver_by_id[bundle[0].jobs[0].assigned_driver_id]
+        for x in bundle:
+            _release_unit(x, current_driver, vehicle_pool)
+    for bundle, target_driver, plan, vehicle_plan in chain:
+        for x, v in vehicle_plan:
+            egk = next(e for (uu, e) in plan if uu is x)
+            _commit_unit(x, target_driver, v, egk, group_drivers, group_vehicle_by_driver, "chain-swap-relocated")
+        for x in bundle:
+            for jb in x.jobs:
+                jb.unresolved = False
+
+
 def _swap_repair(units, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days,
                   group_drivers, group_vehicle_by_driver, max_rounds=3):
-    """Bounded local search: for each still-unresolved unit, look for a
-    driver who could take it if exactly ONE of their existing single-job,
-    ungrouped units moved elsewhere -- and only commits the swap if that
-    displaced unit actually finds a legal new home. Never a net-zero
-    shuffle; every committed swap strictly reduces the unresolved count
-    by one. Capped at max_rounds full passes, since each pass is at worst
-    O(units x drivers x drivers)."""
+    """Bounded local search: for each still-unresolved unit U, look for a
+    driver D who could take U if one existing 'bundle' of D's work moved
+    elsewhere -- a bundle being either a single ungrouped unit, or a WHOLE
+    Same-Driver group D is part of (never split, see _bundle_units_for_driver)
+    -- and only commits the swap if that entire displaced bundle actually
+    finds one legal new home, driver AND vehicle(s), all together. Tries the
+    cheap single-hop case first (does the displaced bundle fit somewhere
+    directly); if that fails, falls back to a bounded multi-hop chain search
+    (_try_place_bundle_chain) that can also displace a SECOND bundle out of
+    the way to make room for the first -- this is what actually resolves a
+    day where every driver is individually blocked, but only because
+    they're each blocking someone else in a solvable cycle-free chain.
+    Never a net-zero shuffle; every committed move strictly reduces the
+    unresolved count by one. Capped at max_rounds full passes, since each
+    pass is at worst O(units x drivers x drivers x chain_depth)."""
     def is_unresolved(u):
         return u.jobs[0].unresolved
-
-    def current_driver_id(u):
-        return u.jobs[0].assigned_driver_id
 
     for _ in range(max_rounds):
         progressed = False
@@ -1835,12 +2044,34 @@ def _swap_repair(units, driver_pool, vehicle_pool, travel_buffer_minutes, allow_
             for D in driver_pool:
                 if not _driver_qualifies_for_type(D, U.vehicle_type_required):
                     continue
-                D_units = sorted(
-                    [u for u in units if current_driver_id(u) == D.id and not u.same_driver_key and len(u.jobs) == 1],
-                    key=lambda u: u.hours,
-                )
-                for J in D_units:
-                    reduced = [iv for iv in D.busy_intervals if not (iv[0] == J.start_dt and iv[1] == J.end_dt)]
+
+                # Cheapest case first, and the one the original version of
+                # this function missed entirely: D may already have genuine
+                # free capacity -- e.g. freed up by an HR-005 release that
+                # happened after the last swap-repair pass -- in which case
+                # U just needs to be placed directly, no displacement of
+                # anything required. Checking every driver's real schedule
+                # here (not a reduced/hypothetical one) before ever
+                # considering a swap keeps a driver with genuine room from
+                # being skipped just because swap-repair only knows how to
+                # think in terms of displacement.
+                direct_ok, direct_egk = _unit_driver_feasible(D, U, allow_override_days, travel_buffer_minutes,
+                                                                group_vehicle_by_driver)
+                if direct_ok:
+                    v_direct, found_v_direct = _find_vehicle_for_unit(U, vehicle_pool, travel_buffer_minutes, direct_egk)
+                    if found_v_direct:
+                        _commit_unit(U, D, v_direct, direct_egk, group_drivers, group_vehicle_by_driver, "direct-fit")
+                        for jb in U.jobs:
+                            jb.unresolved = False
+                        placed = True
+                        progressed = True
+                        break
+
+                for bundle in _bundle_units_for_driver(units, D.id):
+                    reduced = [
+                        iv for iv in D.busy_intervals
+                        if not any(iv[0] == x.start_dt and iv[1] == x.end_dt for x in bundle)
+                    ]
                     if _overlaps_with_buffer(reduced, U.start_dt, U.end_dt, travel_buffer_minutes):
                         continue
                     if D.working_hours_per_day is not None:
@@ -1848,30 +2079,71 @@ def _swap_repair(units, driver_pool, vehicle_pool, travel_buffer_minutes, allow_
                         projected = _merged_hours(reduced + [(U.start_dt, U.end_dt)])
                         if ceiling is not None and projected > ceiling + 1e-9:
                             continue
-                    if _driver_is_off(D, U.start_dt.date(), allow_override_days) or not _job_matches_shift_period(U.start_dt, D.shift_period):
+                    if _driver_is_off(D, U.start_dt.date(), allow_override_days) or not _job_matches_shift_period(U.start_dt, D.shift_period, busy_intervals=reduced):
                         continue
-                    new_home = None
+
+                    # Single-hop attempt: does the displaced bundle fit
+                    # directly onto some other driver right now?
+                    new_home_plan = None
                     for E in driver_pool:
-                        if E.id == D.id or not _driver_qualifies_for_type(E, J.vehicle_type_required):
+                        if E.id == D.id:
                             continue
-                        ok, egk = _unit_driver_feasible(E, J, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver)
-                        if ok:
-                            new_home = (E, egk)
+                        plan = _bundle_fits_driver(bundle, E, allow_override_days, travel_buffer_minutes, group_vehicle_by_driver)
+                        if plan is not None:
+                            new_home_plan = (E, plan)
                             break
-                    if new_home is None:
-                        continue
-                    E, egk_j = new_home
-                    v_j, found_v_j = _find_vehicle_for_unit(J, vehicle_pool, travel_buffer_minutes, egk_j)
-                    if not found_v_j:
-                        continue
+
+                    if new_home_plan is not None:
+                        E, plan = new_home_plan
+                        vehicle_plan = _find_vehicles_for_bundle(plan, vehicle_pool, travel_buffer_minutes)
+                        v_u, found_v_u = (None, False)
+                        if vehicle_plan is not None:
+                            v_u, found_v_u = _find_vehicle_for_unit(U, vehicle_pool, travel_buffer_minutes, None)
+                        if vehicle_plan is not None and found_v_u:
+                            for x in bundle:
+                                _release_unit(x, D, vehicle_pool)
+                            for x, v in vehicle_plan:
+                                egk = next(e for (uu, e) in plan if uu is x)
+                                _commit_unit(x, E, v, egk, group_drivers, group_vehicle_by_driver, "swap-relocated")
+                            _commit_unit(U, D, v_u, None, group_drivers, group_vehicle_by_driver, "swap-placed")
+                            for x in bundle:
+                                for jb in x.jobs:
+                                    jb.unresolved = False
+                            for jb in U.jobs:
+                                jb.unresolved = False
+                            placed = True
+                            progressed = True
+                            break
+                        # Single-hop found a driver-side fit but no vehicle
+                        # was free there -- still worth trying the deeper
+                        # chain search below, since a different branch of
+                        # the chain may route around the vehicle conflict.
+
+                    # Multi-hop fallback: maybe no driver has room for the
+                    # displaced bundle RIGHT NOW, but one WOULD if one of
+                    # THEIR jobs moved to a third driver first. Bounded by
+                    # SWAP_REPAIR_CHAIN_DEPTH so this always terminates.
                     v_u, found_v_u = _find_vehicle_for_unit(U, vehicle_pool, travel_buffer_minutes, None)
                     if not found_v_u:
                         continue
-                    _release_unit(J, D, vehicle_pool)
-                    _commit_unit(J, E, v_j, egk_j, group_drivers, group_vehicle_by_driver, "swap-relocated")
-                    _commit_unit(U, D, v_u, None, group_drivers, group_vehicle_by_driver, "swap-placed")
-                    for jb in J.jobs + U.jobs:
+                    chain = _try_place_bundle_chain(bundle, units, driver_pool, vehicle_pool, allow_override_days,
+                                                     travel_buffer_minutes, group_vehicle_by_driver,
+                                                     {D.id}, SWAP_REPAIR_CHAIN_DEPTH)
+                    if chain is None:
+                        continue
+
+                    # _commit_chain releases every bundle in the chain --
+                    # including this outermost one, still sitting on D --
+                    # from wherever it's CURRENTLY assigned before landing
+                    # each on its new home. Don't pre-release `bundle` here
+                    # too: it's already chain[0], and releasing it twice
+                    # would clear its assigned_driver_id before _commit_chain
+                    # gets a chance to read where it's coming from.
+                    _commit_chain(chain, driver_pool, vehicle_pool, group_drivers, group_vehicle_by_driver)
+                    _commit_unit(U, D, v_u, None, group_drivers, group_vehicle_by_driver, "chain-swap-placed")
+                    for jb in U.jobs:
                         jb.unresolved = False
+
                     placed = True
                     progressed = True
                     break
@@ -1999,13 +2271,587 @@ def allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings,
             j.unresolved = False
 
     settled_job_ids = set()
-    for _ in range(6):
-        changed_gap = _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days)
-        changed_repair = _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes,
-                                                       allow_override_days, settled_job_ids=settled_job_ids)
-        changed_idle = _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minutes,
-                                                allow_override_days, settled_job_ids=settled_job_ids)
-        if not (changed_gap or changed_repair or changed_idle):
+    # Outer loop: rearrangement (gap-fill / HR-005 minimum-hours / idle-driver
+    # rescue) and swap-repair each can create new opportunities for the
+    # other -- most concretely, HR-005 releasing a whole grouped day back to
+    # unresolved happens AFTER swap-repair's first (and previously only)
+    # pass, so those released units never got a chance at a swap. Looping
+    # the pair a bounded few times lets a later swap pick up what an earlier
+    # HR-005 release freed, and vice versa, without risking an unbounded
+    # back-and-forth (each inner stage is itself change-detecting and exits
+    # early once nothing moves).
+    for _ in range(10):
+        any_rearrange_changed = False
+        for _ in range(6):
+            changed_gap = _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days)
+            changed_repair = _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_minutes,
+                                                           allow_override_days, settled_job_ids=settled_job_ids)
+            changed_idle = _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minutes,
+                                                    allow_override_days, settled_job_ids=settled_job_ids)
+            if changed_gap or changed_repair or changed_idle:
+                any_rearrange_changed = True
+            else:
+                break
+
+        unresolved_before_swap = sum(1 for u in units if u.jobs[0].unresolved)
+        _swap_repair(units, driver_pool, vehicle_pool, travel_buffer_minutes, allow_override_days,
+                     group_drivers, group_vehicle_by_driver, max_rounds=swap_rounds)
+        unresolved_after_swap = sum(1 for u in units if u.jobs[0].unresolved)
+        swap_progressed = unresolved_after_swap < unresolved_before_swap
+
+        if not any_rearrange_changed and not swap_progressed:
             break
+
+    return jobs
+
+# ==========================================================================
+# allocate_by_solver() -- NEW strategy (2026-08-08), built on Google OR-Tools'
+# CP-SAT constraint solver instead of a hand-written heuristic. Added after
+# three separate real bugs were found and fixed one at a time while chasing
+# the last few unresolved jobs with allocate_by_anchor()'s bounded chain
+# search (a phantom busy-interval left behind by a mismatched release-tuple
+# comparison, a driver never re-checked after capacity freed up elsewhere,
+# and a scope gap where the chain search couldn't see far enough) -- each a
+# genuine, subtle bug, and each the kind of thing a greedy/local-search
+# heuristic will keep producing one at a time as new edge cases surface.
+# The project owner asked, after seeing this pattern, what method real
+# fleet/crew-scheduling systems actually use for this problem class: a
+# constraint solver. Instead of writing step-by-step placement logic, every
+# hard rule is stated as a constraint and the actual goal (zero unresolved,
+# then zero supplier use, then balanced hours) as an objective, and the
+# solver searches the space directly and provably rather than through a
+# sequence of hand-coded heuristic passes.
+#
+# SCOPE OF THIS FIRST VERSION -- deliberately narrower than the other three
+# strategies in two specific, disclosed ways (Rule 16):
+#   1. "Same Driver" group cohesion for NON-overlapping members gets a real
+#      soft-preference bonus in the objective (added after testing directly
+#      against a real human-planned day: a 4-row group spanning 13:00-15:00,
+#      17:00-19:00, and a 23:00-01:00 pair, none of them overlapping each
+#      other at all, was kept entirely on one driver in the real plan purely
+#      as a preference -- the first version of this strategy had no
+#      incentive to do that, and left one of those rows unresolved as a
+#      direct result even though every row individually had somewhere to
+#      go). What's still NOT modeled is genuine overlap-relaxation for group
+#      members beyond what build_planning_units() already pre-merges (exact
+#      pairs, same vehicle type, times within 1h, handled automatically as
+#      one decision) -- if two DIFFERENT units share a same_driver_key AND
+#      genuinely overlap in time, they're still constrained with ORDINARY
+#      overlap rules and can never legally land on the same driver here,
+#      even though the real engine's SD-004-aware relaxation would allow it
+#      for a matching vehicle type. This is a real, disclosed, narrower
+#      boundary than allocate()/allocate_by_merit()/allocate_by_anchor(),
+#      not a silent gap -- the dominant real-world overlapping case (two
+#      simultaneous same-vehicle pickups) is still handled correctly via
+#      pre-merging; what's left out is specifically 3+-way simultaneous
+#      group overlaps, a rarer pattern not yet confirmed as a real problem.
+#   2. Supplier hiring is NOT modeled inside the solver itself (dynamically
+#      naming/numbering hired units the way the solver would need to is a
+#      different kind of combinatorial problem, and modeling it exactly
+#      would roughly double the size of this change). Instead: the solver
+#      is given ONLY in-house drivers/vehicles, with an explicit "unresolved"
+#      escape valve per unit; whatever's still unresolved after the solver
+#      finishes is then run through the SAME reuse-before-hire supplier pass
+#      allocate() already uses, unchanged, matching Rule 1 (extend, don't
+#      reinvent) and Rule 7 (suppliers are the fallback, and are actually a
+#      separate, already-solved sub-problem, not a novel part of this one).
+#
+# Everything else -- license/vehicle-type matching, off-days, the shift
+# window rule (gates only a driver's first job of the day, not a wall
+# across the whole day -- confirmed against a real PLANNED file), the daily
+# floor/ceiling (folding in the monthly-overtime-budget interaction), and
+# no-double-booking for both drivers and vehicles -- is modeled as a real
+# hard constraint, not approximated.
+# ==========================================================================
+
+def _solver_effective_ceiling_minutes(driver):
+    """Combines the two layered daily-hours checks _unit_driver_feasible()
+    already applies into ONE effective per-driver daily ceiling, in minutes
+    (CP-SAT needs integers, and minutes avoids float rounding issues):
+    the flat daily ceiling (max_working_hours_per_day, or working_hours_per_day
+    if that's blank), AND -- separately -- if max_overtime_hours_per_month is
+    blank, NO daily overtime is allowed at all regardless of what the daily
+    ceiling says (a blank monthly budget means zero overtime, matching the
+    project's established precedent), so the effective ceiling collapses to
+    working_hours_per_day in that case; if a monthly budget IS configured,
+    the effective ceiling is further capped by however much of that budget
+    is still unspent this month. Returns None if working_hours_per_day
+    itself isn't configured (no daily rule at all for this driver)."""
+    if driver.working_hours_per_day is None:
+        return None
+    floor_minutes = driver.working_hours_per_day * 60.0
+    if driver.max_overtime_hours_per_month is None:
+        return floor_minutes
+    flat_ceiling_minutes = _driver_ceiling(driver) * 60.0
+    remaining_monthly_minutes = max(0.0, driver.max_overtime_hours_per_month - driver.month_overtime_so_far) * 60.0
+    return min(flat_ceiling_minutes, floor_minutes + remaining_monthly_minutes)
+
+
+def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
+                        allowed_driver_ids=None, allowed_supplier_ids=None,
+                        allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES,
+                        time_limit_seconds=15.0):
+    """Constraint-solver strategy (Google OR-Tools CP-SAT). See the module
+    comment block above this function for the full design and its two
+    disclosed scope boundaries. Mutates and returns `jobs`, same contract as
+    the other three strategies. Not yet wired into the UI -- exists so it
+    can be tested and compared against real data first (Rule 13).
+
+    Requires the `ortools` package. Raises ImportError with a clear message
+    if it isn't installed, rather than letting the rest of this module (or
+    the app) fail to import."""
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError as e:
+        raise ImportError(
+            "allocate_by_solver() requires the 'ortools' package (pip install ortools). "
+            "It is not required for any other part of this app -- only this one "
+            "experimental strategy."
+        ) from e
+
+    allow_override_days = allow_override_days or {}
+    driver_pool = [d for d in drivers if allowed_driver_ids is None or d.id in allowed_driver_ids]
+    vehicle_pool = [v for v in vehicles if not v.in_workshop]
+    offering_pool = [o for o in supplier_offerings if allowed_supplier_ids is None or o.supplier_id in allowed_supplier_ids]
+
+    for j in jobs:
+        if j.start_dt is None or j.end_dt is None:
+            j.unresolved = True
+            j.assignment_note = "Could not parse date/time for this row"
+
+    valid_jobs = [j for j in jobs if j.start_dt is not None and j.end_dt is not None]
+    units = build_planning_units(valid_jobs)
+    n = len(units)
+    if n == 0:
+        return jobs
+
+    # ---- Warm-start hint ----------------------------------------------------
+    # Adding the Same-Driver group-cohesion bonus (see below) made this model
+    # noticeably harder for CP-SAT to converge on from a cold start -- proven
+    # by direct testing: wall time went from under a second to over a minute
+    # without reaching a proven-optimal status. The standard fix or exactly
+    # this ("good model, slow convergence") is a warm-start hint: run a fast
+    # heuristic first (allocate_by_anchor, itself validated separately against
+    # real data and typically sub-second) and hand its result to the solver as
+    # a starting point via model.AddHint(). CP-SAT then searches for
+    # improvements FROM there instead of from nothing, which both speeds up
+    # convergence and tends to reach a better (or provably optimal) result
+    # faster. This never constrains the actual search -- the solver is free
+    # to move away from the hint entirely if a better solution exists; it's
+    # purely a starting point. Runs on independent COPIES of the drivers/
+    # vehicles/jobs so it can't leak any state into the real objects this
+    # function will go on to mutate for real.
+    import copy
+    from dataclasses import replace as _dc_replace
+    hint_driver_id = {}
+    hint_vehicle_id = {}
+    hint_unresolved = {}
+    try:
+        scratch_drivers = [_dc_replace(d, occupied_seconds=0.0, busy_intervals=[]) for d in driver_pool]
+        scratch_vehicles = [_dc_replace(v, busy_intervals=[]) for v in vehicle_pool]
+        scratch_jobs = copy.deepcopy(valid_jobs)
+        allocate_by_anchor(scratch_jobs, scratch_drivers, scratch_vehicles, offering_pool,
+                            allow_override_days=allow_override_days, travel_buffer_minutes=travel_buffer_minutes)
+        scratch_by_sr = {j.sr: j for j in scratch_jobs}
+        for i, u in enumerate(units):
+            scratch_job = scratch_by_sr.get(u.jobs[0].sr)
+            if scratch_job is None:
+                continue
+            if scratch_job.unresolved:
+                hint_unresolved[i] = True
+            elif scratch_job.assigned_driver_id is not None:
+                hint_driver_id[i] = scratch_job.assigned_driver_id
+                if scratch_job.assigned_vehicle_id is not None:
+                    hint_vehicle_id[i] = scratch_job.assigned_vehicle_id
+    except Exception:
+        # The hint is purely a speed optimization -- if anything about this
+        # scratch run goes wrong for any reason, solve cold rather than fail
+        # the whole strategy over what's just a head start.
+        pass
+
+    def _minutes(dt_a, dt_b):
+        return int(round((dt_b - dt_a).total_seconds() / 60.0))
+
+    def _overlaps(u, w, buffer_minutes):
+        buf = timedelta(minutes=buffer_minutes)
+        return u.start_dt < w.end_dt + buf and w.start_dt < u.end_dt + buf
+
+    model = cp_model.CpModel()
+
+    # ---- Per-unit compatible driver list (license + off-day only here --
+    # shift is sequence-dependent, handled below via has_morning/has_evening
+    # linking constraints, not a pre-filter) --------------------------------
+    compatible_drivers = []
+    for u in units:
+        compat = [
+            d for d in driver_pool
+            if _driver_qualifies_for_type(d, u.vehicle_type_required)
+            and not _driver_is_off(d, u.start_dt.date(), allow_override_days)
+        ]
+        compatible_drivers.append(compat)
+
+    # ---- Per-unit compatible vehicle list ----------------------------------
+    needs_vehicle = [_vehicle_type_needs_vehicle(u.vehicle_type_required) for u in units]
+    compatible_vehicles = []
+    for i, u in enumerate(units):
+        if not needs_vehicle[i]:
+            compatible_vehicles.append([])
+            continue
+        compatible_vehicles.append([v for v in vehicle_pool if _type_matches(u.vehicle_type_required, v.vehicle_type)])
+
+    # ---- Decision variables -------------------------------------------------
+    x = {}   # (i, driver.id) -> BoolVar
+    for i, u in enumerate(units):
+        for d in compatible_drivers[i]:
+            x[i, d.id] = model.NewBoolVar(f"x_u{i}_d{d.id}")
+
+    veh = {}  # (i, vehicle.id) -> BoolVar
+    for i, u in enumerate(units):
+        for v in compatible_vehicles[i]:
+            veh[i, v.id] = model.NewBoolVar(f"veh_u{i}_v{v.id}")
+
+    unresolved = [model.NewBoolVar(f"unresolved_u{i}") for i in range(n)]
+
+    # Apply the warm-start hint gathered above, now that x/veh/unresolved
+    # all exist. Only hints variables the scratch run actually touched --
+    # any (unit, driver) or (unit, vehicle) pair not license/type-compatible
+    # never got a variable created for it in the first place, so there's
+    # nothing to hint there regardless.
+    hint_vars, hint_vals = [], []
+    for i in range(n):
+        if hint_unresolved.get(i):
+            hint_vars.append(unresolved[i])
+            hint_vals.append(1)
+            continue
+        did = hint_driver_id.get(i)
+        if did is not None and (i, did) in x:
+            hint_vars.append(x[i, did])
+            hint_vals.append(1)
+        vid = hint_vehicle_id.get(i)
+        if vid is not None and (i, vid) in veh:
+            hint_vars.append(veh[i, vid])
+            hint_vals.append(1)
+    for hv, hval in zip(hint_vars, hint_vals):
+        model.add_hint(hv, hval)
+
+    # Each unit is either assigned to exactly one compatible driver, or
+    # unresolved -- never both, never neither.
+    for i in range(n):
+        driver_terms = [x[i, d.id] for d in compatible_drivers[i]]
+        model.Add(sum(driver_terms) + unresolved[i] == 1)
+
+    # If a unit needs a vehicle, it gets exactly one IFF it's actually
+    # assigned to a driver; if it needs no vehicle ("Driver Only"), no
+    # vehicle variables exist for it at all (nothing to constrain).
+    for i, u in enumerate(units):
+        if needs_vehicle[i]:
+            driver_terms = [x[i, d.id] for d in compatible_drivers[i]]
+            vehicle_terms = [veh[i, v.id] for v in compatible_vehicles[i]]
+            model.Add(sum(vehicle_terms) == sum(driver_terms))
+
+    # ---- No-double-booking: drivers ----------------------------------------
+    # See the module comment block's scope note (1): the Same-Driver overlap
+    # exception only applies INSIDE a pre-merged unit (handled automatically,
+    # since that's a single decision); any two DIFFERENT units are always
+    # mutually exclusive on a shared driver if their times genuinely overlap,
+    # regardless of same_driver_key.
+    for i in range(n):
+        for j2 in range(i + 1, n):
+            if not _overlaps(units[i], units[j2], travel_buffer_minutes):
+                continue
+            shared_driver_ids = set(d.id for d in compatible_drivers[i]) & set(d.id for d in compatible_drivers[j2])
+            for did in shared_driver_ids:
+                model.Add(x[i, did] + x[j2, did] <= 1)
+
+    # ---- No-double-booking: vehicles ---------------------------------------
+    for i in range(n):
+        if not needs_vehicle[i]:
+            continue
+        for j2 in range(i + 1, n):
+            if not needs_vehicle[j2] or not _overlaps(units[i], units[j2], travel_buffer_minutes):
+                continue
+            shared_vehicle_ids = set(v.id for v in compatible_vehicles[i]) & set(v.id for v in compatible_vehicles[j2])
+            for vid in shared_vehicle_ids:
+                model.Add(veh[i, vid] + veh[j2, vid] <= 1)
+
+    # ---- Shift window: gates only a driver's FIRST job of the day ----------
+    # (confirmed against a real human-planned day where a 'morning' driver
+    # routinely picked up an afternoon job as a natural continuation of a
+    # day already under way -- see _job_matches_shift_period's docstring for
+    # the full reasoning). Encoded as: if a 'morning' driver has ANY evening-
+    # window unit assigned, they must have AT LEAST ONE morning-window unit
+    # assigned too (their real first job); symmetric for 'evening' drivers
+    # picking up an early-morning-window unit (e.g. an overnight job rolling
+    # into the small hours).
+    for d in driver_pool:
+        if d.shift_period not in ("morning", "evening"):
+            continue
+        morning_terms, evening_terms = [], []
+        for i, u in enumerate(units):
+            if (i, d.id) not in x:
+                continue
+            is_evening_unit = u.start_dt.time() >= time(SHIFT_PERIOD_EVENING_CUTOFF_HOUR, 0)
+            (evening_terms if is_evening_unit else morning_terms).append(x[i, d.id])
+        if d.shift_period == "morning" and evening_terms:
+            has_morning = model.NewBoolVar(f"has_morning_d{d.id}")
+            if morning_terms:
+                model.AddMaxEquality(has_morning, morning_terms)
+            else:
+                model.Add(has_morning == 0)
+            for term in evening_terms:
+                model.Add(term <= has_morning)
+        if d.shift_period == "evening" and morning_terms:
+            has_evening = model.NewBoolVar(f"has_evening_d{d.id}")
+            if evening_terms:
+                model.AddMaxEquality(has_evening, evening_terms)
+            else:
+                model.Add(has_evening == 0)
+            for term in morning_terms:
+                model.Add(term <= has_evening)
+
+    # ---- Daily hours: floor (if used at all) and ceiling --------------------
+    # HR-005 exemption (already established in allocate()'s
+    # _repair_minimum_daily_hours, confirmed against the real PLANNED file):
+    # the daily MINIMUM only applies when a driver's day is entirely
+    # ungrouped work. If ANY of a driver's units that day belong to a
+    # Same-Driver group, the floor is not enforced at all for that day --
+    # a real driver in the ground-truth plan (VISWANADHAN) legitimately
+    # worked only 5h because every one of his jobs that day was inside one
+    # flagged group, and the group's own hours are what's driving the
+    # shortfall, not something forcing more (or fewer) hours could fix.
+    # The ceiling still applies unconditionally either way -- only the
+    # floor gets this exemption.
+    used = {}
+    total_minutes = {}
+    for d in driver_pool:
+        my_terms = [(i, x[i, d.id]) for i, u in enumerate(units) if (i, d.id) in x]
+        if not my_terms:
+            continue
+        total = sum(_minutes(units[i].start_dt, units[i].end_dt) * var for i, var in my_terms)
+        total_var = model.NewIntVar(0, 24 * 60, f"total_d{d.id}")
+        model.Add(total_var == total)
+        total_minutes[d.id] = total_var
+
+        used_var = model.NewBoolVar(f"used_d{d.id}")
+        model.AddMaxEquality(used_var, [var for _, var in my_terms])
+        used[d.id] = used_var
+
+        ceiling_minutes = _solver_effective_ceiling_minutes(d)
+        if ceiling_minutes is not None:
+            model.Add(total_var <= int(ceiling_minutes))
+
+            grouped_terms = [var for i, var in my_terms if units[i].same_driver_key]
+            if grouped_terms:
+                has_grouped_unit = model.NewBoolVar(f"has_grouped_d{d.id}")
+                model.AddMaxEquality(has_grouped_unit, grouped_terms)
+                floor_applies = model.NewBoolVar(f"floor_applies_d{d.id}")
+                model.Add(floor_applies <= used_var)
+                model.Add(floor_applies <= 1 - has_grouped_unit)
+                model.Add(floor_applies >= used_var - has_grouped_unit)
+            else:
+                floor_applies = used_var  # no grouped units possible for this driver at all -- floor always applies when used
+
+            floor_minutes = int(d.working_hours_per_day * 60)
+            model.Add(total_var >= floor_minutes).OnlyEnforceIf(floor_applies)
+
+    # ---- Same-Driver group cohesion (soft preference, SD-002/SD-003) ------
+    # build_planning_units() already merges exact pairs (same vehicle type,
+    # times within 1h) into one unit -- nothing extra needed there, it's a
+    # single decision already. But a group can have MORE than 2 members, or
+    # members spread far enough apart in time that they never got pre-merged
+    # even though they don't conflict with each other at all -- confirmed
+    # against a real human-planned day: a 4-row group (13:00-15:00,
+    # 17:00-19:00, and a 23:00-01:00 pair) was kept entirely on one driver,
+    # with zero time overlap between any of its members, purely as a
+    # preference. Originally scoped OUT of v1 on the assumption the dominant
+    # pattern was already covered by pre-merged pairs -- but testing directly
+    # against that real file showed the solver leaving a job unresolved
+    # specifically because nothing told it to prefer consolidating that
+    # group, even though every member individually had a place to go.
+    #
+    # Encoded as: minimize the number of DISTINCT drivers touching each
+    # group, rather than a per-PAIR "together" bonus. A first version used
+    # pairwise together[i,j,driver] booleans (O(members^2) per group) and
+    # measurably slowed the solver down -- confirmed by direct testing, wall
+    # time went from under a second to over a minute without even reaching a
+    # proven-optimal status, because pairwise terms create a lot of
+    # symmetric, equally-good alternative combinations for the search to
+    # sift through. touches_group[group,driver] (O(members) per group,
+    # linked with simple one-directional >= constraints and left otherwise
+    # unconstrained -- the objective's downward pressure does the rest) is
+    # the standard leaner way to express "minimize how spread out this group
+    # is" and is both correct and cheap.
+    group_driver_touch_terms = []
+    units_by_group = {}
+    for i, u in enumerate(units):
+        key = u.same_driver_key or None
+        if key:
+            units_by_group.setdefault(key, []).append(i)
+    for key, member_indices in units_by_group.items():
+        if len(member_indices) < 2:
+            continue
+        candidate_driver_ids = set()
+        for i in member_indices:
+            candidate_driver_ids.update(d.id for d in compatible_drivers[i])
+        for did in candidate_driver_ids:
+            member_vars_on_this_driver = [x[i, did] for i in member_indices if (i, did) in x]
+            if not member_vars_on_this_driver:
+                continue
+            touches = model.NewBoolVar(f"touches_{key}_{did}")
+            for var in member_vars_on_this_driver:
+                model.Add(touches >= var)
+            group_driver_touch_terms.append(touches)
+
+    # ---- Objective: minimize unresolved (dominant), then reward Same-Driver
+    # group consolidation, then minimize unused capacity among drivers
+    # actually used (balances hours -- directly the "job 57 swap" idea the
+    # project owner described: redistribute so idle time is spread evenly
+    # rather than piling up on one driver), then a small bonus for spreading
+    # work across more drivers when it's free to do so. Each tier uses a
+    # weight comfortably larger than everything below it could possibly sum
+    # to, so higher tiers are never traded away for a gain in a lower one.
+    # -------------------------------------------------------------
+    BIG_M = 1_000_000
+    GROUP_COHESION_WEIGHT = 10_000
+    unused_capacity_terms = []
+    for d in driver_pool:
+        if d.id not in total_minutes:
+            continue
+        ceiling_minutes = _solver_effective_ceiling_minutes(d)
+        if ceiling_minutes is None:
+            continue
+        gap = model.NewIntVar(0, int(ceiling_minutes), f"gap_d{d.id}")
+        model.Add(gap == int(ceiling_minutes) - total_minutes[d.id]).OnlyEnforceIf(used[d.id])
+        model.Add(gap == 0).OnlyEnforceIf(used[d.id].Not())
+        unused_capacity_terms.append(gap)
+
+    driver_count_bonus = sum(used.values()) if used else 0
+
+    model.Minimize(
+        BIG_M * sum(unresolved)
+        + GROUP_COHESION_WEIGHT * sum(group_driver_touch_terms)
+        + sum(unused_capacity_terms)
+        - driver_count_bonus
+    )
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_seconds
+    solver.parameters.num_search_workers = 8
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # No feasible solution found at all within the time limit (should be
+        # rare -- "everyone unresolved" is always feasible, since unresolved
+        # has no other constraints) -- fail safe by marking everything
+        # unresolved rather than raising, matching every other strategy's
+        # behavior when a job simply can't be placed.
+        for u in units:
+            for j in u.jobs:
+                j.unresolved = True
+                j.assignment_note = "Solver found no feasible solution within the time limit"
+        return jobs
+
+    driver_by_id = {d.id: d for d in driver_pool}
+    group_drivers = {}
+    group_vehicle_by_driver = {}
+
+    for i, u in enumerate(units):
+        if solver.Value(unresolved[i]):
+            for j in u.jobs:
+                j.unresolved = True
+            continue
+        chosen_driver = None
+        for d in compatible_drivers[i]:
+            if solver.Value(x[i, d.id]):
+                chosen_driver = d
+                break
+        chosen_vehicle = None
+        if needs_vehicle[i]:
+            for v in compatible_vehicles[i]:
+                if solver.Value(veh[i, v.id]):
+                    chosen_vehicle = v
+                    break
+        _commit_unit(u, chosen_driver, chosen_vehicle, u.same_driver_key or None,
+                     group_drivers, group_vehicle_by_driver, "solver")
+
+    # ---- Supplier fallback for anything the solver left unresolved --------
+    # Identical reuse-before-hire logic to allocate()/allocate_by_merit()'s
+    # supplier pass, reused rather than reimplemented (Rule 1).
+    leftover_units = [u for u in units if u.jobs[0].unresolved]
+    hires_by_key = {}
+    group_supplier_hires = {}
+    for unit in sorted(leftover_units, key=lambda u: u.start_dt):
+        group_key = unit.same_driver_key or None
+        note_suffix = " [Same Driver group]" if group_key else ""
+        matching_offerings = [o for o in offering_pool if _type_matches(unit.vehicle_type_required, o.vehicle_type)]
+        if not matching_offerings:
+            for j in unit.jobs:
+                j.unresolved = True
+                j.assignment_note = "No qualifying in-house or supplier resource available"
+            continue
+
+        reusable_hire = None
+        if group_key:
+            for hire in group_supplier_hires.get(group_key, []):
+                if _type_matches(unit.vehicle_type_required, hire.vehicle_type) and not _overlaps_with_buffer(
+                        hire.busy_intervals, unit.start_dt, unit.end_dt, travel_buffer_minutes, ignore_group_key=group_key):
+                    reusable_hire = hire
+                    break
+        if reusable_hire is None:
+            for o in matching_offerings:
+                key = (o.supplier_id, o.vehicle_type)
+                for hire in hires_by_key.get(key, []):
+                    if not _overlaps_with_buffer(hire.busy_intervals, unit.start_dt, unit.end_dt,
+                                                  travel_buffer_minutes, ignore_group_key=group_key):
+                        reusable_hire = hire
+                        break
+                if reusable_hire:
+                    break
+
+        if reusable_hire:
+            reusable_hire.busy_intervals.append((unit.start_dt, unit.end_dt, group_key))
+            label = reusable_hire.label
+            supplier_text = f"SAME {label}" if reusable_hire.already_used else label
+            reusable_hire.already_used = True
+            for j in unit.jobs:
+                j.unresolved = False
+                j.assigned_supplier_unit = supplier_text
+                j.assigned_supplier_id = reusable_hire.supplier_id
+                j.assignment_note = f"Supplier: {reusable_hire.supplier_name}{note_suffix}"
+            if group_key:
+                group_supplier_hires.setdefault(group_key, [])
+                if reusable_hire not in group_supplier_hires[group_key]:
+                    group_supplier_hires[group_key].append(reusable_hire)
+            continue
+
+        hireable = []
+        for o in matching_offerings:
+            key = (o.supplier_id, o.vehicle_type)
+            already_hired_count = len(hires_by_key.get(key, []))
+            if o.max_available_per_day is None or already_hired_count < o.max_available_per_day:
+                hireable.append(o)
+        if not hireable:
+            for j in unit.jobs:
+                j.unresolved = True
+                j.assignment_note = "No qualifying in-house or supplier resource available (all suppliers at daily capacity)"
+            continue
+
+        chosen_offering = min(hireable, key=lambda o: o.cumulative_hours_history)
+        key = (chosen_offering.supplier_id, chosen_offering.vehicle_type)
+        instance_number = len(hires_by_key.get(key, [])) + 1
+        new_hire = SupplierHire(
+            supplier_id=chosen_offering.supplier_id, supplier_name=chosen_offering.supplier_name,
+            vehicle_type=chosen_offering.vehicle_type, instance_number=instance_number,
+        )
+        new_hire.busy_intervals.append((unit.start_dt, unit.end_dt, group_key))
+        new_hire.already_used = True
+        hires_by_key.setdefault(key, []).append(new_hire)
+        if group_key:
+            group_supplier_hires.setdefault(group_key, []).append(new_hire)
+        for j in unit.jobs:
+            j.unresolved = False
+            j.assigned_supplier_unit = new_hire.label
+            j.assigned_supplier_id = new_hire.supplier_id
+            j.assignment_note = f"Supplier: {new_hire.supplier_name}{note_suffix}"
 
     return jobs

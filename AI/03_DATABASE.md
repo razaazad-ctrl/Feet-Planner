@@ -332,3 +332,15 @@ SELECT * FROM decision_log WHERE plan_date > ? ORDER BY plan_date
   session sees an unexplained zero-match on text that looks identical in
   the UI, check for a literal `\n` (or other whitespace variant) before
   assuming it's a code bug.
+
+- **Another instance of the same exact-string-matching failure class,
+  found and fixed 2026-08-09:** vehicle plate `A 68982` was entered as
+  `vehicle_type = "14 Seater Van"` in the test database when the actual
+  vehicle is a `"14 Seater Bus"` -- spotted by the project owner via a
+  direct screenshot of the real source data, not discovered through the
+  software. Fixed via `db.update_vehicle()` in the test database only;
+  the project owner's own live database has the same issue and needs the
+  same manual correction via the Vehicles tab, not something this
+  session touched. No schema or code change -- purely a data-entry
+  correction, same category as the "Seated"/"Seater" and embedded-
+  newline issues above. See `CHANGELOG_AI.md` Phase 16.

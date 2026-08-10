@@ -103,8 +103,34 @@ Section 3 below).
   tables exist.** They are reserved schema with zero CRUD or UI wired to
   them. If asked to build off-day/comp-day tracking, you're building it
   from scratch, not extending something that partially works.
-
-## 4. Areas of the code that require extra care
+- **In `allocate_by_solver()`, using a pairwise encoding for a soft
+  "keep these things together" preference in the CP-SAT model.** Tried
+  once (Phase 16): a `together[unit_i, unit_j, driver]` boolean per pair
+  of Same-Driver-group units per shared candidate driver, correctly
+  modeled logically, but measurably slowed the solver down -- wall time
+  went from well under a second to over 60 seconds without even reaching
+  a proven-optimal status, because pairwise terms create a lot of
+  symmetric, equally-good alternative combinations for the search to
+  sift through. The fix was a `touches_group[group, driver]` encoding
+  (minimize the number of distinct drivers touching each group,
+  O(members) instead of O(members²) per group) -- logically equivalent,
+  much cheaper to search. If a future soft preference needs adding to
+  this model, prefer an encoding that scales linearly with group/set
+  size over one that scales quadratically, even when both are logically
+  equivalent -- CP-SAT's search difficulty is about symmetry as much as
+  raw constraint count. See `CHANGELOG_AI.md` Phase 16 for the full
+  before/after timing.
+- **Using OR-Tools' camelCase API (`model.AddHint`, `model.NewBoolVar`
+  is fine, but check any camelCase method before relying on it) without
+  checking whether it's a deprecated alias first.** `AddHint` specifically
+  has a broken compatibility shim in the pinned `ortools` version when
+  passed list arguments (`TypeError` deep inside the library, not an
+  obviously-hint-related error message). The real, current method is
+  snake_case `model.add_hint(var, value)`, called once per pair, not
+  with lists. If an OR-Tools call throws a confusing error, check
+  `inspect.getsource()` on the method actually being called before
+  assuming the arguments are wrong -- the deprecated alias's own error
+  can be misleading.
 
 - **`allocation_engine.py`'s `allocate()` function.** This is the core
   of the whole product's value. It is deterministic and must stay that
@@ -417,77 +443,164 @@ Section 3 below).
   disclosed gap -- worth closing before either new strategy is
   considered for production use, following this project's own testing
   discipline (see Section 4, "Areas of the code that require extra
-  care").
+  care"). **Still open as of Phase 16 -- see below, the gap now also
+  covers all of Phase 16's new code on top of this.**
+- ~~10-Ton-Chiller-Truck scarcity confirmed as a genuine capacity
+  constraint~~ **Confirmed still physically true (only one such vehicle
+  exists, plate `A 67338`), but NOT actually a bottleneck once the
+  algorithm correctly sequences one driver across the whole day on it --
+  see Phase 16.** The scarcity note above was accurate as written; it
+  just turned out one vehicle, run by one driver back-to-back
+  (12:00-17:00, 17:00-22:00, 23:00-01:00 in the real ground-truth file),
+  was always sufficient for the real day's actual demand. The earlier
+  "genuine ceiling" conclusion was really an artifact of the algorithm
+  not keeping that one driver on that one vehicle consistently across
+  the day, not the vehicle count itself.
+- **RESOLVED 2026-08-06/09 (Phase 15 + Phase 16 combined): zero unresolved,
+  zero supplier, all 11 drivers used on the real `UNPLANNED.xlsx`, via TWO
+  different validated paths.** `allocate_by_anchor()` reached this via
+  three real bug fixes to `_swap_repair` (whole-group/bundle displacement,
+  a direct-fit check it was missing entirely, and a bounded multi-hop
+  chain search) plus a genuine business-rule correction (the Morning/
+  Evening shift window only gates a driver's FIRST job of the day, not
+  every job -- confirmed against a real human-planned file). The new
+  `allocate_by_solver()` (Google OR-Tools CP-SAT) reaches the SAME
+  headline result independently, with a mathematically PROVEN-optimal
+  status (not just "a solution was found"), in under 4 seconds on the
+  real file. See `CHANGELOG_AI.md` Phase 16 for the full technical
+  writeup of both, including three more real bugs found and fixed while
+  building the solver (a deprecated-API footgun in the `ortools` version
+  pinned here, a 60x+ slowdown from a naive pairwise soft-constraint
+  encoding, and a daily-floor exemption the solver hadn't replicated
+  from the existing heuristic engines). **This does not mean the project
+  is "done"** -- see the priority list in Section 6, now substantially
+  rewritten, for what's actually next.
+- **NEW, real gap opened by Phase 16: `allocate_by_solver()` has zero
+  dedicated synthetic tests, same caveat as the other two experimental
+  strategies above.** All validation so far is a single real-data run.
+  Given how much of this strategy's correctness rests on the CP-SAT
+  model itself (constraint-by-constraint) rather than step-by-step
+  procedural logic, targeted synthetic tests here would likely look
+  different in shape from this project's existing `tests/*.py` files --
+  probably small, hand-built scenarios checking ONE constraint at a time
+  (e.g. "a driver whose whole day would be one grouped job should never
+  be forced to hit the floor," "an off-day driver should never get a
+  variable created for them at all," "the shift window should allow a
+  continuation job but refuse a lone evening job for a morning-only
+  driver") rather than full `allocate()`-style end-to-end runs. Not
+  built yet -- flagged as a real priority, see Section 6.
 
 ## 6. Recommended next improvements, roughly in priority order
 
 Based on what's explicitly still open and what would unblock the most
-value:
+value. **This list changed substantially after Phase 16** -- the
+question that used to sit at position 0 ("should we move toward
+production, or keep iterating") has effectively been answered by
+results, not by discussion: `allocate_by_solver()` now reaches 0
+unresolved / 0 supplier / all drivers used, PROVEN optimal, on the real
+file that motivated all of Phase 14/15/16's work. The open questions now
+are about validating that this holds up on a bigger, more realistic file
+(one that actually needs some supplier use) and closing real,
+already-disclosed gaps, not about which algorithmic direction to pursue.
 
-0. **Decide whether/how to move `allocate_by_anchor` or `allocate_by_merit`
-   toward production, or keep iterating on them, before doing anything
-   else fairness-related.** The open design question from Phase 14 was
-   resolved into two real, tested alternative strategies (Phase 15) --
-   see Section 5 above. Neither is wired into the UI yet. Before writing
-   more allocation logic, get an explicit decision from the project
-   owner: keep tuning `allocate_by_anchor` (currently the more promising
-   of the two, ties baseline on unresolved count with better driver
-   utilization), write proper synthetic tests for the Phase 15 code
-   first, or pause this line of work. Do not unilaterally switch
-   `plan_day_tab.py` to either new function without that conversation.
-
-1. **Decide the duty-span question (spec OPT-001), explicitly left open
+0. **Validate `allocate_by_solver()` against a bigger, real file that
+   includes genuine supplier need (in progress as of the end of this
+   session).** Everything validated so far is the one `UNPLANNED.xlsx`
+   file the project owner deliberately built WITHOUT needing any
+   supplier, specifically to prove the in-house engine could handle it
+   alone first. The project owner's own words: "if this get[s] to 0
+   unresolved with following all the hard rules then i will be
+   confident to introduce the bigger schedule and will know that
+   suppliers used were necessary." That milestone is now reached -- the
+   next real test is a file where SOME supplier use is genuinely
+   expected, to confirm (a) the solver still resolves everything
+   in-house-first correctly, (b) supplier use only appears where truly
+   necessary (matching Rule 7), and (c) solve time stays reasonable at
+   a larger scale (the current file is 44 jobs / 11 drivers, solving in
+   ~4s; a bigger file's actual size and solve time are both unknowns
+   until tested).
+1. **Write dedicated synthetic tests for ALL of Phase 15 AND Phase 16's
+   new code before considering any of it production-ready.** This
+   combines what were previously two separate open items. Still
+   completely unaddressed: `allocate_by_merit`, `allocate_by_anchor`,
+   `_swap_repair` (now significantly more complex after Phase 16's
+   bundle/chain-search widening), `build_planning_units`,
+   `_rebalance_idle_drivers`, and now also `allocate_by_solver` and its
+   CP-SAT model, all validated only via direct real-data runs so far.
+   For the solver specifically, small hand-built scenarios checking one
+   constraint at a time (see Section 5's note on this) will likely be
+   more useful than trying to mirror the existing `tests/*.py` pattern
+   exactly.
+2. **Decide whether/when to wire `allocate_by_solver()` (or
+   `allocate_by_anchor`, as a fallback if `ortools` isn't available in
+   some environment) into `plan_day_tab.py`'s "Run Planning" button.**
+   Currently NONE of the four strategies except the original `allocate()`
+   are reachable from the UI at all -- this is still true after Phase 16.
+   Now that one of them has real, validated, proven-optimal results,
+   this is a much more concrete decision than it was before, but it's
+   still the project owner's call, not something to do unilaterally
+   (Rule 1/16). Related sub-questions worth raising explicitly when this
+   conversation happens: should the UI offer a choice of strategy, or
+   just replace `allocate()` outright? Should `ortools` become a hard
+   requirement (added to the base install) or stay optional with a
+   graceful fallback to `allocate_by_anchor` if it's missing (the lazy
+   import already supports this today)? What should happen in the UI if
+   the solver returns `FEASIBLE` instead of `OPTIMAL` (i.e. it hit the
+   time limit) -- silently accept the best-found result, or surface that
+   distinction to the planner?
+3. **Decide the duty-span question (spec OPT-001), explicitly left open
    2026-08-03.** Should a driver's SPAN (first job to last job that day,
    including idle gaps) count toward daily/monthly hour limits, instead
    of (or alongside) summed job duration as today? Tradeoff already
    explained to the project owner once (span-based is more realistic
    about unavailability during a gap, but hits hour ceilings faster than
-   actual hours worked and may not match driver pay) -- they wanted to
-   see how much the OPT-002/003 gap-filling fix (Section 5/`CHANGELOG_AI.md`
-   Phase 11) reduces the underlying scenario before deciding. Worth
-   revisiting after a few real planning runs with the gap-fill fix in
-   place.
-2. **Confirm and, if wanted, fix NEW-007 (spec): extend gap-filling to
+   actual hours worked and may not match driver pay) -- still not
+   revisited. Worth another look now that both the anchor engine and the
+   solver are producing much more tightly-packed real schedules than
+   before.
+4. **Confirm and, if wanted, fix NEW-007 (spec): extend gap-filling to
    cover wide-open (not just bounded) driver capacity.** Found 2026-08-03
    (Phase 13) via a real test: a driver ended the day with a single 2h
-   job while other jobs sat unresolved. `_fill_gaps_with_unresolved_jobs()`
-   only helps when a driver has an existing booking BOTH before AND after
-   the gap -- a driver who's simply underutilized with nothing bracketing
-   their light day is invisible to it. Not confirmed as a bug yet (the
-   specific case checked appeared to be a genuine license-type mismatch,
-   not a coverage gap) -- ask the project owner for a case where the
-   license clearly matches before building this, since it's a real scope
-   increase, not a quick tweak.
-3. **Wire AI suggestion Accept to actually mutate the results table.**
+   job while other jobs sat unresolved. Possibly moot now -- Phase 16's
+   multi-hop chain search and `allocate_by_solver`'s direct optimization
+   both attack a broader version of this same underutilization problem
+   from a different angle -- but hasn't been explicitly re-checked
+   against this specific spec since those were built.
+5. **Wire AI suggestion Accept to actually mutate the results table.**
    High value, well-scoped, the decision-logging plumbing already
    exists — this is "finish what's started," not new design work.
-4. **Help the user fix their real data** (license types, missing
-   drivers, vehicle-type text consistency) using the same
-   extract-from-PLANNED-file technique already built and used once in
-   this project (see `CHANGELOG_AI.md` Phase 6) — this will likely
-   improve real-world accuracy more than further engine changes at this
-   point, based on the diagnostic work already done.
-5. **Build the daily driver/supplier shortlist UI**, since the backend
+6. **Help the user fix their real data** (license types, missing
+   drivers, vehicle-type text consistency, and now also the embedded-
+   newline issue confirmed fleet-wide in Phase 15 -- the project owner's
+   own live database was NOT touched this session, only the test
+   snapshot was) using the same extract-from-PLANNED-file technique
+   already built and used once in this project (see `CHANGELOG_AI.md`
+   Phase 6).
+7. **Build the daily driver/supplier shortlist UI**, since the backend
    already supports it — comparatively low effort for real planner
    value (handling "these specific drivers are off tomorrow" days more
    conveniently than the per-entity exclusion toggle alone).
-6. **PDF export**, once the user is ready to prioritize it — needs a
+8. **PDF export**, once the user is ready to prioritize it — needs a
    design conversation about the `pywin32`/Excel-COM approach first,
    since it's a different technical approach than everything else built
    so far (everything else is pure Python; this would shell out to a
    real Excel install).
-7. **Two small, well-scoped follow-ups from the Phase 10 rework, either
+9. **Two small, well-scoped follow-ups from the Phase 10 rework, either
    one is a good next pick:** showing month-to-date overtime-so-far on
    the Drivers tab (spec NEW-006 -- the number is already computed
    correctly, just not displayed), and reporting each driver's actual
    first-job time back to them once a day is finalized (spec SS-003 --
    same situation, data exists, not surfaced yet).
-8. **Only after the above, and only with explicit confirmation from the
-   user:** consider the combined "Plan My Day" one-click shortcut
-   (merging Run Planning + AI Review) and PyInstaller packaging into a
-   distributable `.exe`. (Driver shift-rotation logic, previously listed
-   here, was explicitly rejected 2026-08-03 -- see Section 5 -- and
-   should not be resurrected as a planned item.)
+10. **Only after the above, and only with explicit confirmation from the
+    user:** consider the combined "Plan My Day" one-click shortcut
+    (merging Run Planning + AI Review) and PyInstaller packaging into a
+    distributable `.exe`. If `allocate_by_solver()` does get wired into
+    the UI before packaging happens, factor `ortools`'s bundle-size
+    impact into that packaging conversation (see AI_CONTEXT.md Section 6
+    "The solver strategy" for the tradeoff detail already discussed with
+    the project owner). (Driver shift-rotation logic, previously listed
+    here, was explicitly rejected 2026-08-03 -- see Section 5 -- and
+    should not be resurrected as a planned item.)
 
 Do not reorder this list based on assumptions about what seems
 technically interesting — confirm priority with the user, since they've

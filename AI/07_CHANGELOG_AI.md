@@ -1139,3 +1139,308 @@ NEXT_SESSION.md: these new code paths deserve the same synthetic test
 coverage as everything else in this project before being considered
 production-ready, even though real-data testing caught two genuine bugs
 already.
+
+## Phase 16 — Swap-repair widened to whole groups + multi-hop chains, shift rule corrected to first-job-only, and a new CP-SAT solver strategy reaching 0 unresolved / 0 supplier on real data (2026-08-09)
+
+- **Starting point:** `allocate_by_anchor()` was at 14 unresolved jobs
+  against the real `UNPLANNED.xlsx`, following Phase 15's experimental
+  work. The project owner asked to keep pushing toward zero, offering to
+  either propose a new idea or let the assistant continue technically.
+- **Diagnostic first, per this project's established practice:** before
+  changing anything, every unresolved job was classified as either
+  genuinely vehicle-capacity-bound (no matching vehicle exists anywhere,
+  in-house or supplier) or driver/timing-bound (a matching vehicle DOES
+  exist, something about the current allocation is just blocking it).
+  Result: only 1 of 14 (a "14 Seater Bus" job) was a genuine ceiling at
+  that point; the other 13 were theoretically fixable, split roughly
+  8 stuck in "Same Driver" grouped pairs `_swap_repair` couldn't move,
+  and 5 genuine "no resource available at this exact moment" conflicts.
+
+### Data correction
+- The project owner spotted, via a screenshot, that vehicle `A 68982`
+  was entered as `"14 Seater Van"` in the test database when the actual
+  vehicle is a `"14 Seater Bus"` -- a real, exact-string-matching data
+  issue of exactly the kind this project has repeatedly flagged as a
+  process problem, not a code bug (see AI_CONTEXT.md Section 6,
+  "Vehicle-type matching"). Corrected via `db.update_vehicle()` in the
+  test database. (The project owner's own live database has the same
+  issue and was left for them to fix manually via the Vehicles tab --
+  not something this session touched.)
+
+### `_swap_repair` widened: whole-group displacement, direct-fit, multi-hop chains
+Three real, separable gaps were found and fixed in sequence, each
+confirmed against real data before moving to the next:
+
+1. **Whole-group (bundle) displacement.** The original `_swap_repair`
+   (Phase 15) could only displace a single, ungrouped unit to make room
+   for an unresolved one -- a Same-Driver group stuck in the wrong place
+   had no path to being moved at all, since nothing in the function knew
+   how to treat a group as one atomic thing to relocate. Fixed by adding
+   `_bundle_units_for_driver()` (returns every displaceable "bundle" on a
+   driver -- each ungrouped unit alone, or a WHOLE Same-Driver group's
+   units together, never split, matching the same whole-group-move
+   principle HR-005's repair pass already uses) and `_bundle_fits_driver()`
+   (checks a whole bundle's feasibility on a candidate driver, batch-wise,
+   so two individually-legal moves can't jointly bust a daily ceiling).
+   `_unit_driver_feasible()` and `_find_vehicle_for_unit()` were both
+   generalized to accept an optional override/tentative interval list so
+   this batch-checking could reuse them instead of duplicating logic.
+2. **Direct-fit check (a real, separate oversight, not a tuning issue).**
+   Testing the fix above against real data surfaced a second, more basic
+   gap: `_swap_repair` only ever thought in terms of *displacement* -- it
+   never checked whether a driver already had genuine free capacity (e.g.
+   freed up by an HR-005 release earlier in the same run) and could just
+   take the unresolved unit directly, no swap needed at all. Traced with a
+   step-by-step instrumented run showing a driver (IMRAN PASHA) drop to
+   1.0h occupied via an HR-005 release, remain fully eligible for the
+   stuck job by every hard rule, and STILL never get it, because nothing
+   in `_swap_repair` ever asked "does this driver already have room?"
+   before jumping straight into displacement logic. Fixed by adding a
+   direct-fit check as the very first thing tried per candidate driver.
+3. **Bounded multi-hop chain search.** Even with (1) and (2), several
+   jobs stayed unresolved specifically because every driver was
+   individually blocked -- but only because each was blocking someone
+   else, in a way a single-hop swap can't see. Confirmed directly: 20
+   separate jobs overlapped one 4-hour window against only 11 drivers,
+   several spanning many hours each. Added `_try_place_bundle_chain()`
+   (a classic bounded-depth augmenting-path search, the same idea used in
+   textbook bipartite-matching algorithms: find a home for the displaced
+   bundle, or -- if depth remains -- displace ONE of THAT driver's own
+   bundles and recursively find a home for it too, chaining through as
+   many drivers as `SWAP_REPAIR_CHAIN_DEPTH` allows, each driver visited
+   at most once so it can never cycle) and `_commit_chain()` (commits an
+   entire found chain atomically -- release every bundle from wherever
+   it's currently sitting first, then land each on its new home).
+   **A real double-release bug was found and fixed while wiring this in:**
+   `_swap_repair` pre-released the outermost bundle from its origin driver
+   before calling `_commit_chain`, which ALSO tries to release that same
+   bundle (reading its now-already-cleared `assigned_driver_id`), raising
+   a `KeyError`. Fixed by removing the redundant pre-release -- `_commit_chain`
+   already handles it correctly on its own.
+- Also widened `allocate_by_anchor()`'s outer loop: previously a single
+  `_swap_repair` call ran once, before the gap-fill/HR-005/idle-rescue
+  rearrangement loop, meaning any job released back to unresolved by a
+  LATER rearrangement pass never got a second swap attempt. Restructured
+  into an outer loop (rearrange up to 6x, then swap-repair, repeat up to
+  10x, stopping early once nothing changes in a full round) so a release
+  from a later pass can still trigger a fresh swap-repair attempt.
+- **A second, independent real bug found via this same investigation:**
+  `_repair_minimum_daily_hours`'s inner `_release()` helper matched a
+  busy interval to remove by `(start, end, tag)` where `tag` was the RAW
+  `same_driver_key` -- but the interval had originally been stored with
+  the EFFECTIVE group key, which SD-004's vehicle-consistency rule can
+  set to `None` even for a job that DOES have a `same_driver_key` (if its
+  vehicle type didn't match what the group had already established on
+  that driver). When the two didn't match, the release silently failed
+  to find anything to remove, leaving a PHANTOM busy interval behind
+  forever -- confirmed directly: a vehicle showed a busy interval with no
+  job behind it at all, permanently blocking that time slot for anyone.
+  Fixed by matching on `(start, end)` only, the same safe pattern
+  `_release_unit()` already uses elsewhere in this module -- proven safe
+  here too, since this function only ever touches ungrouped jobs (grouped
+  days are explicitly skipped), and two different ungrouped jobs can
+  never legitimately share an identical `(start, end)` on the same
+  driver in the first place.
+- Combined effect of all of the above, tested against real
+  `UNPLANNED.xlsx`: **14 unresolved → 2 unresolved, 0 supplier, all 11
+  drivers used** (up from 9/11 idle-driver waste before this phase).
+
+### Shift rule corrected: gates only the FIRST job of the day, not every job
+The project owner supplied a real human-planned file (`PLANNED_1.xlsx`,
+the source `UNPLANNED.xlsx` was originally stripped from) as ground
+truth and, cross-checking it against the test database, a genuine
+business-rule mismatch surfaced: `DEEPAK DEWAN` is configured
+`shift_period='morning'` in the database, yet the real plan gives him a
+job at 16:00-19:00 -- a job our engine's window check (before this fix)
+would have refused outright, since it re-checked EVERY job against the
+morning/evening window, not just the first one of the day. Confirmed
+directly with the project owner: "if a driver is in morning shift 07:00
+that means his shift will end 16:00 if the 12hr max field is empty...
+he can definitely get a job or two after 12:00." **The real rule: the
+shift window only gates a driver's FIRST job of the day; once they have
+any job on a given date, later jobs that day are governed purely by the
+normal overlap/hour-ceiling rules.**
+- Implemented via a new optional `busy_intervals` parameter on
+  `_job_matches_shift_period()`: if the driver already has any interval
+  starting on the same calendar date as the job being checked, the
+  window check is skipped entirely (already working this day); if not,
+  the normal window check applies (this IS effectively their first job).
+  `busy_intervals=None` (the default) preserves the original
+  always-enforce behavior, so any call site not explicitly updated fails
+  safe rather than silently gaining the relaxation.
+- **Every one of the 7 call sites across the whole engine was updated**
+  to pass real (or tentative/hypothetical, where the call site is doing
+  a batch feasibility check) interval state, not just the main
+  `allocate()` loop: `_fill_gaps_with_unresolved_jobs`,
+  `_repair_minimum_daily_hours` (passing the tentative-within-batch
+  `combined_busy`, correctly reordered to compute before the shift check
+  rather than after), `_rebalance_idle_drivers` (passing the
+  within-rescue `accumulated` intervals, so a SECOND job tentatively
+  added to the same idle driver in one rescue attempt also gets the
+  continuation relaxation), the shared `_unit_driver_feasible()` (used by
+  `allocate_by_merit`, `allocate_by_anchor`, `_swap_repair`, and the new
+  chain search -- this one had the override parameter already threaded
+  through for the overlap/hours checks from Phase 15, but the shift
+  check itself had been left calling the old 2-argument form; fixed by
+  reordering so the resolved `busy_intervals` value is computed before
+  it, not after), and `_swap_repair`'s own direct main-loop check
+  (passing `reduced`, the hypothetical post-displacement schedule, not
+  the driver's raw current one).
+- Combined with the swap-repair widening above, tested against real
+  `UNPLANNED.xlsx`: **2 unresolved → 0 unresolved, 0 supplier, all 11
+  drivers used** via `allocate_by_anchor()`.
+
+### New strategy: `allocate_by_solver()` -- Google OR-Tools CP-SAT
+With `allocate_by_anchor()` reaching 0/0 on the original file, the
+project owner supplied the real ground-truth file directly and pointed
+out a genuine, harder scheduling puzzle within it (Sheet 2's driver-hour
+summary): every driver's day should land strictly within their
+configured floor/ceiling, but real days ranged from 0h to 7h of idle
+time with no consistent balancing logic -- e.g. moving one specific job
+between two specific drivers would give both of them exactly 4h idle
+instead of one having 1h and the other more. The project owner
+explicitly asked what METHOD real fleet/crew-scheduling systems use for
+this class of problem, having noticed the heuristic approach kept
+surfacing one subtle bug at a time as new edge cases came up (three
+found and fixed in roughly two hours during the work above). Answer:
+constraint programming / mixed-integer programming solvers -- state the
+hard rules as constraints and the actual goal as an objective, and let
+the solver search the space directly and provably, rather than writing
+one heuristic pass at a time. Confirmed with the project owner (OR-Tools
+CP-SAT: free, open-source, solves a problem this size in well under a
+second, adds one new dependency) before building.
+- **New function `allocate_by_solver()`** (plus helper
+  `_solver_effective_ceiling_minutes()`), added alongside the other
+  three strategies, not replacing any of them (Rule 1/13). `ortools`
+  added to `requirements.txt`; imported LAZILY inside the function (not
+  at module level) so the rest of the app -- and the other three
+  strategies -- continue to work with zero impact if `ortools` isn't
+  installed.
+- **Model:** one boolean `x[unit, driver]` per license-compatible
+  (unit, driver) pair, `veh[unit, vehicle]` per type-compatible
+  (unit, vehicle) pair, `unresolved[unit]` per unit. Hard constraints:
+  exactly one of {assigned to one driver, unresolved} per unit; a
+  vehicle assigned iff a driver is (and not at all for "Driver Only"
+  rows); no two time-overlapping units share a driver or a vehicle;
+  shift window as a first-job-only gate (encoded via `has_morning`/
+  `has_evening` linking variables per driver: if a "morning" driver has
+  ANY evening-window unit assigned, they must also have at least one
+  morning-window unit, i.e. their real first job -- symmetric for
+  "evening" drivers picking up an early-morning-window unit, e.g. an
+  overnight job rolling past midnight); daily ceiling folding in the
+  monthly-overtime-budget interaction (`_solver_effective_ceiling_minutes`
+  replicates `_unit_driver_feasible`'s existing two-layer logic: a blank
+  monthly-overtime budget collapses the effective ceiling down to the
+  daily floor regardless of what the daily-ceiling field says, matching
+  the project's established "blank monthly overtime = zero daily
+  overtime" precedent); daily floor, WITH the same Same-Driver-group
+  exemption `_repair_minimum_daily_hours` already has (see next
+  subsection -- a real gap found and fixed during this same phase).
+- **Same-Driver group cohesion (soft preference, not a hard rule):**
+  `build_planning_units()`'s pairs-only pre-merge already handles the
+  dominant real pattern (two simultaneous same-vehicle pickups) as a
+  single decision, needing nothing extra. But group members that never
+  got pre-merged -- a group of 3+ rows, or members that simply don't
+  overlap each other in time at all -- had no incentive in the first
+  version of this model to land on the same driver, even when nothing
+  hard was stopping them. Confirmed as a real, not theoretical, gap:
+  testing against the real ground-truth file directly showed a 4-row
+  group (13:00-15:00, 17:00-19:00, and a 23:00-01:00 pair, none
+  overlapping each other) kept entirely on one driver in the real plan
+  purely as a preference; the solver's first version left one row of
+  that exact group unresolved. **A first encoding attempt (pairwise
+  `together[unit_i, unit_j, driver]` booleans, one per pair of same-group
+  units per shared candidate driver) measurably slowed the solver down --
+  confirmed by direct timing: wall time went from well under a second to
+  over 60 seconds without even reaching a proven-optimal status, because
+  pairwise terms create a lot of symmetric, equally-good alternative
+  combinations for the search to sift through.** Replaced with a leaner
+  `touches_group[group, driver]` encoding (minimize the number of
+  DISTINCT drivers touching each group, O(members) linking constraints
+  per group instead of O(members²)) -- restored fast, proven-optimal
+  solves. **Lesson for future modeling work in this codebase:** when
+  adding a soft preference to a CP-SAT model, prefer an encoding that
+  scales linearly with group size over one that scales quadratically,
+  even when both are logically equivalent -- the solver's search
+  difficulty is not just about constraint count, it's about how much
+  symmetry the encoding introduces.
+- **Warm-start hint:** runs `allocate_by_anchor()` on independent scratch
+  copies of the drivers/vehicles/jobs (via `dataclasses.replace` for
+  fresh runtime state and `copy.deepcopy` for the jobs, so nothing leaks
+  into the real objects this function goes on to mutate) and feeds the
+  result to the solver via `model.add_hint()` before the real solve --
+  purely a starting point, never constraining what the solver is free to
+  find instead. **A real API bug hit while wiring this in:** OR-Tools'
+  camelCase `model.AddHint(...)` is a deprecated alias whose compatibility
+  shim breaks when passed list arguments in this installed version
+  (`ortools==9.15`), raising a confusing `TypeError` deep inside the
+  library. The real, current method is snake_case `model.add_hint(var,
+  value)`, called once per (variable, value) pair, not with lists --
+  confirmed by reading the actual library source directly rather than
+  guessing from the error message.
+- **A second real gap found and fixed during this phase, this time in
+  the daily-floor constraint specifically:** the project owner clarified
+  the intended semantics directly -- floor and ceiling should be
+  strictly enforced for a used driver ("never less than 9, never more
+  than 12"), but pointed at the real ground-truth file's own
+  `VISWANADHAN` (5.0h that day, well under his 9h floor) as proof this
+  isn't actually absolute in practice. Checked directly: every one of
+  VISWANADHAN's real jobs that day was inside ONE Same-Driver group --
+  exactly the existing, already-implemented HR-005 exemption from
+  `_repair_minimum_daily_hours` (Phase 12: "if ANY of those jobs are
+  grouped, the day is... recognized as unfixable-without-touching-a-
+  protected-group and left alone entirely"), which the new solver simply
+  hadn't replicated yet. Fixed by making the floor constraint's
+  enforcement conditional on BOTH the driver being used AND having ZERO
+  grouped units that day (`floor_applies = used AND NOT has_grouped_unit`,
+  encoded as a small reified conjunction) -- the ceiling still applies
+  unconditionally either way; only the floor gets this exemption,
+  matching the other three strategies exactly.
+- **Objective**, weighted so each tier is never traded away for a lower
+  one: `1,000,000 × unresolved_count + 10,000 × distinct_group_driver_touches
+  + unused_capacity_among_used_drivers − used_driver_count_bonus`.
+- **Supplier fallback is NOT modeled inside the solver.** Dynamically
+  naming/numbering hired supplier units the way the solver would need to
+  is a materially different kind of combinatorial problem, and modeling
+  it exactly would roughly double the size of this change for a part of
+  the pipeline that's already solved well. Instead: whatever the solver
+  leaves unresolved is run through the exact same reuse-before-hire
+  dynamic-labeling logic `allocate()`'s supplier pass already uses,
+  copied (not reimplemented) directly into this function, per Rule 1.
+- **Disclosed scope boundary, not a silent gap (Rule 16):** genuine
+  overlap-relaxation for Same-Driver group members beyond what
+  `build_planning_units()` already pre-merges is NOT modeled -- if two
+  different units share a `same_driver_key` AND genuinely overlap in
+  time, they're still constrained with ordinary overlap rules here and
+  can never legally land on the same driver, even though the real
+  engine's SD-004-aware relaxation would allow it for a matching vehicle
+  type. The dominant real-world case (two simultaneous same-vehicle
+  pickups) is unaffected, since that's exactly what pre-merging already
+  handles as one decision; what's excluded is specifically 3+-way
+  simultaneous group overlaps, a rarer pattern not yet confirmed as a
+  real problem worth the added complexity.
+- **Final validated result against real `UNPLANNED.xlsx` + real
+  `fleetplanner.db`, after every fix above: 44/44 jobs resolved, 0
+  supplier hires, all 11 drivers used, solver status PROVEN OPTIMAL
+  (not just "found a solution" -- CP-SAT's branch-and-bound genuinely
+  proves no better assignment exists under the modeled constraints),
+  3.78 seconds wall time.** This matches the real human-planned ground
+  truth's own headline result (44/44, 0 supplier, all 11 drivers), though
+  not the exact same per-driver hour distribution -- expected, since
+  there is more than one valid way to reach 44/44 given the hard rules
+  as configured.
+- Full existing test suite re-run and passing after every fix in this
+  phase (the pre-existing, unrelated stale `test_shift_start.py` also
+  failed throughout this phase's work -- since confirmed genuinely dead
+  and deleted, along with the equally stale `CHANGED_FILES_MANIFEST.txt`
+  leftover from the 2026-08-03 session that had already flagged it for
+  removal; the full suite now runs 100% clean with no skip-list needed).
+  No new formal synthetic test files were added for
+  `_bundle_units_for_driver`, `_try_place_bundle_chain`, or
+  `allocate_by_solver()` specifically -- all validation this phase was
+  direct real-data testing, same caveat carried over from Phase 15.
+- Scheduling rules spec bumped to v12. `AI_CONTEXT.md`, `ARCHITECTURE.md`,
+  `BUSINESS_RULES.md`, `NEXT_SESSION.md`, `AI_INDEX.json`, and this file
+  updated per Rule 14/17. (`DATABASE.md` and `WORKFLOWS.md` checked and
+  needed only a minor note -- no schema or workflow-level change this
+  phase, purely algorithm and a new optional dependency.)

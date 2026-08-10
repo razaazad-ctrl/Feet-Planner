@@ -55,7 +55,7 @@ BUT:
 
 ---
 
-## Shift (redesigned 2026-08-03)
+## Shift (redesigned 2026-08-03, refined 2026-08-09)
 
 - The planner never fixes an exact shift-start clock time before
   planning. They just mark a driver "Morning", "Evening", or leave it
@@ -67,6 +67,22 @@ BUT:
   off-day-triggered transition rule. Explicitly rejected by the project
   owner: the planner decides who's on which shift, day to day, and the
   software does not compute or remember any rotation.
+- **Refined 2026-08-09: the Morning/Evening window only gates a driver's
+  FIRST job of the day, not every job.** Confirmed directly against a
+  real human-planned day: a driver marked "Morning" was routinely given
+  an afternoon job as a natural continuation of a day already under way
+  (e.g. 07:00-15:00 then, after a short gap, 16:00-19:00) -- the previous
+  behavior (checking every single job against the window) would have
+  wrongly refused that second job. The project owner's own framing: "if
+  a driver is in morning shift 07:00 that means his shift will end 16:00
+  if the 12hr max field is empty... he can definitely get a job or two
+  after 12:00." So the real rule is: once a driver has ANY job already on
+  a given day, later jobs that same day are governed purely by the
+  normal overlap/hour-ceiling rules, not re-checked against the shift
+  window -- the window only decides which half of the day their very
+  first job can fall in. See AI_CONTEXT.md Section 6 ("Shift
+  enforcement") and CHANGELOG_AI.md Phase 16 for the full technical
+  writeup.
 
 ---
 
@@ -83,6 +99,29 @@ BUT:
   fixed time-based or type-based split rule.
 - Same reuse-first idea applies if the group falls through to a hired
   supplier unit instead of an in-house driver.
+- A fresh group's opening driver is picked by projecting the group's
+  TOTAL hours onto each candidate, not just the opening row's duration
+  (added 2026-08-06, see CHANGELOG_AI.md Phase 14) -- reduces (but does
+  not eliminate) the chance of one driver being locked into a large group
+  purely because they were idle for its first row.
+- **RESOLVED 2026-08-09** (was an open concern raised 2026-08-06): on a
+  real day, removing every "Same Driver" value entirely made results
+  WORSE (12 unresolved vs. fewer with grouping in place), confirming the
+  feature is genuinely load-bearing, not just a fairness obstacle -- and
+  the alphabetical-order driver-search artifact was separately fixed in
+  Phase 14 (now least-occupied-first). The remaining concern -- that
+  grouping was "ruling" the allocation rather than assisting it -- turned
+  out to trace to two separate, real algorithm gaps rather than the
+  grouping feature itself being wrong: (1) `_swap_repair` could only
+  displace a single ungrouped job to make room for something else, never
+  a whole Same-Driver group, so a group stuck in the wrong place had no
+  way to get unstuck; (2) group members that never got pre-merged into
+  one `PlanningUnit` (see `build_planning_units`) had no incentive to
+  land on the same driver even when nothing was stopping them. Both
+  fixed 2026-08-09 -- see CHANGELOG_AI.md Phase 16 for the full
+  technical detail, including the new `allocate_by_solver()` strategy
+  that resolves this class of problem directly via constraint
+  programming rather than heuristic patching.
 
 ---
 

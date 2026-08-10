@@ -495,19 +495,38 @@ for shift in ("morning", "evening"):
       #      closest to (but not after) target_end
       #   5. (second loop) MIDDLE FILL: everything else, least-occupied-first
 mark remaining leftover units unresolved
-_swap_repair(units, ..., max_rounds=swap_rounds)
-  # bounded local search: for each unresolved unit, look for a driver
-  # who could take it if exactly ONE of their existing single-job,
-  # UNGROUPED units moved elsewhere -- commits ONLY if that displaced
-  # unit finds a legal new home elsewhere (strict improvement, never a
-  # net-zero shuffle). Capped rounds, not full backtracking search.
+outer loop (up to 10x): {
+  rearrangement loop (up to 6x): gap-fill, HR-005 repair, idle-rescue
+  _swap_repair(units, ..., max_rounds=swap_rounds)
+} until neither stage changes anything in a full round
+  # (2026-08-09, Phase 16) bounded local search over "bundles" -- a
+  # bundle being either a single ungrouped unit, or a WHOLE Same-Driver
+  # group (never split, same principle HR-005 uses). For each unresolved
+  # unit U:
+  #   1. direct-fit: does some qualifying driver already have genuine
+  #      free room? If so, place U there directly, no displacement.
+  #   2. single-hop: does displacing ONE bundle from a qualifying driver
+  #      free enough room for U, AND does that bundle then find a legal
+  #      home elsewhere (driver + vehicle)?
+  #   3. multi-hop chain (_try_place_bundle_chain, bounded by
+  #      SWAP_REPAIR_CHAIN_DEPTH): if (2) fails, can the bundle's new
+  #      home be freed by displacing ONE of ITS OWN bundles too,
+  #      recursively, each driver visited at most once (an augmenting-
+  #      path search, the same idea used in bipartite-matching
+  #      algorithms) -- catches cases where every driver is individually
+  #      blocked, but only because each is blocking someone else.
+  # Every committed move strictly reduces the unresolved count by one --
+  # never a net-zero shuffle. Looping this against the rearrangement
+  # stage (rather than running swap-repair once, as in the original
+  # version of this function) matters because a LATER rearrangement pass
+  # can release a job that an EARLIER swap-repair call never got to see.
 supplier fallback (same logic as allocate_by_merit)
-rearrangement loop: same three-pass loop as allocate_by_merit
 ```
 
-Real-data result: 12 unresolved (tied with baseline), but 9/9 active
-drivers had real work vs. baseline's 9/11 with 2 idle -- better
-utilization, not yet a strictly better result overall.
+Real-data result (2026-08-09, after the widening above plus the shift
+first-job-only correction -- see CHANGELOG_AI.md Phase 16): **0
+unresolved, 0 supplier, all 11 active drivers used**, on the real
+`UNPLANNED.xlsx` -- up from 14 unresolved at the start of that session.
 
 ### `_rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, ..., settled_job_ids=None)`
 
@@ -531,6 +550,106 @@ remaining-hours miscalculation that silently undid a valid consolidation
 (fixed by using the donor's TRUE full workload, including already-settled
 jobs, as the baseline for "would this leave them short" -- separate from
 the narrower list of jobs actually eligible to be pulled).
+
+## 5c. The solver strategy — `allocate_by_solver()` (2026-08-09, allocation_engine.py)
+
+A fourth allocation strategy, alongside `allocate()`, `allocate_by_merit()`,
+and `allocate_by_anchor()` -- not a replacement for any of them. Uses
+Google OR-Tools' CP-SAT constraint solver instead of a hand-written
+heuristic: every hard rule is a constraint, the real goal is a weighted
+objective, and the solver searches the space directly rather than
+following a sequence of heuristic passes. See `AI_CONTEXT.md`'s "The
+solver strategy" subsection (Section 6) for the full design reasoning;
+this section is the structural *what/where*.
+
+```
+allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
+                    allowed_driver_ids=None, allowed_supplier_ids=None,
+                    allow_override_days=None, travel_buffer_minutes=..., 
+                    time_limit_seconds=15.0):
+
+  from ortools.sat.python import cp_model   # LAZY import -- raises a
+                                              # clear ImportError if
+                                              # ortools isn't installed;
+                                              # nothing else in the app
+                                              # depends on it
+
+  units = build_planning_units(valid_jobs)   # same pre-merge as merit/anchor
+
+  # --- warm-start hint ---
+  scratch_drivers/vehicles = dataclasses.replace(..., fresh runtime state)
+  scratch_jobs = copy.deepcopy(valid_jobs)
+  allocate_by_anchor(scratch_jobs, scratch_drivers, scratch_vehicles, ...)
+    # fast heuristic run on throwaway copies, purely to seed the solver
+
+  model = cp_model.CpModel()
+  x[unit, driver.id]        = BoolVar   # per license-compatible pair only
+  veh[unit, vehicle.id]     = BoolVar   # per type-compatible pair only
+  unresolved[unit]          = BoolVar
+
+  for hv, hval in <hints derived from the scratch anchor run>:
+      model.add_hint(hv, hval)          # NOT model.AddHint -- see note below
+
+  # hard constraints:
+  sum(x[unit,*]) + unresolved[unit] == 1              # per unit
+  sum(veh[unit,*]) == sum(x[unit,*])                  # per unit needing a vehicle
+  x[i,d] + x[j,d] <= 1   for any time-overlapping (i,j) sharing driver d
+  veh[i,v] + veh[j,v] <= 1  for any time-overlapping (i,j) sharing vehicle v
+  has_morning[d] / has_evening[d] linking vars          # shift = first-job-only gate
+  total_minutes[d] <= _solver_effective_ceiling_minutes(d)     # ceiling, always
+  total_minutes[d] >= floor_minutes(d)  .OnlyEnforceIf(floor_applies[d])
+    # floor_applies[d] = used[d] AND NOT has_grouped_unit[d] -- the
+    # Same-Driver-group exemption HR-005 already has, replicated here
+
+  # soft preference (objective terms, not constraints):
+  touches_group[group, driver]   # minimize distinct drivers per group --
+                                   # NOT pairwise together[i,j,driver] (tried
+                                   # first, caused a 60x+ slowdown, see
+                                   # CHANGELOG_AI.md Phase 16)
+  gap[driver] = ceiling - total   # minimize unused capacity, used drivers only
+  used[driver]                   # small bonus for spreading across more drivers
+
+  model.Minimize(
+      1_000_000 * sum(unresolved)
+      + 10_000 * sum(touches_group terms)
+      + sum(gap terms)
+      - sum(used terms)
+  )
+
+  solver = cp_model.CpSolver()
+  solver.parameters.max_time_in_seconds = time_limit_seconds
+  status = solver.Solve(model)   # OPTIMAL = proven best; FEASIBLE = best found
+                                   # so far, time limit hit; anything else =
+                                   # no solution at all (rare -- "everyone
+                                   # unresolved" is always feasible)
+
+  for each unit: commit via _commit_unit() based on solver.Value(...)
+
+  supplier fallback for units still unresolved
+    # IDENTICAL reuse-before-hire logic to allocate()'s supplier pass,
+    # copied not reimplemented (Rule 1) -- runs strictly AFTER the solver
+    # has exhausted every in-house combination it could find, since
+    # unresolved costs 1,000,000x anything else in the objective
+```
+
+**Real-data result (2026-08-09): 44/44 resolved, 0 supplier, all 11
+drivers used, status `OPTIMAL`, 3.78 seconds** -- see
+`CHANGELOG_AI.md` Phase 16 for the sequence of fixes that got here
+(a deprecated OR-Tools API footgun, the pairwise-vs-per-group encoding
+lesson, and the floor-exemption gap).
+
+**Two disclosed scope boundaries relative to the other three strategies**
+(Rule 16 -- not silent gaps): (1) genuine time-overlap relaxation for
+Same-Driver group members beyond what `build_planning_units()` already
+pre-merges into pairs isn't modeled -- ordinary overlap rules apply to
+anything not pre-merged, even within a flagged group; (2) supplier
+hiring isn't modeled inside the solver at all, handled entirely by the
+reused fallback pass described above.
+
+**Not wired into `plan_day_tab.py`.** See `NEXT_SESSION.md` Section 6
+item 2 for the open sub-questions (strategy choice in the UI vs. a
+straight replacement, whether `ortools` becomes a hard requirement, how
+to surface an `OPTIMAL` vs. `FEASIBLE` result to the planner).
 
 ## 6. Data flow diagram (text form)
 
@@ -644,6 +763,17 @@ rules_parser
 - `requests` (unpinned) — used by `maps_client.py` for direct HTTP calls
   to the Google Routes API (no Google SDK used, deliberately, to avoid
   the extra dependency weight)
+- `ortools` (unpinned, added 2026-08-09) — Google's constraint-solver
+  toolkit, used ONLY by the experimental `allocate_by_solver()` strategy
+  in `allocation_engine.py`. Imported LAZILY inside that one function,
+  not at module level, so every other part of the app -- including the
+  other three allocation strategies -- works with zero impact if it
+  isn't installed. Not yet a genuine runtime requirement for the app as
+  a whole; see `NEXT_SESSION.md` Section 6 item 2 for the open question
+  of whether it should become one if `allocate_by_solver()` gets wired
+  into the UI. Worth factoring into the PyInstaller packaging
+  conversation whenever that happens (`ortools` adds meaningfully to
+  bundle size).
 
 No web framework, no ORM, no task queue, no external message broker —
 this is intentionally a simple, single-process desktop application.
