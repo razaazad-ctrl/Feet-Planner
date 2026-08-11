@@ -1507,3 +1507,21 @@ second, adds one new dependency) before building.
 - `AI_INDEX.json` was reviewed and does not require a folder/module entry
   change because the feature extends the existing `plan_day_tab.py` module
   rather than adding a new module or changing the architecture boundaries.
+
+## Phase 20 — Final Summary Popup Visual Refinement (2026-08-11)
+
+- Removed the `In-house drivers only` checkbox from the Summary popup. The table
+  now always presents both resource populations when present, with `IN-HOUSE
+  DRIVERS` first and `SUPPLIERS` second.
+- Reduced the popup width and increased its height/compact row sizing so up to
+  approximately 15 in-house driver rows can be visible at once on a normal
+  desktop display.
+- Kept the existing structured columns: driver/supplier, first job start, last
+  job end, duty span, trips, and total worked hours.
+- Added visual icons to the four metric cards. In-house drivers and suppliers use
+  a matching line-art icon family; in-house trips and supplier trips use the
+  supplied trip clipart. The clipart is bundled as `app/ui/trip_clipart.png` and
+  loaded relative to `plan_day_tab.py`.
+- Preserved the result-only architecture: no database reads, allocation changes,
+  API calls, or changes to the surrounding Plan a Day workflow.
+- Updated architecture/workflow documentation to record the final popup behavior.

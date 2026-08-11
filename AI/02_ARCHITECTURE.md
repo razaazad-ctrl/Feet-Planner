@@ -181,10 +181,15 @@ reporting layer over `PlanDayTab.self.jobs` only:
   when enabled, supplier records. Columns cover first-job start, last-job end,
   duty span, trip count, and merged worked hours. This keeps detailed workload
   information aligned and easy to scan instead of rendering each record as a card.
-- The table includes an `In-house drivers only` checkbox. It is enabled by default
-  to keep the focused driver view. When unchecked, supplier rows are added after
-  the complete in-house-driver group. Explicit `IN-HOUSE DRIVERS` and `SUPPLIERS`
-  group headers make the ordering unambiguous.
+- The table always shows both populations when they exist. There is no filter
+  checkbox in the popup: explicit `IN-HOUSE DRIVERS` and `SUPPLIERS` group
+  headers keep the ordering unambiguous, with in-house drivers first and suppliers
+  second.
+- The four metric cards use visual icons: in-house drivers and suppliers use the
+  same line-art icon family as the modern popup design, while in-house trips and
+  supplier trips use the supplied trip clipart bundled as `app/ui/trip_clipart.png`.
+  The image is loaded relative to `plan_day_tab.py`, so the popup does not depend
+  on an external path or database record.
 - The footer intentionally avoids repeating the four header-card totals. It shows
   only `Total trips` and `Unresolved trips`, plus the Close action.
 - For each assigned in-house driver it calculates first-job -> last-job duty span,
@@ -193,8 +198,8 @@ reporting layer over `PlanDayTab.self.jobs` only:
   occupied-hour accounting.
 - Supplier detail is grouped from the assignment results themselves; numbered
   supplier hires and `SAME ...` labels are treated as the same supplier company.
-  Supplier rows are optional through the table checkbox and always appear after
-  the in-house-driver group when enabled. No database lookup is introduced.
+  Supplier rows always appear after the in-house-driver group. No database lookup
+  is introduced.
 - Opening the popup does not modify jobs, assignments, the database, or the
   uploaded workbook.
 

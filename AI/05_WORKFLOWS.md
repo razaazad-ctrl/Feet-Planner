@@ -62,9 +62,11 @@ When the planner clicks **Summary**:
 → Group assigned jobs by driver and supplier from the result objects only
 → Calculate each driver's duty span, trip count, and merged worked hours
 → Display modern metric cards for the primary totals (including `In-house trips`)
-→ Display a structured table with in-house drivers by default
-→ If `In-house drivers only` is unchecked, append supplier records after the
-  in-house group and label both groups explicitly
+→ Display a structured table with an explicit `IN-HOUSE DRIVERS` group first
+→ Display a `SUPPLIERS` group second when supplier records exist
+→ Show both groups directly; no popup filter checkbox is required
+→ Use modern metric-card icons: driver/supplier line-art icons plus the supplied
+  trip clipart for both trip cards
 → Display Total trips and Unresolved trips in the footer without repeating the
   other header-card totals
 
