@@ -180,7 +180,32 @@ saw a rule it could enforce). The current model:
   constraints. This distinction is stated in the UI copy itself ("free
   text — context only, not enforced automatically").
 
-### Overtime model (updated 2026-08-03, see CHANGELOG_AI.md Phase 10 for full history)
+### Overtime model (updated 2026-08-03, corrected 2026-08-10, see CHANGELOG_AI.md Phases 10 and 21 for full history)
+**Corrected 2026-08-10 (Phase 21) -- read this before anything below,
+since it changes the metric every check in this section actually uses.**
+Every daily/monthly hours check described below is measured against a
+driver's duty SPAN (first job's start to last job's end that day), NOT
+the summed duration of their individual jobs. Confirmed directly by the
+project owner with a concrete example: a driver with three jobs summing
+to 8 actual worked hours should never be blocked from that day being
+legal on the grounds that 8 < 9 -- what matters is whether their first
+and last job are spread across at least 9 hours. Summed job duration
+("hours worked") has NO hard rule of its own anywhere in this engine; it
+remains exactly what it always was for FAIRNESS purposes only (see
+`occupied_seconds`, still computed via `_merged_hours()`, still the
+basis for least-occupied-first candidate ranking and the solver's
+balance objective) but must never again be read as deciding legality.
+This resolves the project's own long-standing open "OPT-001 duty-span
+question" (first raised 2026-08-03, left undecided through Phases
+10-20) -- span for every hard rule below, summed duration for fairness
+only, never the reverse. New helper: `_day_span_hours()` (kept
+deliberately distinct from `_merged_hours()`, which is unchanged and
+still correct for its own role). See CHANGELOG_AI.md Phase 21 for the
+full technical writeup across all four allocation strategies, including
+a genuinely new piece of CP-SAT modeling `allocate_by_solver()` needed
+(span isn't expressible as a simple sum) and a permanent post-solve
+validation added there as a safety net.
+
 - `working_hours_per_day` is a driver's normal/baseline day. As of this
   session it's ALSO a hard daily **minimum**: if a driver is used at all
   on a given day, they must reach at least this many hours that day (see
@@ -398,7 +423,7 @@ planner instruction (Rule 3/9), not a judgment call. Confirmed rules
   contain extra human-readable context (e.g. "[Same Driver group]")
   without that leaking into the exported file's Driver cell.
 
-### The solver strategy (`allocate_by_solver`, new 2026-08-09, EXPERIMENTAL)
+### The solver strategy (`allocate_by_solver`, new 2026-08-09, EXPERIMENTAL, hour-accounting corrected 2026-08-10)
 A fundamentally different fourth approach, alongside `allocate()`,
 `allocate_by_merit()`, and `allocate_by_anchor()` -- not a replacement
 for any of them (Rule 1/13). Instead of a hand-written heuristic pass,
@@ -409,13 +434,29 @@ project owner asked what method real fleet/crew-scheduling systems use
 for this class of problem, having watched the heuristic strategies
 surface one subtle bug at a time as new edge cases came up.
 
+**2026-08-10 (Phase 21) correction, important for anyone reading the
+model details below:** the floor/ceiling/monthly-overtime constraints
+described in this section are now measured against duty SPAN (via a new
+MIN/MAX channeling construction: `span[driver] = last_end[driver] -
+first_start[driver]`, computed only over that driver's actually-assigned
+units), not summed job duration as an earlier version of this section
+described. The fairness/balance objective term still uses genuinely
+summed hours (`total_minutes`), unchanged. A permanent post-solve
+validation was also added, re-deriving each driver's real committed span
+directly from the final `Job` data and raising loudly if it's ever
+outside their floor/ceiling -- stress-tested clean across 30+ separate
+runs. See CHANGELOG_AI.md Phase 21 for the full writeup, including the
+CP-SAT modeling detail (span requires a real channeling trick, since
+it's not expressible as a simple linear sum the way the original
+sum-based version was).
+
 **Why this is a different kind of tool, not just a fourth heuristic:**
 a heuristic strategy tries a specific sequence of moves and either finds
 an answer or doesn't; a constraint solver explores the full space of
 legal answers and can tell you when it's found the true best one
 ("OPTIMAL" status) versus just the best one found so far within a time
 budget ("FEASIBLE"). On the real `UNPLANNED.xlsx`, it reaches OPTIMAL --
-0 unresolved, 0 supplier, all 11 drivers used -- in under 4 seconds.
+0 unresolved, 0 supplier, all 11 drivers used -- in a few seconds.
 
 **What's modeled as hard constraints:** license/vehicle-type match,
 off-days, the shift first-job-only gate (a `has_morning`/`has_evening`

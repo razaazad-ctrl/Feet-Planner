@@ -25,15 +25,17 @@ print("PASS: _merged_hours computes true union hours correctly")
 
 # --- Reproduces the exact real-world pattern found in PLANNED.xlsx
 # (ARAVIND BALAKRISHNAN): a same-time duplicate-pickup pair (3h, counts
-# once) plus a separate contiguous block (6h) = 9h true total, NOT the
-# naive 12h sum. Must fit cleanly under a 9/12 hour driver with zero
-# overtime allowed. ---
+# once for fairness/occupied_seconds purposes) plus a separate contiguous
+# block. Job times chosen (2026-08-10 duty-span correction) so the whole
+# day's SPAN, not just the summed/deduplicated duration, fits exactly at
+# a 9h ceiling -- 04:00 to 13:00, back-to-back with no gaps. Must fit
+# cleanly under a 9/9 hour driver with zero overtime allowed. ---
 jobs = [
     Job(row_number=1, sr="1", start_dt=dt(4), end_dt=dt(7), vehicle_type_required="Bus", same_driver_key="EVENT-A"),
     Job(row_number=2, sr="2", start_dt=dt(4), end_dt=dt(7), vehicle_type_required="Bus", same_driver_key="EVENT-A"),  # simultaneous duplicate pickup
-    Job(row_number=3, sr="3", start_dt=dt(10), end_dt=dt(12), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
-    Job(row_number=4, sr="4", start_dt=dt(12), end_dt=dt(13), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
-    Job(row_number=5, sr="5", start_dt=dt(13), end_dt=dt(16), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
+    Job(row_number=3, sr="3", start_dt=dt(7), end_dt=dt(9), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
+    Job(row_number=4, sr="4", start_dt=dt(9), end_dt=dt(10), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
+    Job(row_number=5, sr="5", start_dt=dt(10), end_dt=dt(13), vehicle_type_required="Bus", same_driver_key="EVENT-B"),
 ]
 drivers = [DriverProfile(id=1, name="D1", license_types=["Bus"], working_hours_per_day=9.0,
                           max_working_hours_per_day=9.0, max_overtime_hours_per_month=None)]
@@ -42,7 +44,7 @@ vehicles = [VehicleProfile(id=1, plate="BUS-1", vehicle_type="Bus"),
 allocate(jobs, drivers, vehicles, [])
 for j in jobs:
     print(f"SR{j.sr} {j.start_dt.strftime('%H:%M')}-{j.end_dt.strftime('%H:%M')} -> driver_id={j.assigned_driver_id} unresolved={j.unresolved}")
-assert all(j.assigned_driver_id == 1 for j in jobs), "All 5 rows should fit on one 9h-max driver -- true total is 9h, not the naive 12h sum"
+assert all(j.assigned_driver_id == 1 for j in jobs), "All 5 rows should fit on one 9h-max driver -- true SPAN is exactly 9h (04:00-13:00), back to back"
 assert not any(j.unresolved for j in jobs)
 print("PASS: simultaneous duplicate-pickup pair correctly counted once, whole day fits under a 9h zero-overtime driver")
 

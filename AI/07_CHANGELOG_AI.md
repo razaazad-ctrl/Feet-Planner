@@ -1,12 +1,3 @@
-## Phase 20 — In-house Trip Count in Summary Header (2026-08-10)
-
-- Corrected the second summary metric card so it reports **In-house trips** only.
-- The value is calculated from the current in-memory result assignments where a
-  driver is assigned, rather than using the total number of jobs (which includes
-  supplier and unresolved jobs).
-- The separate footer `Total trips` remains the overall trip/job count.
-- No allocation, database, API, export, or surrounding UI behavior was changed.
-
 # CHANGELOG_AI.md — Fleet Planner
 
 Major architectural and logical changes only, in chronological order.
@@ -1468,6 +1459,25 @@ second, adds one new dependency) before building.
 - No database, allocation-engine, API, or surrounding Plan a Day UI changes were
   introduced.
 
+## Phase 19b — In-house Trip Count Fix in Summary Header (2026-08-10)
+
+*(Numbering note: this entry was originally committed as a second, duplicate
+"Phase 20" prepended at the very top of this file, ahead of even the Phase 0
+entry -- a real documentation-hygiene slip, not a content error. Corrected here
+by moving it to its actual chronological position (after Phase 19, before
+Phase 18 in this file's existing -- if unusual -- ordering for the summary-
+popup cluster) and renumbering it out of collision with the real Phase 20
+below, following the same fix pattern already used once before in this project
+for the Phase 14/14b collision. See NEXT_SESSION.md for the standing reminder
+this prompted about keeping changelog entries appended in one place.)*
+
+- Corrected the second summary metric card so it reports **In-house trips** only.
+- The value is calculated from the current in-memory result assignments where a
+  driver is assigned, rather than using the total number of jobs (which includes
+  supplier and unresolved jobs).
+- The separate footer `Total trips` remains the overall trip/job count.
+- No allocation, database, API, export, or surrounding UI behavior was changed.
+
 ## Phase 18 — Modern Summary Table Refinement (2026-08-10)
 
 - Refined the existing `DriverSupplierSummaryDialog` without changing the
@@ -1525,3 +1535,162 @@ second, adds one new dependency) before building.
 - Preserved the result-only architecture: no database reads, allocation changes,
   API calls, or changes to the surrounding Plan a Day workflow.
 - Updated architecture/workflow documentation to record the final popup behavior.
+
+## Phase 21 — Duty-span correction: the daily hard rule (and monthly overtime) measure SPAN, not summed job duration (2026-08-10)
+
+- **The project owner corrected a foundational misunderstanding, with a
+  concrete example.** AALIM has `working_hours_per_day=9`,
+  `max_working_hours_per_day=12` -- a hard rule that should mean: if used
+  at all, his day must be >=9h and <=12h, measured strictly by **duty
+  SPAN** (first job's start to last job's end). Separately, if he's given
+  3 jobs summing to 8 actual worked hours (2h+3h+3h) inside that span,
+  that 8h figure ("hours worked") has **no hard rule of its own at all**
+  -- it's purely a fairness/balance concern, never a legality check. Every
+  hard-rule check throughout `allocation_engine.py` had this backwards:
+  the floor/ceiling was being checked against `_merged_hours()` (a SUM of
+  job durations, deduplicated for overlaps), not the span -- meaning a
+  driver needed 9+ CUMULATIVE hours of actual work to ever "activate,"
+  when the real rule only requires a 9+ hour SPREAD between their first
+  and last job, a much easier bar. This is, in effect, the resolution of
+  the project's own long-standing open "OPT-001 duty-span question"
+  (raised 2026-08-03, left undecided ever since) -- resolved directly:
+  span for the hard rule, summed duration for fairness only, never the
+  reverse. Confirmed as the direct cause of a real symptom the project
+  owner had already noticed: `MANPREET SINGH` was getting zero jobs at
+  all from `allocate_by_solver()`, because the only way to "activate" him
+  under the old sum-based floor would have required 9+ hours of actual
+  work with no combination available that didn't conflict elsewhere --
+  under the corrected span-based floor, a much smaller, well-spread set
+  of jobs is enough, and he now gets real work.
+- **Fixed everywhere this check occurs:** a new `_day_span_hours()`
+  helper (earliest start to latest end of a set of same-day intervals,
+  deliberately distinct from `_merged_hours()`, which remains correct and
+  unchanged for its existing fairness/tie-breaking role -- e.g.
+  `occupied_seconds`, least-occupied-first candidate ranking, the
+  solver's balance objective) plus a `_same_day_intervals()` helper for
+  date-scoping. Every ceiling/floor check in the engine now uses span:
+  the main `allocate()` candidate loop, `_fill_gaps_with_unresolved_jobs`,
+  `_repair_minimum_daily_hours` (both its top-level floor check, now
+  computing `span_hours` instead of the old `total_hours`, and its
+  internal move-feasibility ceiling check), the shared
+  `_unit_driver_feasible()` (used by `allocate_by_merit`,
+  `allocate_by_anchor`, `_swap_repair`, and the chain search --
+  propagating the fix to all of them through one shared function),
+  `_swap_repair`'s own inline ceiling check, and `_rebalance_idle_drivers`
+  (a more substantial rework here -- see below).
+- **`_rebalance_idle_drivers()` needed a deeper rework, not just a metric
+  swap.** Its whole design (accumulate candidate jobs one at a time until
+  the running SUM reaches the driver's minimum) assumed sum-based floors;
+  under span-based floors, reaching the minimum is about the accumulated
+  jobs' SPREAD, not their total duration, so both the loop's stopping
+  condition and its ceiling-feasibility check were switched to
+  `_day_span_hours()`. The donor-side "would pulling this job leave the
+  donor with a new illegal short day" check was similarly switched to
+  compare the donor's remaining SPAN (after removing the candidate job)
+  against their own floor, rather than remaining summed duration.
+- **Monthly overtime budget: also span-based, confirmed directly by the
+  project owner (a real, important correction to an interim guess).**
+  An earlier attempt at this fix (mid-session) initially made the
+  monthly-overtime-vs-budget check SUM-based rather than span-based,
+  reasoning that overtime *pay* should track actual hours worked --
+  flagged explicitly to the project owner as an assumption rather than
+  something their original explanation covered. The project owner
+  corrected this directly: `working_hours_per_day` is "the total legal
+  working hours allowed / day, anything over this will be overtime" --
+  a driver whose SPAN reaches 12h against a 9h baseline has 3h of
+  overtime that day, full stop, deducted from
+  `max_overtime_hours_per_month`, using the exact same duty-span concept
+  as the daily ceiling, not a separate sum-based one. Reverted the
+  interim sum-based attempt everywhere it had been applied (all the same
+  call sites listed above) back to span-based overtime, matching the
+  ceiling check exactly. This also simplified the solver's modeling (see
+  below) back to a single combined helper instead of two separate ones.
+- **`allocate_by_solver()` needed a genuinely new piece of CP-SAT
+  modeling, not just a metric swap** -- span isn't expressible as a
+  simple linear sum the way summed duration was; it requires MIN/MAX over
+  only the units actually assigned to a driver. Solved with a channeling
+  trick: for each (unit, driver) candidate pair, an "effective start" and
+  "effective end" that collapse to a large neutral constant when that
+  unit ISN'T assigned to that driver (so it can never influence the
+  min/max), then `AddMinEquality`/`AddMaxEquality` over all of them per
+  driver to get `first_start[d]`/`last_end[d]`, and `span[d] = last_end[d]
+  - first_start[d]`. The daily floor (with the existing Same-Driver-group
+  exemption, unchanged) and ceiling are now both checked against
+  `span[d]`; the fairness/balance objective term still uses the
+  unchanged, genuinely SUM-based `total_minutes[d]`. `_solver_effective_ceiling_minutes()`
+  (the helper folding the flat daily ceiling and the monthly-overtime
+  interaction into one number) needed no conceptual change once overtime
+  was confirmed span-based -- an interim version had briefly split it
+  into two separate helpers (`_solver_span_ceiling_minutes` /
+  `_solver_monthly_overtime_cap_minutes`) while overtime was thought to
+  be sum-based; reverted back to the single combined helper once overtime
+  was confirmed span-based too, which is simpler and was in fact the
+  correct design from the very first version of this function.
+- **A permanent safety net was added, not just a one-time check:**
+  `allocate_by_solver()` now runs an explicit post-solve validation
+  after committing every unit, re-deriving each used driver's actual
+  span directly from the real `Job` data (independent of the CP-SAT
+  model's own internal bookkeeping) and raising a loud `AssertionError`
+  if any used, non-group-exempt driver's span ever falls outside their
+  floor/ceiling. Since every solver-returned solution is supposed to
+  satisfy every modeled constraint by construction, this should never
+  fire -- but a hard-rule violation must never ship silently regardless
+  of how it could happen (Rule 2/6), so it's now checked explicitly on
+  every run rather than assumed correct from the model design alone.
+  Stress-tested clean across 30+ separate solver runs (including
+  single-threaded runs across many different random seeds, specifically
+  to rule out an intermittent issue noticed once during interim,
+  incomplete edits mid-session) with zero violations caught.
+- **Two existing synthetic tests needed fixture updates, not weakening.**
+  `tests/test_daily_overtime_ceiling.py`'s "repair pass success" scenario
+  and `tests/test_hour_accounting.py`'s duplicate-pickup scenario both
+  had job times with real GAPS between them that were only "legal" under
+  the old sum-based ceiling math (their true summed duration fit under
+  the ceiling even though their span didn't). Adjusted the job times so
+  the scenarios stay legal under the corrected span-based ceiling while
+  still testing what they originally intended (a genuine repair-pass
+  consolidation success; the duplicate-pickup dedup logic for fairness
+  purposes) -- documented inline in each file why the times changed.
+  `tests/test_gap_filling.py`'s driver fixtures also needed
+  `max_overtime_hours_per_month=60.0` added (previously blank, which
+  under span-based overtime correctly blocks ANY daily overtime at all,
+  including the 3h the test's consolidation scenario now legitimately
+  needs) -- matching how real driver profiles in the actual database are
+  actually configured, not a special-case relaxation.
+- **Real-data result on `UNPLANNED.xlsx` (both engines independently):**
+  `allocate_by_anchor()` and `allocate_by_solver()` both still reach 0
+  unresolved, 0 supplier, all 11 drivers used after this fix -- the
+  headline numbers are unchanged, but the underlying per-driver hour
+  distribution is now correct (`MANPREET SINGH` gets real work; every
+  driver's actual duty span, not just their summed duration, is verified
+  within their configured floor/ceiling).
+- Full existing test suite re-run and passing after every fix in this
+  phase. `tests/test_shift_start.py`, confirmed dead since the Phase 10
+  shift redesign (its own imports reference functions removed back then)
+  and already flagged for deletion in an old, no-longer-present
+  `CHANGED_FILES_MANIFEST.txt`, was deleted this session -- the suite now
+  runs 100% clean with no skip-list needed.
+- **Documentation hygiene, found and fixed while syncing this session's
+  work with the actual repository state:** this file had accumulated a
+  genuine numbering collision -- two separate entries both titled
+  "Phase 20" (one, "In-house Trip Count in Summary Header," had been
+  mistakenly prepended above even the Phase 0 entry at the very top of
+  the file, rather than appended in sequence). Corrected by renumbering
+  the misplaced entry to "Phase 19b" and moving it to its correct
+  chronological position -- the same fix pattern already used once before
+  in this project for an earlier Phase 14/14b collision. **Standing
+  reminder for future sessions (see NEXT_SESSION.md):** always append new
+  phases at the END of this file, never prepend at the top, even for a
+  small fix.
+- **Deferred, explicitly, to a future session (the project owner offered
+  the choice and this genuinely is separate-enough scope):** two new
+  derived fields the project owner wants next -- "Balance Overtime /
+  month" (`max_overtime_hours_per_month` minus overtime used so far this
+  month, i.e. how much overtime budget remains) and "Balance hours /
+  month" (`total_hours_per_month_target` minus total SPAN hours logged so
+  far this month) -- both intended to display on the Drivers tab next to
+  their respective existing fields, and both intended to be calculated
+  and persisted when a day is finalized/saved (mirroring how
+  `db.get_driver_month_overtime_hours` already works from
+  `finalized_jobs`), not computed live on every keystroke. Not started
+  this session. See `NEXT_SESSION.md` for the concrete next-step plan.

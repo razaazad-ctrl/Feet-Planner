@@ -1,4 +1,4 @@
-Fleet Planner Scheduling Rules Specification v12
+Fleet Planner Scheduling Rules Specification v13
 (v3 reviewed against the actual codebase in FleetPlanner.zip and tested live
 against UNPLANNED.xlsx on 2026-08-02. v4 updated 2026-08-03 after a working
 session with the project owner that resolved HR-002/NEW-002 and redesigned
@@ -186,9 +186,11 @@ HR-004 [✓] Idle time counts as break.
         Confirmed: occupied_seconds only accumulates actual job duration,
         never the gap between jobs, so idle time is never charged against a
         driver's hours.
-HR-005 [~ WIDENED 2026-08-06] A driver used at all on a given day must
-        reach at least their configured working_hours_per_day that day
-        (hard minimum, not just a target).
+HR-005 [~ WIDENED 2026-08-06, CORRECTED 2026-08-10] A driver used at all
+        on a given day must reach at least their configured
+        working_hours_per_day that day (hard minimum, not just a
+        target), measured by duty SPAN (first job start to last job
+        end), NOT summed job duration.
         Added 2026-08-03 at the project owner's explicit request ("full
         rework now to enforce as a hard minimum"). This can't be enforced
         as a simple per-job filter the way the daily ceiling is, because
@@ -1415,3 +1417,57 @@ V12 ADDENDUM (2026-08-09)
   substitute for synthetic regression coverage. See NEXT_SESSION.md
   Section 6 item 1 for the explicit next-step, now the top priority
   alongside validating against a bigger real file.
+
+--------------------------------------------------------------------------
+V13 ADDENDUM (2026-08-10)
+--------------------------------------------------------------------------
+- HR-005 CORRECTED: the daily floor/ceiling hard rule, and the monthly
+  overtime budget interaction, are measured against a driver's duty SPAN
+  (first job's start to last job's end), NOT summed job duration --
+  confirmed directly by the project owner with a concrete example
+  (AALIM: three jobs summing to 8h shouldn't matter for legality, only
+  his first-to-last-job spread does). Summed job duration ("hours
+  worked") has no hard rule of its own anywhere in this engine; it's
+  used only for fairness/balance, never legality. This resolves the
+  project's own long-standing open "OPT-001 duty-span question" (first
+  raised v4, 2026-08-03) -- span for every hard rule, summed duration
+  for fairness only, never the reverse. Fixed across all four allocation
+  strategies via a new _day_span_hours() helper. allocate_by_solver()
+  needed genuinely new CP-SAT modeling (a MIN/MAX channeling
+  construction over only each driver's assigned units, since span isn't
+  a simple linear sum) and gained a permanent post-solve validation that
+  raises loudly if a driver's committed span is ever found outside their
+  floor/ceiling -- stress-tested clean across 30+ separate runs.
+- An interim mid-fix guess (that monthly overtime should track summed
+  "actual worked" hours rather than span, reasoning overtime pay should
+  correlate with hours actually worked) was explicitly flagged to the
+  project owner as an assumption and then corrected by them directly:
+  overtime is ALSO span-based, the same duty-span concept as the daily
+  ceiling throughout, not a separate sum-based one.
+- Two existing synthetic tests needed fixture updates (not weakening) to
+  reflect the corrected rule -- see CHANGELOG_AI.md Phase 21 for exactly
+  what changed and why in each case.
+- Real-data result unchanged at the headline level (allocate_by_anchor()
+  and allocate_by_solver() both still reach 0 unresolved / 0 supplier /
+  all 11 drivers used on UNPLANNED.xlsx) but now with a correct
+  underlying per-driver hour distribution -- a driver who previously got
+  zero jobs at all under the old sum-based floor (needing 9+ cumulative
+  worked hours to ever "activate") now gets real, legally-spread work.
+- Two new derived fields requested by the project owner, explicitly
+  deferred to a future session (separate scope -- new DB tracking + new
+  Drivers tab UI, not an allocation-engine change): "Balance Overtime /
+  month" and "Balance hours / month". See CHANGELOG_AI.md Phase 21 and
+  NEXT_SESSION.md Section 6 item 1 for the full field definitions and
+  concrete implementation plan.
+- Documentation hygiene: a genuine numbering collision in
+  CHANGELOG_AI.md (two separate entries both titled "Phase 20," one
+  mistakenly prepended above even the Phase 0 entry) was found and
+  fixed while syncing this session's work with the actual repository
+  state -- renumbered to "Phase 19b" and moved to its correct
+  chronological position. Standing reminder for future sessions: always
+  append new changelog phases at the end of the file, never prepend.
+- tests/test_shift_start.py, dead since the v4/HR-002 shift redesign,
+  was finally deleted this session (already flagged for removal in an
+  old CHANGED_FILES_MANIFEST.txt that has itself now been removed as
+  stale) -- the full test suite runs 100% clean with no skip-list
+  needed.

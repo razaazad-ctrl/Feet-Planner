@@ -344,3 +344,14 @@ SELECT * FROM decision_log WHERE plan_date > ? ORDER BY plan_date
   session touched. No schema or code change -- purely a data-entry
   correction, same category as the "Seated"/"Seater" and embedded-
   newline issues above. See `CHANGELOG_AI.md` Phase 16.
+
+- **The embedded-newline fix (above) recurred 2026-08-10** -- the cleaned
+  database snapshot from Phase 15 (2026-08-06) was not the one that ended
+  up committed to the repository; vehicle `Z 43915`'s `vehicle_type` had
+  the embedded newline back in it, causing 3 real jobs to go unresolved
+  (`_type_matches()` failing on the invisible-in-the-UI character
+  difference, same failure mode as before). Re-applied the same SQL
+  sweep fix directly to the repo's actual `fleetplanner.db`. If this
+  recurs again, it's worth checking whether the database gets
+  regenerated/re-exported from a source that still has the original
+  wrapped-cell newline, rather than re-fixing it ad hoc each time.

@@ -489,19 +489,74 @@ Section 3 below).
   continuation job but refuse a lone evening job for a morning-only
   driver") rather than full `allocate()`-style end-to-end runs. Not
   built yet -- flagged as a real priority, see Section 6.
+- **RESOLVED 2026-08-10 (Phase 21): the daily hard rule (floor/ceiling)
+  and monthly overtime budget were both being checked against SUMMED job
+  duration instead of duty SPAN (first job start to last job end) --
+  a foundational correction, not a tuning tweak.** The project owner
+  caught this directly with a concrete example (AALIM: 3 jobs summing to
+  8h shouldn't matter for legality, only his span does) and separately
+  corrected an interim guess made mid-fix (overtime is ALSO span-based,
+  not sum-based, confirmed directly: "anything over [working_hours_per_day]
+  will be overtime... deducted from max overtime hours/month"). Fixed
+  across every strategy via a new `_day_span_hours()` helper (kept
+  distinct from `_merged_hours()`, which remains correct for its
+  existing fairness/tie-breaking role). `allocate_by_solver()` needed
+  real new CP-SAT modeling (a MIN/MAX channeling trick over only the
+  units assigned to each driver) since span isn't a simple linear sum.
+  A permanent post-solve validation was added to the solver to catch any
+  future violation loudly rather than silently. See `CHANGELOG_AI.md`
+  Phase 21 for the full technical writeup, including which existing
+  tests needed fixture updates (not weakening) to reflect the corrected
+  rule.
+- **NEW, real, explicitly deferred: "Balance Overtime / month" and
+  "Balance hours / month" fields, requested 2026-08-10.** The project
+  owner wants two new derived numbers displayed on the Drivers tab:
+  - **Balance Overtime / month** = `max_overtime_hours_per_month` minus
+    however much span-based overtime the driver has actually used this
+    month so far (the same figure `db.get_driver_month_overtime_hours`
+    already computes for the monthly-cap check -- just not currently
+    displayed anywhere). Shown next to the existing "Max overtime
+    hours/month" field.
+  - **Balance hours / month** = `total_hours_per_month_target` minus the
+    total SPAN hours logged so far this month (a NEW monthly
+    accumulation this project doesn't currently track anywhere --
+    `total_hours_per_month_target` is presently informational-only, see
+    Section 5 above). Shown next to the existing "Total hours/month
+    target" field. If `total_hours_per_month_target` is blank, both
+    balance fields should read as zero, per the project owner's
+    instruction.
+  - **Both should be calculated when a day is Finalized/saved to
+    history, not computed live** -- mirroring the existing
+    `finalized_jobs`-based pattern `db.get_driver_month_overtime_hours`
+    already uses, not a new on-the-fly calculation. This means the
+    natural place to compute and persist "hours logged this month" is
+    likely a small addition alongside (or inside) `db.save_finalized_jobs`
+    or a sibling read function, following the same day-grouped,
+    finalized-history-driven approach already established for overtime.
+  - Explicitly NOT started this session -- the project owner offered
+    the choice to do it now or defer, and given it's genuinely separate
+    scope (new DB read logic + new Drivers tab UI fields, not an
+    allocation-engine change), it was deferred. This is now the
+    **top UI/DB priority** for the next session that picks up Drivers
+    tab or monthly-tracking work -- see item 0 below, now updated to
+    reflect this alongside the still-open bigger-file validation.
 
 ## 6. Recommended next improvements, roughly in priority order
 
 Based on what's explicitly still open and what would unblock the most
-value. **This list changed substantially after Phase 16** -- the
-question that used to sit at position 0 ("should we move toward
-production, or keep iterating") has effectively been answered by
-results, not by discussion: `allocate_by_solver()` now reaches 0
-unresolved / 0 supplier / all drivers used, PROVEN optimal, on the real
-file that motivated all of Phase 14/15/16's work. The open questions now
-are about validating that this holds up on a bigger, more realistic file
-(one that actually needs some supplier use) and closing real,
-already-disclosed gaps, not about which algorithmic direction to pursue.
+value. **This list changed substantially after Phase 16, and got one
+more addition after Phase 21** -- the question that used to sit at
+position 0 ("should we move toward production, or keep iterating") has
+effectively been answered by results, not by discussion:
+`allocate_by_solver()` now reaches 0 unresolved / 0 supplier / all
+drivers used, PROVEN optimal, on the real file that motivated all of
+Phase 14/15/16's work, and Phase 21 corrected a foundational hard-rule
+bug (span vs. summed duration) across every strategy. The open questions
+now are about validating that this holds up on a bigger, more realistic
+file (one that actually needs some supplier use), a genuinely new
+feature the project owner asked for (the Balance fields), and closing
+real, already-disclosed gaps -- not about which algorithmic direction to
+pursue.
 
 0. **Validate `allocate_by_solver()` against a bigger, real file that
    includes genuine supplier need (in progress as of the end of this
@@ -517,25 +572,43 @@ already-disclosed gaps, not about which algorithmic direction to pursue.
    in-house-first correctly, (b) supplier use only appears where truly
    necessary (matching Rule 7), and (c) solve time stays reasonable at
    a larger scale (the current file is 44 jobs / 11 drivers, solving in
-   ~4s; a bigger file's actual size and solve time are both unknowns
-   until tested).
-1. **Write dedicated synthetic tests for ALL of Phase 15 AND Phase 16's
-   new code before considering any of it production-ready.** This
-   combines what were previously two separate open items. Still
+   a few seconds; a bigger file's actual size and solve time are both
+   unknowns until tested).
+1. **Build "Balance Overtime / month" and "Balance hours / month"**
+   (requested 2026-08-10, explicitly deferred to this list -- see
+   Section 5's entry above for the exact field definitions and the
+   project owner's stated preference for computing these at Finalize-Day
+   time, not live). Concrete first steps: (a) a new `db` function
+   alongside `get_driver_month_overtime_hours` that sums SPAN hours (not
+   summed job duration -- consistent with Phase 21) per finalized day,
+   grouped by driver and month; (b) two new read-only fields on the
+   Drivers tab, positioned next to "Max overtime hours/month" and "Total
+   hours/month target" respectively; (c) confirm with the project owner
+   whether "hours logged this month" for the Balance-hours field should
+   also be span-based (matching the overtime field's logic) before
+   building it, since Phase 21 was specifically about the DAILY
+   floor/ceiling and monthly overtime, and this is a related but
+   distinct monthly figure that wasn't explicitly covered by that
+   correction.
+2. **Write dedicated synthetic tests for ALL of Phase 15/16/21's new
+   code before considering any of it production-ready.** Still
    completely unaddressed: `allocate_by_merit`, `allocate_by_anchor`,
    `_swap_repair` (now significantly more complex after Phase 16's
    bundle/chain-search widening), `build_planning_units`,
-   `_rebalance_idle_drivers`, and now also `allocate_by_solver` and its
-   CP-SAT model, all validated only via direct real-data runs so far.
-   For the solver specifically, small hand-built scenarios checking one
-   constraint at a time (see Section 5's note on this) will likely be
-   more useful than trying to mirror the existing `tests/*.py` pattern
-   exactly.
-2. **Decide whether/when to wire `allocate_by_solver()` (or
+   `_rebalance_idle_drivers`, `allocate_by_solver` and its CP-SAT model
+   (including the new span-channeling constraints from Phase 21), and
+   `_day_span_hours`/`_same_day_intervals` themselves -- all validated
+   only via direct real-data runs and (for the solver specifically) a
+   30+-run stress test so far, not the small, targeted synthetic tests
+   every other piece of this engine has. For the solver, small
+   hand-built scenarios checking one constraint at a time (see Section
+   5's note on this) will likely be more useful than trying to mirror
+   the existing `tests/*.py` pattern exactly.
+3. **Decide whether/when to wire `allocate_by_solver()` (or
    `allocate_by_anchor`, as a fallback if `ortools` isn't available in
    some environment) into `plan_day_tab.py`'s "Run Planning" button.**
    Currently NONE of the four strategies except the original `allocate()`
-   are reachable from the UI at all -- this is still true after Phase 16.
+   are reachable from the UI at all -- this is still true after Phase 21.
    Now that one of them has real, validated, proven-optimal results,
    this is a much more concrete decision than it was before, but it's
    still the project owner's call, not something to do unilaterally
@@ -548,17 +621,14 @@ already-disclosed gaps, not about which algorithmic direction to pursue.
    the solver returns `FEASIBLE` instead of `OPTIMAL` (i.e. it hit the
    time limit) -- silently accept the best-found result, or surface that
    distinction to the planner?
-3. **Decide the duty-span question (spec OPT-001), explicitly left open
-   2026-08-03.** Should a driver's SPAN (first job to last job that day,
-   including idle gaps) count toward daily/monthly hour limits, instead
-   of (or alongside) summed job duration as today? Tradeoff already
-   explained to the project owner once (span-based is more realistic
-   about unavailability during a gap, but hits hour ceilings faster than
-   actual hours worked and may not match driver pay) -- still not
-   revisited. Worth another look now that both the anchor engine and the
-   solver are producing much more tightly-packed real schedules than
-   before.
-4. **Confirm and, if wanted, fix NEW-007 (spec): extend gap-filling to
+4. ~~Decide the duty-span question (spec OPT-001)~~ **RESOLVED 2026-08-10,
+   Phase 21.** A driver's SPAN (first job to last job that day, including
+   idle gaps) now counts toward daily/monthly hour limits -- confirmed
+   directly by the project owner, not summed job duration as before.
+   Summed duration remains relevant only for fairness/balance, never
+   legality. See `CHANGELOG_AI.md` Phase 21 for the full technical
+   writeup across every strategy.
+5. **Confirm and, if wanted, fix NEW-007 (spec): extend gap-filling to
    cover wide-open (not just bounded) driver capacity.** Found 2026-08-03
    (Phase 13) via a real test: a driver ended the day with a single 2h
    job while other jobs sat unresolved. Possibly moot now -- Phase 16's
@@ -566,32 +636,34 @@ already-disclosed gaps, not about which algorithmic direction to pursue.
    both attack a broader version of this same underutilization problem
    from a different angle -- but hasn't been explicitly re-checked
    against this specific spec since those were built.
-5. **Wire AI suggestion Accept to actually mutate the results table.**
+6. **Wire AI suggestion Accept to actually mutate the results table.**
    High value, well-scoped, the decision-logging plumbing already
    exists — this is "finish what's started," not new design work.
-6. **Help the user fix their real data** (license types, missing
+7. **Help the user fix their real data** (license types, missing
    drivers, vehicle-type text consistency, and now also the embedded-
    newline issue confirmed fleet-wide in Phase 15 -- the project owner's
    own live database was NOT touched this session, only the test
    snapshot was) using the same extract-from-PLANNED-file technique
    already built and used once in this project (see `CHANGELOG_AI.md`
    Phase 6).
-7. **Build the daily driver/supplier shortlist UI**, since the backend
+8. **Build the daily driver/supplier shortlist UI**, since the backend
    already supports it — comparatively low effort for real planner
    value (handling "these specific drivers are off tomorrow" days more
    conveniently than the per-entity exclusion toggle alone).
-8. **PDF export**, once the user is ready to prioritize it — needs a
+9. **PDF export**, once the user is ready to prioritize it — needs a
    design conversation about the `pywin32`/Excel-COM approach first,
    since it's a different technical approach than everything else built
    so far (everything else is pure Python; this would shell out to a
    real Excel install).
-9. **Two small, well-scoped follow-ups from the Phase 10 rework, either
-   one is a good next pick:** showing month-to-date overtime-so-far on
-   the Drivers tab (spec NEW-006 -- the number is already computed
-   correctly, just not displayed), and reporting each driver's actual
-   first-job time back to them once a day is finalized (spec SS-003 --
-   same situation, data exists, not surfaced yet).
-10. **Only after the above, and only with explicit confirmation from the
+10. **One small, well-scoped follow-up from the Phase 10 rework:**
+    reporting each driver's actual first-job time back to them once a
+    day is finalized (spec SS-003 -- data exists, not surfaced yet). The
+    other Phase 10 follow-up listed here previously (month-to-date
+    overtime-so-far on the Drivers tab, spec NEW-006) is effectively
+    superseded by item 1 above ("Balance Overtime / month") -- build that
+    instead of NEW-006 separately, since it's the more complete version
+    of the same idea.
+11. **Only after the above, and only with explicit confirmation from the
     user:** consider the combined "Plan My Day" one-click shortcut
     (merging Run Planning + AI Review) and PyInstaller packaging into a
     distributable `.exe`. If `allocate_by_solver()` does get wired into

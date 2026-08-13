@@ -382,11 +382,21 @@ def _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buff
             if _overlaps_with_buffer(d.busy_intervals, job.start_dt, job.end_dt, travel_buffer_minutes):
                 continue
             if d.working_hours_per_day is not None:
-                projected = _merged_hours(d.busy_intervals + [(job.start_dt, job.end_dt)])
+                same_day = _same_day_intervals(d.busy_intervals, job.start_dt.date()) + [(job.start_dt, job.end_dt)]
+                projected_span = _day_span_hours(same_day)
                 ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
-                if projected > ceiling + 1e-9:
+                if projected_span > ceiling + 1e-9:
                     continue
-                overtime = max(0.0, projected - d.working_hours_per_day)
+                # Monthly overtime BUDGET is ALSO span-based (2026-08-10,
+                # confirmed directly by the project owner): working_hours_per_day
+                # is the total legal daily hours; any SPAN beyond it is
+                # overtime, deducted from max_overtime_hours_per_month. (An
+                # earlier version of this fix tried sum-based overtime
+                # instead -- reverted; the project owner clarified overtime
+                # tracks the same duty-span concept as the daily ceiling,
+                # not summed job duration.)
+                overtime = max(0.0, projected_span - d.working_hours_per_day)
+                overtime = max(0.0, projected_sum - d.working_hours_per_day)
                 if d.max_overtime_hours_per_month is not None:
                     if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
                         continue
@@ -520,17 +530,20 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
 
         # Recomputed FRESH every time -- see correctness note (1) above.
         # Includes EVERY job assigned to this driver that day, grouped or
-        # not: total_hours has to reflect the driver's true day, even
+        # not: span_hours has to reflect the driver's true day, even
         # though only the ungrouped subset is ever movable (see below).
-        # Uses merged/deduplicated hours (2026-08-03 hour-accounting fix,
-        # see _merged_hours above) -- two overlapping same-time rows in a
-        # flagged group count once, not once each.
+        # Duty SPAN (2026-08-10 correction, confirmed directly by the
+        # project owner with a concrete example) -- first job's start to
+        # last job's end, NOT summed job duration. Summed duration
+        # ("hours worked") has no hard rule of its own; it remains purely
+        # a fairness/tie-breaking figure (see occupied_seconds elsewhere
+        # in this module) and must never again decide legality here.
         all_day_jobs = [
             j for j in jobs
             if j.assigned_driver_id == driver_id and j.start_dt is not None and j.start_dt.date() == day
         ]
-        total_hours = _merged_hours([(j.start_dt, j.end_dt) for j in all_day_jobs])
-        if total_hours <= 1e-9 or total_hours >= driver.working_hours_per_day - 1e-9:
+        span_hours = _day_span_hours([(j.start_dt, j.end_dt) for j in all_day_jobs])
+        if span_hours <= 1e-9 or span_hours >= driver.working_hours_per_day - 1e-9:
             continue  # unused, already fixed by an earlier pair in this pass, or already meets the minimum
 
         # Stability guard (2026-08-04) -- see settled_job_ids note above.
@@ -604,11 +617,13 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
                                       travel_buffer_minutes, ignore_group_key=effective_group_key):
                 return False, None
             if d.working_hours_per_day is not None:
-                projected = _merged_hours(combined_busy + [(job.start_dt, job.end_dt)])
+                projected_span = _day_span_hours(combined_busy + [(job.start_dt, job.end_dt)])
                 ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
-                if projected > ceiling + 1e-9:
+                if projected_span > ceiling + 1e-9:
                     return False, None
-                overtime = max(0.0, projected - d.working_hours_per_day)
+                # Monthly overtime BUDGET is span-based too (2026-08-10) --
+                # same metric as the ceiling just above.
+                overtime = max(0.0, projected_span - d.working_hours_per_day)
                 if d.max_overtime_hours_per_month is not None:
                     if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
                         return False, None
@@ -718,7 +733,7 @@ def _repair_minimum_daily_hours(jobs, driver_pool, vehicle_pool, travel_buffer_m
                 job.assigned_vehicle_plate = ""
                 job.unresolved = True
                 job.assignment_note = (
-                    f"Below {driver.name}'s minimum daily hours ({total_hours:.1f}h < "
+                    f"Below {driver.name}'s minimum daily span ({span_hours:.1f}h < "
                     f"{driver.working_hours_per_day:.1f}h required) and no other qualifying "
                     f"driver had room -- needs manual review"
                 )
@@ -793,8 +808,8 @@ def _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minut
         if _overlaps_with_buffer(accumulated, job.start_dt, job.end_dt, travel_buffer_minutes):
             return False
         ceiling = _driver_ceiling(idle)
-        projected = _merged_hours([(s, e) for s, e, _ in accumulated] + [(job.start_dt, job.end_dt)])
-        if ceiling is not None and projected > ceiling + 1e-9:
+        projected_span = _day_span_hours([(s, e) for s, e, _ in accumulated] + [(job.start_dt, job.end_dt)])
+        if ceiling is not None and projected_span > ceiling + 1e-9:
             return False
         return True
 
@@ -807,7 +822,7 @@ def _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minut
         picked_job_ids = set()
 
         for _ in range(20):  # hard cap, real datasets are nowhere near this
-            if _merged_hours([(s, e) for s, e, _ in accumulated]) >= minimum - 1e-9:
+            if _day_span_hours([(s, e) for s, e, _ in accumulated]) >= minimum - 1e-9:
                 break
             candidate = None  # (job, kind, donor)
 
@@ -845,10 +860,17 @@ def _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minut
                     for job in sorted(donor_pullable, key=lambda j: (j.end_dt - j.start_dt)):
                         if job.start_dt is None or job.end_dt is None:
                             continue
-                        remaining_hours = _merged_hours([
+                        # Duty SPAN of what the donor would be left with if
+                        # this specific job were pulled away -- NOT summed
+                        # duration (2026-08-10 correction). Removing a job
+                        # that isn't one of the donor's bounding first/last
+                        # jobs doesn't shrink their span at all; removing a
+                        # bounding one might. Either way, span is the right
+                        # thing to check against their own minimum here.
+                        remaining_span = _day_span_hours([
                             (x.start_dt, x.end_dt) for x in donor_all_jobs if x is not job
                         ])
-                        if 1e-9 < remaining_hours < donor.working_hours_per_day - 1e-9:
+                        if 1e-9 < remaining_span < donor.working_hours_per_day - 1e-9:
                             continue  # would push the donor into a NEW illegal short day
                         if _feasible(idle, job, accumulated):
                             found = job
@@ -867,8 +889,8 @@ def _rebalance_idle_drivers(jobs, driver_pool, vehicle_pool, travel_buffer_minut
             if kind == "donor":
                 tentative_donor_removed.setdefault(donor.id, []).append((job.start_dt, job.end_dt))
 
-        total = _merged_hours([(s, e) for s, e, _ in accumulated])
-        if total < minimum - 1e-9:
+        total_span = _day_span_hours([(s, e) for s, e, _ in accumulated])
+        if total_span < minimum - 1e-9:
             continue  # couldn't reach the minimum -- discard everything tentative, driver stays legally idle
 
         # COMMIT -- only reached if the full accumulated total clears the minimum.
@@ -964,6 +986,48 @@ def _merged_hours(intervals):
     return sum((e - s).total_seconds() for s, e in merged) / 3600.0
 
 
+# --- Duty-span hard-rule correction (2026-08-10) --------------------------
+# The daily working_hours_per_day / max_working_hours_per_day hard rule was,
+# until this fix, checked against _merged_hours() above -- the SUM of a
+# driver's actual job durations (deduplicated for overlaps). The project
+# owner corrected this directly, with a concrete example: a driver with
+# three jobs (2h + 3h + 3h = 8h of "hours worked") should NOT be blocked
+# from having that day be legal, or forced to pick up more work to reach
+# 9h of SUMMED duration -- the 9h/12h hard rule is measured against the
+# driver's duty SPAN instead: strictly the time from their FIRST job's
+# start to their LAST job's end, regardless of how much actual job time
+# falls inside that window or how large the gaps between jobs are. Summed
+# job duration ("hours worked") has NO hard rule of its own at all -- it
+# remains exactly what it was for fairness/tie-breaking purposes (see
+# occupied_seconds, still computed via _merged_hours, still the basis for
+# least-occupied-first candidate ranking and the solver's balance
+# objective), but it must never again be compared against
+# working_hours_per_day/max_working_hours_per_day to decide legality.
+# This was, in effect, the project's own long-standing open OPT-001
+# "duty span" question (first raised 2026-08-03, left undecided ever
+# since) -- now resolved directly by the project owner: span for the hard
+# rule, summed duration for fairness only, never the reverse.
+def _day_span_hours(intervals):
+    """The driver's duty SPAN for a set of same-day intervals: from the
+    EARLIEST start to the LATEST end, not the summed/merged duration of
+    the intervals themselves (contrast with _merged_hours above, which
+    remains the correct function for fairness/tie-breaking purposes).
+    Accepts 2-tuples (start, end) or longer; anything past the first two
+    elements is ignored."""
+    if not intervals:
+        return 0.0
+    starts = [iv[0] for iv in intervals]
+    ends = [iv[1] for iv in intervals]
+    return (max(ends) - min(starts)).total_seconds() / 3600.0
+
+
+def _same_day_intervals(intervals, the_date):
+    """Filters a driver's busy_intervals down to only those STARTING on
+    the given calendar date -- the same day-grouping convention already
+    used elsewhere in this module (e.g. _repair_minimum_daily_hours)."""
+    return [iv for iv in intervals if iv[0].date() == the_date]
+
+
 def allocate(jobs, drivers, vehicles, supplier_offerings,
              allowed_driver_ids=None, allowed_supplier_ids=None,
              allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES):
@@ -1053,13 +1117,21 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
                 continue
 
             if d.working_hours_per_day is not None:
-                projected_today_hours = _merged_hours(d.busy_intervals + [(job.start_dt, job.end_dt)])
+                projected_today_span = _day_span_hours(d.busy_intervals + [(job.start_dt, job.end_dt)])
                 # Hard daily ceiling -- applies regardless of how much monthly
                 # overtime allowance remains. See HR-002 rework note above.
+                # Measured against duty SPAN (first job start to last job
+                # end), not summed job duration -- see the 2026-08-10
+                # correction note above _day_span_hours().
                 daily_ceiling = d.max_working_hours_per_day if d.max_working_hours_per_day is not None else d.working_hours_per_day
-                if projected_today_hours > daily_ceiling + 1e-9:
+                if projected_today_span > daily_ceiling + 1e-9:
                     continue
-                projected_today_overtime = max(0.0, projected_today_hours - d.working_hours_per_day)
+                # Monthly overtime BUDGET is ALSO span-based (2026-08-10,
+                # confirmed directly by the project owner) -- overtime is
+                # any SPAN beyond working_hours_per_day, deducted from
+                # max_overtime_hours_per_month, same metric as the ceiling
+                # just above.
+                projected_today_overtime = max(0.0, projected_today_span - d.working_hours_per_day)
                 if d.max_overtime_hours_per_month is not None:
                     projected_month_overtime = d.month_overtime_so_far + projected_today_overtime
                     if projected_month_overtime > d.max_overtime_hours_per_month:
@@ -1454,11 +1526,13 @@ def _unit_driver_feasible(d, unit, allow_override_days, travel_buffer_minutes, g
                               travel_buffer_minutes, ignore_group_key=effective_group_key):
         return False, None
     if d.working_hours_per_day is not None:
-        projected = _merged_hours(busy_intervals + [(unit.start_dt, unit.end_dt)])
+        projected_span = _day_span_hours(busy_intervals + [(unit.start_dt, unit.end_dt)])
         ceiling = _driver_ceiling(d)
-        if ceiling is not None and projected > ceiling + 1e-9:
+        if ceiling is not None and projected_span > ceiling + 1e-9:
             return False, None
-        overtime = max(0.0, projected - d.working_hours_per_day)
+        # Monthly overtime BUDGET is span-based too (2026-08-10) -- same
+        # metric as the ceiling just above.
+        overtime = max(0.0, projected_span - d.working_hours_per_day)
         if d.max_overtime_hours_per_month is not None:
             if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
                 return False, None
@@ -2076,8 +2150,8 @@ def _swap_repair(units, driver_pool, vehicle_pool, travel_buffer_minutes, allow_
                         continue
                     if D.working_hours_per_day is not None:
                         ceiling = _driver_ceiling(D)
-                        projected = _merged_hours(reduced + [(U.start_dt, U.end_dt)])
-                        if ceiling is not None and projected > ceiling + 1e-9:
+                        projected_span = _day_span_hours(reduced + [(U.start_dt, U.end_dt)])
+                        if ceiling is not None and projected_span > ceiling + 1e-9:
                             continue
                     if _driver_is_off(D, U.start_dt.date(), allow_override_days) or not _job_matches_shift_period(U.start_dt, D.shift_period, busy_intervals=reduced):
                         continue
@@ -2367,7 +2441,13 @@ def allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings,
 def _solver_effective_ceiling_minutes(driver):
     """Combines the two layered daily-hours checks _unit_driver_feasible()
     already applies into ONE effective per-driver daily ceiling, in minutes
-    (CP-SAT needs integers, and minutes avoids float rounding issues):
+    (CP-SAT needs integers). Both layers are measured against a driver's
+    duty SPAN (first assigned job's start to last assigned job's end), NOT
+    summed job duration (2026-08-10 correction, confirmed directly by the
+    project owner: working_hours_per_day is "the total legal working hours
+    allowed / day, anything over this will be overtime" -- overtime tracks
+    the same duty-span concept as the daily ceiling, deducted from
+    max_overtime_hours_per_month exactly like the heuristic engines do):
     the flat daily ceiling (max_working_hours_per_day, or working_hours_per_day
     if that's blank), AND -- separately -- if max_overtime_hours_per_month is
     blank, NO daily overtime is allowed at all regardless of what the daily
@@ -2621,8 +2701,35 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
     # shortfall, not something forcing more (or fewer) hours could fix.
     # The ceiling still applies unconditionally either way -- only the
     # floor gets this exemption.
+    #
+    # 2026-08-10 duty-span correction (confirmed directly by the project
+    # owner with a concrete example): the floor/ceiling hard rule, AND the
+    # monthly overtime budget interaction, are BOTH measured against a
+    # driver's duty SPAN -- first assigned job's start to last assigned
+    # job's end -- NOT the summed duration of their jobs. working_hours_per_day
+    # is the total legal daily hours; any SPAN beyond it is overtime,
+    # deducted from max_overtime_hours_per_month -- the same duty-span
+    # concept throughout, not a separate sum-based one. Summed duration
+    # ("hours worked") has no hard rule of its own at all and is used only
+    # for fairness (the balance objective further below, via total_minutes
+    # -- unchanged, still genuinely sum-based).
+    #
+    # Modeling a span in CP-SAT requires MIN/MAX over only the units
+    # actually assigned to a driver, which needs a channeling trick: for
+    # each (unit, driver) pair, an "effective start/end" that collapses to
+    # a neutral extreme value when that unit ISN'T assigned, so it can
+    # never influence the min/max, then AddMinEquality/AddMaxEquality over
+    # all of them. NEUTRAL is a large constant safely outside the real
+    # time range spanned by any real dataset this app handles.
+    NEUTRAL = 100_000
+    epoch = min(u.start_dt for u in units)
+
+    def _abs_minutes(dt):
+        return int(round((dt - epoch).total_seconds() / 60.0))
+
     used = {}
     total_minutes = {}
+    span_minutes = {}
     for d in driver_pool:
         my_terms = [(i, x[i, d.id]) for i, u in enumerate(units) if (i, d.id) in x]
         if not my_terms:
@@ -2636,9 +2743,29 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
         model.AddMaxEquality(used_var, [var for _, var in my_terms])
         used[d.id] = used_var
 
-        ceiling_minutes = _solver_effective_ceiling_minutes(d)
-        if ceiling_minutes is not None:
-            model.Add(total_var <= int(ceiling_minutes))
+        effective_starts, effective_ends = [], []
+        for i, var in my_terms:
+            start_abs = _abs_minutes(units[i].start_dt)
+            end_abs = _abs_minutes(units[i].end_dt)
+            eff_start = model.NewIntVar(0, NEUTRAL, f"eff_start_u{i}_d{d.id}")
+            model.Add(eff_start == start_abs).OnlyEnforceIf(var)
+            model.Add(eff_start == NEUTRAL).OnlyEnforceIf(var.Not())
+            effective_starts.append(eff_start)
+            eff_end = model.NewIntVar(-NEUTRAL, NEUTRAL, f"eff_end_u{i}_d{d.id}")
+            model.Add(eff_end == end_abs).OnlyEnforceIf(var)
+            model.Add(eff_end == -NEUTRAL).OnlyEnforceIf(var.Not())
+            effective_ends.append(eff_end)
+        first_start = model.NewIntVar(0, NEUTRAL, f"first_start_d{d.id}")
+        model.AddMinEquality(first_start, effective_starts)
+        last_end = model.NewIntVar(-NEUTRAL, NEUTRAL, f"last_end_d{d.id}")
+        model.AddMaxEquality(last_end, effective_ends)
+        span_var = model.NewIntVar(-2 * NEUTRAL, 2 * NEUTRAL, f"span_d{d.id}")
+        model.Add(span_var == last_end - first_start)
+        span_minutes[d.id] = span_var
+
+        effective_ceiling_minutes = _solver_effective_ceiling_minutes(d)
+        if effective_ceiling_minutes is not None:
+            model.Add(span_var <= int(effective_ceiling_minutes)).OnlyEnforceIf(used_var)
 
             grouped_terms = [var for i, var in my_terms if units[i].same_driver_key]
             if grouped_terms:
@@ -2652,7 +2779,7 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
                 floor_applies = used_var  # no grouped units possible for this driver at all -- floor always applies when used
 
             floor_minutes = int(d.working_hours_per_day * 60)
-            model.Add(total_var >= floor_minutes).OnlyEnforceIf(floor_applies)
+            model.Add(span_var >= floor_minutes).OnlyEnforceIf(floor_applies)
 
     # ---- Same-Driver group cohesion (soft preference, SD-002/SD-003) ------
     # build_planning_units() already merges exact pairs (same vehicle type,
@@ -2717,6 +2844,12 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
     for d in driver_pool:
         if d.id not in total_minutes:
             continue
+        # Fairness/balance term stays SUM-based (total_minutes) -- matches
+        # the project owner's explanation that "hours worked" is purely a
+        # fairness concern, measured here against the same effective
+        # ceiling used for the hard span rule (a driver's summed worked
+        # hours can never exceed their span, so this is still a
+        # meaningful "how full is this driver" reference).
         ceiling_minutes = _solver_effective_ceiling_minutes(d)
         if ceiling_minutes is None:
             continue
@@ -2773,6 +2906,38 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
                     break
         _commit_unit(u, chosen_driver, chosen_vehicle, u.same_driver_key or None,
                      group_drivers, group_vehicle_by_driver, "solver")
+
+    # ---- Post-solve validation (defense in depth) --------------------------
+    # A driver hard-rule violation must never ship silently, no matter how
+    # it happened -- this re-checks every used driver's actual committed
+    # span against their floor/ceiling (respecting the Same-Driver-group
+    # exemption) directly from the real Job data, independent of the CP-SAT
+    # model's own internal bookkeeping. If this ever fires, it means the
+    # constraint encoding itself has a real bug (every solver-returned
+    # solution is supposed to satisfy every modeled constraint by
+    # definition) -- fail loudly here rather than let a bad result through,
+    # matching Rule 2/6 (hard rules must never be silently violated).
+    per_driver_committed = {}
+    for j in jobs:
+        if j.assigned_driver_id is not None and j.start_dt is not None:
+            per_driver_committed.setdefault(j.assigned_driver_id, []).append(j)
+    for d in driver_pool:
+        day_jobs = per_driver_committed.get(d.id)
+        if not day_jobs or d.working_hours_per_day is None:
+            continue
+        has_group = any(j.same_driver_key for j in day_jobs)
+        if has_group:
+            continue  # HR-005 exemption -- floor doesn't apply
+        span = _day_span_hours([(j.start_dt, j.end_dt) for j in day_jobs])
+        ceiling = _driver_ceiling(d)
+        if span < d.working_hours_per_day - 1e-6 or (ceiling is not None and span > ceiling + 1e-6):
+            raise AssertionError(
+                f"allocate_by_solver() internal error: {d.name}'s committed duty span ({span:.2f}h) "
+                f"violates their hard floor/ceiling ({d.working_hours_per_day}h-{ceiling}h) with no "
+                f"Same-Driver-group exemption applicable. This should be impossible under the CP-SAT "
+                f"model's constraints -- please report this with the input file, it indicates a real "
+                f"bug in the constraint encoding, not a data issue."
+            )
 
     # ---- Supplier fallback for anything the solver left unresolved --------
     # Identical reuse-before-hire logic to allocate()/allocate_by_merit()'s

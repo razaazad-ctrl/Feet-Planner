@@ -98,8 +98,13 @@ print("PASS: repair pass correctly recognises a move alone can't fix a day that'
 # ceiling (with enough monthly overtime allowance) to absorb A's short job
 # too -- the repair pass should move A's job onto B, leaving A completely
 # free (0h, legal) and B at a legal, if longer, day.
+# Job times chosen so the combined SPAN (not just summed duration) stays
+# legal under the 2026-08-10 duty-span correction: driver A's job ends
+# right when driver B's begins (08:00-11:00 then 11:00-20:00), so
+# consolidating gives a 12h span (08:00-20:00), exactly at the ceiling --
+# not the 14h a 2-hour gap between the two jobs would have produced.
 jobs7 = [
-    Job(row_number=1, sr="1", start_dt=dt(6), end_dt=dt(9), vehicle_type_required="Bus"),    # driver A's only job: 3h (short)
+    Job(row_number=1, sr="1", start_dt=dt(8), end_dt=dt(11), vehicle_type_required="Bus"),   # driver A's only job: 3h (short)
     Job(row_number=2, sr="2", start_dt=dt(11), end_dt=dt(20), vehicle_type_required="Bus"),  # driver B: 9h on its own (meets minimum)
 ]
 drivers7 = [

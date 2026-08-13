@@ -24,8 +24,8 @@ jobs = [early, middle, late]
 # or, in the reported real case, fails to find any driver at all and is
 # left unresolved.
 drivers = [
-    DriverProfile(id=1, name="D1", license_types=["Bus"], working_hours_per_day=9.0, max_working_hours_per_day=12.0),
-    DriverProfile(id=2, name="D2", license_types=["Bus"], working_hours_per_day=9.0, max_working_hours_per_day=12.0),
+    DriverProfile(id=1, name="D1", license_types=["Bus"], working_hours_per_day=9.0, max_working_hours_per_day=12.0, max_overtime_hours_per_month=60.0),
+    DriverProfile(id=2, name="D2", license_types=["Bus"], working_hours_per_day=9.0, max_working_hours_per_day=12.0, max_overtime_hours_per_month=60.0),
 ]
 vehicles = [VehicleProfile(id=1, plate="BUS-1", vehicle_type="Bus"),
             VehicleProfile(id=2, plate="BUS-2", vehicle_type="Bus")]

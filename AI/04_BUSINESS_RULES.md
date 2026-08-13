@@ -35,16 +35,37 @@ BUT:
 
 ## Driver Hours
 
-- A driver's normal day is `working_hours_per_day` (e.g. 9). This is now
-  also a hard MINIMUM: if a driver is used at all on a given day, they
-  must reach at least this many hours that day (added 2026-08-03, HR-005).
-  Enforced by a repair pass after normal allocation, since the engine
-  can't know a driver's full-day total until the day's last job is
-  considered -- see AI_CONTEXT.md Section 6.
+- **Measured against duty SPAN, not summed job duration (corrected
+  2026-08-10, Phase 21).** A driver's hard floor/ceiling is checked
+  against the time from their FIRST job's start to their LAST job's end
+  on a given day -- not the sum of their individual job durations. A
+  driver with three jobs totalling 8 summed hours but spread across a
+  10-hour window has a 10-hour day for hard-rule purposes, not an
+  8-hour one. Summed job duration ("hours worked") has NO hard rule of
+  its own at all -- it is used only for fairness/balance (spreading
+  workload evenly across drivers), never to decide whether an assignment
+  is legal. Confirmed directly by the project owner with a concrete
+  example (a driver with 2h+3h+3h=8h of summed work across a day should
+  never be blocked from that day being legal, nor forced to pick up more
+  work just to reach 9h of SUMMED duration). This resolves what had been
+  an explicitly open question in this project since 2026-08-03 (spec
+  OPT-001, "the duty-span question") -- see CHANGELOG_AI.md Phase 21 for
+  the full technical writeup across every allocation strategy.
+- A driver's normal day is `working_hours_per_day` (e.g. 9). This is
+  also a hard MINIMUM, measured by span as above: if a driver is used at
+  all on a given day, their span must reach at least this many hours
+  (added 2026-08-03, HR-005). Enforced by a repair pass after normal
+  allocation, since the engine can't know a driver's full-day span until
+  the day's last job is considered -- see AI_CONTEXT.md Section 6. This
+  minimum does NOT apply at all if any of the driver's jobs that day
+  belong to a "Same Driver" flagged group (see the exemption under "Same
+  Driver" column below) -- confirmed via a real driver in ground-truth
+  data who legitimately worked a 5-hour span because his whole day was
+  one flagged group.
 - A driver's daily ceiling is `max_working_hours_per_day` (e.g. 12),
   planner-set per driver -- on top of `working_hours_per_day`, regardless
   of how much monthly overtime allowance they have left. A driver cannot
-  be given, for example, a 22-hour day just because their monthly budget
+  be given, for example, a 22-hour SPAN just because their monthly budget
   has room for it. (This field replaces the old hardcoded
   `MAX_OVERTIME_HOURS_PER_DAY = 2.0` constant, which had no UI to change
   it -- fixed 2026-08-03, see HR-002/NEW-002 in the scheduling rules spec.)
@@ -52,6 +73,23 @@ BUT:
   overtime), not "unlimited."
 - A blank "Max overtime/month" is treated as 0 overtime allowed, same as
   an explicit 0 -- not as "unlimited."
+- **Monthly overtime is also measured against SPAN, not summed duration
+  (confirmed directly by the project owner, correcting an interim guess
+  made mid-fix that it should track summed "actual worked" hours instead
+  -- it does not).** `working_hours_per_day` is the total legal daily
+  hours; any SPAN beyond it on a given day is that day's overtime,
+  deducted from `max_overtime_hours_per_month` -- the exact same duty-span
+  concept as the daily ceiling above, not a separate one. See
+  CHANGELOG_AI.md Phase 21.
+- **Two new derived fields requested 2026-08-10, not yet built** (see
+  NEXT_SESSION.md Section 6 item 1 for the concrete implementation plan):
+  "Balance Overtime / month" (`max_overtime_hours_per_month` minus
+  overtime actually used so far this month) and "Balance hours / month"
+  (`total_hours_per_month_target` minus total span-hours logged so far
+  this month, reading zero for both if `total_hours_per_month_target` is
+  blank). Both intended to be calculated when a day is Finalized/saved
+  to history, not computed live, mirroring the existing
+  `finalized_jobs`-based pattern already used for overtime tracking.
 
 ---
 
