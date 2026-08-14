@@ -156,6 +156,12 @@ class VehicleMaintenanceDialog(QDialog):
                 background: #ffffff; color: #161616; selection-background-color: #eef4ff;
             }
             QCheckBox { color: #161616; spacing: 6px; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 2px solid #3f7ee8; border-radius: 3px; background: #ffffff;
+            }
+            QCheckBox::indicator:checked { background: #3f7ee8; }
+            QCheckBox::indicator:hover { border-color: #336dcc; }
             QPushButton {
                 background: #f3f5f8; color: #161616; border: 1px solid #d6dce4;
                 border-radius: 6px; padding: 6px 14px;
@@ -308,27 +314,101 @@ class VehicleMaintenanceDialog(QDialog):
         self.plate_display = section.findChild(QLabel, "plate_display")
         self.picture_label = section.findChild(QLabel, "picture_label")
 
+        # Phase 28u: RTA/Ad. Certificate Expiry both show a fixed-format
+        # short date ("13-Aug-2026", never long enough to need wrapping)
+        # but wordWrap was left on (true for every field value since
+        # Phase 28b's original _field_row() helper) -- when the column
+        # wasn't quite wide enough, Qt reserved 2 lines of height for
+        # these specifically, inflating that row and visually reading as
+        # a gap between the #/Expiry rows even though nothing else moved.
+        # Chassis/Engine/RTA#/Ad.Cert# are left wrapping (unchanged) --
+        # those can legitimately hold a long VIN/certificate number.
+        self.rta_cert_expiry_value.setWordWrap(False)
+        self.ad_cert_expiry_value.setWordWrap(False)
+
+        # Phase 28x: with the plate and picture both pulled out of this
+        # grid (below), column 0 became the row's only real content, and
+        # Qt gives leftover row width to whichever column(s) have stretch
+        # -- tested several stretch-factor combinations trying to keep
+        # these tight and none reliably worked (one attempt made things
+        # visibly worse). setMaximumWidth() is a hard constraint Qt
+        # always honors regardless of stretch, unlike stretch itself
+        # (a soft hint) -- used here instead, so these six labels stay
+        # sized to their actual content rather than ballooning into
+        # wherever the picture used to be, which is what the picture's
+        # new free-floating position (below) needs to be measured
+        # against reliably. Expiry dates are always a short fixed format
+        # ("13-Aug-2026") so get a tighter cap than the certificate/VIN
+        # number fields, which can vary more in length.
+        for value_label in (self.chassis_value, self.engine_value,
+                             self.rta_cert_value, self.ad_cert_value):
+            value_label.setMaximumWidth(200)
+        for value_label in (self.rta_cert_expiry_value, self.ad_cert_expiry_value):
+            value_label.setMaximumWidth(130)
+
+        # Phase 28r: plateBox is now a plain QLabel used as an image
+        # container (previously a QFrame styled with CSS border-image --
+        # that left the frame's own opaque palette background painted
+        # underneath the plate PNG's rounded outline, since the CSS never
+        # set background:transparent, producing what looked like two
+        # stacked plate-shaped rectangles). The pixmap itself is set here
+        # in Python, the same Path(__file__)-relative way every other
+        # image in this dialog already loads, rather than baked into the
+        # .ui file (a <pixmap> property there would depend on a Qt
+        # resource system this project doesn't use). plate_display is a
+        # genuine child widget of plateBox in the .ui file now (not a
+        # layout item, no spacer) -- children always paint on top of
+        # their parent in Qt, so the text is guaranteed to render over
+        # the image with nothing else behind it.
+        #
+        # Phase 28w: plateBox was pulled out of infoRow's grid entirely
+        # (it used to occupy column 1, between the left info column and
+        # the picture) and is now a free-floating child of `section`
+        # itself, positioned via its own explicit (x, y) rather than a
+        # grid cell. This was the actual fix for "push the plate left" --
+        # Phase 28u found there was only ~3px of genuine free space left
+        # in that column before shifting it further would compress
+        # column 0's real content, since the picture (column 2) was
+        # already overflowing this dialog's right edge. Taking the plate
+        # out of the grid removes it from that contest for space
+        # entirely -- it can now sit anywhere, including overlapping
+        # into the blank area to the right of the Model/Type text, with
+        # zero effect on Chassis/Engine/RTA/Ad Certificate or the
+        # picture's own layout-managed sizing. findChild() still finds
+        # it identically either way -- searching the widget tree doesn't
+        # care whether a widget is layout-managed or free-floating.
+        plate_box_label = section.findChild(QLabel, "plateBox")
+        if plate_box_label is not None:
+            plate_bg_path = _ASSETS / "plate_background.png"
+            if plate_bg_path.exists():
+                plate_box_label.setPixmap(
+                    QPixmap(str(plate_bg_path)).scaled(
+                        plate_box_label.width(), plate_box_label.height(),
+                        Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
+                    )
+                )
+
         # setColumnStretch() is a method call, not a Qt property -- it
         # isn't captured when Designer/QFormBuilder saves a .ui file, so
         # it has to be re-applied here after loading rather than living in
-        # the .ui file itself. Equal stretch (1, 1) on the two outer
-        # columns is a sane default for the plate's column to land near
-        # center. It is NOT pixel-perfect once the two sides' content
-        # differs in width -- a Phase 28o/28p attempt at forcing exact
-        # centering by matching column-2's minimum width to column 0's
-        # sizeHint worked with short sample text but broke down with
-        # realistic, longer field values (measured: column 0 alone wanted
-        # 870px, far more than a 1050px dialog has room to mirror on both
-        # sides). Given the project owner's whole point in converting this
-        # section to a .ui file is to adjust it visually themselves,
-        # fighting for exact programmatic centering here would work
-        # against that -- if the default position isn't exactly where
-        # they want it, that's now theirs to fine-tune in Designer
-        # (spacers, column widths, alignment) rather than something to
-        # keep re-engineering in Python.
+        # the .ui file itself.
+        #
+        # Phase 28x: both the plate (column 1) and the picture (column 2)
+        # were pulled out of this grid entirely and are now free-floating
+        # (see the plateBox/picture_label handling above) -- column 0
+        # (`left`, the Chassis/Engine/RTA/Ad Certificate stack) is the
+        # only column with real content left in it. With column 1 and 2
+        # now empty, Qt was handing column 0 ALL of the row's leftover
+        # width regardless of its own stretch factor -- confirmed by
+        # testing, setting column 0's stretch to 0 alone made no
+        # difference. Giving column 2 (now empty) an explicit stretch
+        # instead is what actually redirects that leftover space away
+        # from column 0 -- Qt distributes leftover width to whichever
+        # column(s) have stretch set, not preferentially to columns with
+        # real content in them.
         self._info_grid = section.findChild(QGridLayout, "infoRow")
         if self._info_grid is not None:
-            self._info_grid.setColumnStretch(0, 1)
+            self._info_grid.setColumnStretch(0, 0)
             self._info_grid.setColumnStretch(2, 1)
 
         return section

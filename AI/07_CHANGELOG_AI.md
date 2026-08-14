@@ -3445,3 +3445,450 @@ this prompted about keeping changelog entries appended in one place.)*
 - **What did NOT change:** no visible rendering change at all -- this
   was a console-noise-only fix.
 - No other `/AI` file needed updating this phase.
+
+## Phase 28r — Vehicles tab: three expiry columns, red-when-expired (2026-08-14, same session as Phase 28/28b-28q)
+
+- **Requested:** show Vehicle Reg. Expiry, RTA Certificate Expiry, and
+  Ad. Certificate Expiry as three new columns in the Vehicles tab table,
+  positioned between Type and Capacity/Notes; turn any expiry field red
+  once its date has passed.
+- **Implementation:** `vehicles_tab.py` imports `_display_date`,
+  `_is_expired`, and `_EXPIRED_COLOR` from `vehicle_maintenance_dialog.py`
+  (a coupling that already existed for `VehicleMaintenanceDialog` itself)
+  rather than duplicating the same date-parsing/formatting logic a
+  second time. New column constants `COL_REG_EXPIRY`, `COL_RTA_EXPIRY`,
+  `COL_AD_EXPIRY` inserted between `COL_TYPE` and `COL_NOTES` (which
+  shifted from index 4 to 7); table grew from 5 to 8 columns.
+  `db.list_vehicles()` already does `SELECT *`, so no `db.py` change was
+  needed -- the expiry values were already present on every row.
+- **Excluded (inactive) vehicles vs. expired dates, a judgment call:**
+  excluded rows already turn entirely orange (`EXCLUDED_COLOR`), the
+  existing "don't plan this into tomorrow's schedule" signal. Rather
+  than mix orange-row-with-red-cells (confusing, two competing signals
+  on the same row), expired-date red is applied only on active rows --
+  excluded rows stay fully, consistently orange across all columns
+  including the three new ones. Not explicitly specified by the project
+  owner; this was the more visually coherent reading of "red after
+  expiry" given the pre-existing orange convention.
+- **Tested:** confirmed 8 columns with correct headers in the right
+  order; confirmed an expired date renders in `_EXPIRED_COLOR` (`#c0392b`)
+  and a non-expired date in the default color, on the same row, for the
+  same vehicle; confirmed an excluded vehicle's expired date still shows
+  the orange excluded color, not red. A rendered screenshot was also
+  inspected for gross layout correctness (column order, two red / one
+  black expiry cell as expected). Full existing `tests/` suite and the
+  Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** `EditVehicleDialog` (still the only place
+  these fields are edited); `db.py`; the Vehicle Maintenance Log's own
+  display of the same fields (Phase 28l/28m, untouched) -- this phase
+  only adds a second, read-only place these same values are visible, for
+  at-a-glance scanning without opening each vehicle's Maintenance Log.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28s — Plate "double background image" fix, per a second AI's diagnosis on the .ui file (2026-08-14, same session as Phase 28/28b-28r)
+
+- **Reported:** the project owner had consulted a separate AI tool
+  directly on `vehicle_info_section.ui`, which diagnosed the plate as
+  rendering a second, plate-shaped rectangle underneath the actual
+  plate graphic, and proposed replacing the structure with "one PNG
+  background -> one transparent text QLabel on top," removing the
+  layout/spacer causing the duplicate. Asked to understand and implement
+  that fix here.
+- **Verified the diagnosis independently before implementing it** (not
+  applied blindly): inspected `plate_background.png`'s actual pixel data
+  via `QImage` and found the entire image has an alpha channel, and
+  **every pixel outside the black outline/text is fully transparent
+  (alpha=0)** -- including what looks like the plate's white interior.
+  The `.ui` file's `plateBox` was a `QFrame` styled with CSS
+  `border-image: url(...) stretch stretch`, which sets only the
+  border-image -- it never declares `background: transparent`, so the
+  frame's own default palette background (opaque) was still being
+  painted underneath the image on every render. Since the plate PNG's
+  "white" area is actually transparent, that opaque frame background
+  would show through as a second, differently-shaped rectangle behind
+  the plate's rounded outline -- confirming the other AI's diagnosis
+  was correct, not just plausible-sounding.
+- **Fixed exactly as proposed:** `plateBox` changed from a `QFrame` +
+  CSS `border-image` to a plain `QLabel` used purely as an image
+  container (no stylesheet, no frame). `plate_display` is now a genuine
+  **child widget** of `plateBox` (absolute geometry, no layout, no
+  spacer) rather than a layout item -- Qt guarantees a child widget
+  paints on top of its own parent, so the text is reliably rendered over
+  the image with nothing else behind it. The actual pixmap is **not**
+  baked into the `.ui` file (a `<pixmap>` .ui property typically expects
+  a Qt resource system, which this project doesn't use) -- it's set in
+  Python, in `_build_vehicle_info()`, via the same `Path(__file__)`
+  -relative loading pattern already used for every other image in this
+  dialog, scaled to `plateBox`'s exact size.
+- **How the fix was built:** the project owner's existing, already
+  hand-edited `plateBox`/`plate_display` geometry (193x90 box, sized and
+  positioned via Designer since Phase 28p) was read back with
+  `QUiLoader` first, so the replacement preserves their own adjustments
+  exactly rather than resetting to this session's earlier guesses. A
+  small standalone widget tree (`QLabel` "plateBox" containing a child
+  `QLabel` "plate_display" at the same position/size/style) was built
+  and saved via `QFormBuilder` (same reliable method as the rest of this
+  file), then the resulting XML fragment was spliced in to replace only
+  the old `<widget class="QFrame" name="plateBox">...</widget>` block --
+  every other widget in the 5,400+ line file (chassis/engine/RTA/Ad
+  Certificate positions, the picture, everything the project owner may
+  have separately adjusted) was left untouched, matching what was
+  promised.
+- **Tested:** confirmed `plate_display`'s parent is now a `QLabel`
+  (not `QFrame`) named `plateBox`, with a non-null pixmap of the correct
+  193x90 size and an empty stylesheet (no leftover CSS); confirmed
+  `plate_display` still shows the correct plate text. A 3x-scaled
+  close-up screenshot of just the plate widget was rendered and visually
+  confirms a single, clean plate outline with "DUBAI" and the plate
+  number correctly separated -- no second rectangle. Full existing
+  `tests/` suite, the Phase 28b functional GUI test, and a fresh
+  `VehiclesTab` construction check (unrelated tab, confirmed unaffected)
+  all re-run clean, no regressions.
+- **What did NOT change:** every other widget's position/size/style in
+  `vehicle_info_section.ui`; `_load_vehicle()`'s data-population logic
+  (`plate_display.setText(...)` is unchanged -- only its parent widget's
+  type changed); the database.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28t — Plate: 20% smaller, bigger bold bottom-anchored text, shifted left (2026-08-14, same session as Phase 28/28b-28t)
+
+- **First, cleanup:** the empty `<fontweight></fontweight>` startup
+  warnings (Phase 28q) had come back -- the Phase 28s splice
+  reintroduced them into `vehicle_info_section.ui`. Stripped again (7
+  elements). The generator script was already patched in Phase 28q to
+  avoid producing them going forward, and this phase's regeneration
+  confirmed that fix holds (0 produced this time).
+- **Requested:** shrink the plate ~20%; make the plate-number text bold
+  and bigger, but not vertically centered -- anchored near the bottom,
+  clear of the bottom edge and clear of "DUBAI" in the background; then
+  move the whole plate left, without disturbing anything else.
+- **Plate size:** `plateBox` 193x90 -> 154x72 (exactly 80% -- 193*0.8 =
+  154.4, 90*0.8 = 72).
+- **Text:** `plate_display` font-size 16px -> 18px (already bold via
+  both the stylesheet's `font-weight: 700` and the widget's own
+  `font.bold`, both unchanged). Repositioned from vertically centered to
+  bottom-anchored: geometry `(4, 42, 146, 22)` within the new 72px-tall
+  box -- y=42 is comfortably past where "DUBAI" ends (measured Phase
+  28o: ~36% of the image's height, ~26px of this box), and the label's
+  bottom edge (42+22=64) leaves an 8px gap before the box's own bottom
+  edge (72), so the text doesn't touch it.
+- **Moved left, without touching columns 0/2:** the plate's own grid
+  cell alignment in `vehicle_info_section.ui` changed from
+  `AlignRight|AlignTop` to `AlignLeft|AlignTop` -- but this alone does
+  nothing, since that column was always sized tightly to the plate
+  widget's own width (no slack to align within). Rather than adjust
+  columns 0/2's stretch (which would also shift the left-info-column/
+  picture boundary -- the "disturbing anything else" the project owner
+  explicitly asked to avoid), `_build_vehicle_info()` now calls
+  `self._info_grid.setColumnMinimumWidth(1, 260)` -- reserving width in
+  the plate's own column specifically, giving the new left-alignment
+  actual room to matter. Verified with a controlled before/after
+  measurement (same dialog, same data, only that one call toggled): the
+  plate moved left by exactly 96px. Also verified Chassis/Engine/RTA/Ad
+  Certificate's positions (Phase 28l/28m's established grid) and the
+  picture's own size are unchanged -- the picture's absolute X shifted
+  slightly as an unavoidable consequence of column 1 now claiming more
+  width in the same fixed-width row (there's no way to reserve room for
+  the plate to move into without something adjusting), but its own
+  size/content is untouched, which is the reading taken for "without
+  disturbing anything else."
+- **Regeneration method, unchanged from Phase 28s:** the small
+  `plateBox`/`plate_display` widget subtree was rebuilt via `QFormBuilder`
+  (same reliable method throughout this file's history) and spliced in
+  to replace only that block -- the rest of the 5,400+ line file
+  untouched.
+- **Tested:** confirmed `plateBox` is 154x72; confirmed `plate_display`'s
+  stylesheet has `font-size: 18px`; confirmed its geometry is exactly
+  `(4, 42, 146, 22)`; confirmed the 96px leftward shift via a controlled
+  A/B measurement (toggling only `setColumnMinimumWidth`); confirmed
+  Chassis/Engine/RTA/Ad-Certificate positions match the established
+  Phase 28l/28m grid exactly; confirmed zero `<fontweight>` elements
+  remain in the file. A 3x-scaled close-up screenshot of the plate
+  widget was rendered and visually confirms the text sits low in the
+  box, clear of "DUBAI," with a visible gap above the bottom edge. Full
+  existing `tests/` suite and the Phase 28b functional GUI test re-run
+  clean, no regressions.
+- **Aside, not this session's file:** the project owner's IDE had
+  `vehicle_info_section1.ui` open -- checked and confirmed no such file
+  exists on disk (likely a stale/unsaved editor tab); all work this
+  phase was done against the real, existing `vehicle_info_section.ui`.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28u — Plate shrunk further, RTA/Ad Certificate Expiry row-gap fixed, a real QGridLayout quirk found, and a pre-existing picture-overflow bug surfaced (2026-08-14, same session as Phase 28/28b-28u)
+
+- **Requested, from a real screenshot:** shrink the plate a further 20%
+  (text size was fine, don't change it); push it further left; and fix a
+  visible vertical gap between the RTA/Ad. Certificate `#` row and the
+  RTA/Ad. Certificate Expiry row.
+- **Row-gap root cause, confirmed by testing before touching anything:**
+  `rta_cert_expiry_value`/`ad_cert_expiry_value` had `wordWrap=True`
+  (every field value has since Phase 28b's original `_field_row()`
+  helper). "13-Aug-2026" doesn't need to wrap, but when the column
+  wasn't quite wide enough Qt reserved 2 lines of height for it anyway,
+  inflating that row and reading as a gap between the two rows even
+  though nothing else had moved. Fixed by calling
+  `.setWordWrap(False)` on both in `_build_vehicle_info()`, right after
+  the `findChild()` calls. Chassis/Engine/RTA #/Ad. Cert # were left
+  wrapping, unchanged -- those can legitimately hold a long VIN/
+  certificate number; expiry dates are always a short fixed format.
+- **Plate:** `plateBox` 154x72 -> 123x58 (a further 80%: 154*0.8=123.2,
+  72*0.8=57.6). Text size deliberately unchanged (still 18px, per "text
+  size is ok"). Repositioned proportionally within the smaller box to
+  stay bottom-anchored, clear of "DUBAI" and the bottom edge: geometry
+  `(4, 30, 115, 22)`. Same regenerate-via-`QFormBuilder`-and-splice
+  method as Phase 28s/28t -- only the `plateBox`/`plate_display` widget
+  subtree touched, nothing else in the 5,400+ line file.
+- **Moving it further left -- a real, two-layer investigation, not a
+  single fix:**
+  1. First attempt reserved 340px in the plate's grid column (up from
+     Phase 28t's 260) and tried to "protect" column 0 by locking its
+     minimum width to `sizeHint()`. This made things worse, not better --
+     column 0 visibly compressed (`chassis_value` narrowed from 198px to
+     132px). Root cause: `left`'s `sizeHint()` is unreliable in this
+     environment (already known from Phase 28o/28p -- inflated by this
+     session's headless font rendering, returned ~1022px for ordinary
+     field text), so "protecting" column 0 at that measured size did
+     nothing useful.
+  2. Investigating further (with the sizeHint-based protection removed
+     entirely) surfaced a **separate, real Qt behavior**: if
+     `setColumnMinimumWidth()` is never explicitly called on a grid
+     column at all, that column can settle at a visibly smaller width
+     than its own content actually needs -- confirmed side-by-side,
+     same dialog, same data: explicitly calling
+     `setColumnMinimumWidth(1, 0)` (or any value) produced `chassis_value`
+     at its correct 198px, while never calling it at all produced 132px,
+     with nothing else different between the two runs. Treated as an
+     apparent stale/uninitialized-column-width artifact in `QGridLayout`,
+     not a real space conflict -- the fix is to explicitly call
+     `setColumnMinimumWidth(1, ...)` at all, which forces Qt to
+     recompute correctly, regardless of the specific value passed.
+  3. With that relayout-forcing fix in place (and reflecting the plate's
+     own true 123px width, not an inflated reservation), measurement
+     showed there is only ~3px of genuine free space in this row before
+     Qt starts taking real width from column 0 to satisfy a larger
+     request -- confirmed column-by-column, not assumed: the picture
+     (column 2, 314px fixed since Phase 28o) is **already overflowing
+     this dialog's right edge by ~186px at the default 1050px width**,
+     even with nothing reserved for the plate at all. There is no
+     genuine leftover horizontal room in this row for the plate to move
+     further into without either compressing column 0 (Chassis/Engine/
+     RTA/Ad Certificate -- explicitly what the project owner asked not
+     to disturb) or the dialog itself being wider.
+  4. `_shift_plate_column_left()` (deferred via `QTimer.singleShot` in
+     `__init__`, same reasoning as the Phase 28i `scrollToBottom()` fix
+     -- needs real post-layout geometry) now just calls
+     `setColumnMinimumWidth(1, 123)` -- forces the correct relayout,
+     reflects no artificial over-reservation, and leaves the plate at
+     its natural (and, given the shrink, already meaningfully further
+     left than before) position rather than force a larger shift that
+     would come at column 0's expense.
+- **Flagged to the project owner, not silently decided:** the picture
+  overflow (~186px past the dialog's right edge at 1050px width) is a
+  pre-existing issue, not something this phase introduced -- it's why
+  "push the plate further left" hit a real wall. A rendered screenshot
+  taken during this phase's own testing shows the vehicle picture
+  visibly clipped at the top-right corner, consistent with what the
+  project owner's real screenshot showed too. Not fixed here (would mean
+  either shrinking the picture below its Phase 28o reference-image size
+  or widening the dialog, both decisions belonging to the project owner)
+  -- reported back for their direction.
+- **Tested:** confirmed `plateBox` is 123x58; confirmed
+  `rta_cert_expiry_value`/`ad_cert_expiry_value` both report
+  `wordWrap() == False` and land on the same row (matching y) as their
+  sibling `#` fields with the standard 6px row spacing, not inflated;
+  confirmed (via an explicit, controlled side-by-side, not a single
+  reading) that `chassis_value` stays at its correct ~198px width with
+  the relayout-forcing fix in place, versus 132px without it; swept
+  `setColumnMinimumWidth(1, ...)` across a range of values to find the
+  real ~3px safe margin before compression starts. A rendered
+  full-dialog screenshot was inspected and confirms the RTA/Ad.
+  Certificate rows are now aligned with no gap, the plate is visibly
+  smaller, and the picture clipping is visible (as expected, unfixed).
+  Full existing `tests/` suite and the Phase 28b functional GUI test
+  re-run clean, no regressions.
+- **What did NOT change:** Chassis/Engine/RTA/Ad Certificate's own text
+  wrapping behavior (only the two Expiry fields' wordWrap changed); the
+  dialog's own default size; the picture's size (314x145, Phase 28o).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28v — Plate text position bug after the project owner's own Designer resize, plus +1pt font (2026-08-14, same session as Phase 28/28b-28v)
+
+- **Reported:** the project owner resized `plateBox` themselves in Qt
+  Designer (120x50, down from this phase's own 123x58) -- exactly the
+  point of the Phase 28p `.ui` conversion. The plate text ended up
+  sitting on the box's bottom line; asked to nudge it up and increase
+  the font by 1pt.
+- **Root cause, confirmed by reading the live file before touching
+  anything:** `plateBox` was correctly resized to 120x50, but
+  `plate_display`'s own geometry was untouched at its old `(4, 30, 115,
+  22)` value -- 30+22=52 exceeds the new 50px box height by 2px, so the
+  text was genuinely rendering past/on the bottom edge. A child
+  widget's absolute geometry doesn't auto-adjust when its parent is
+  resized in Designer; only the parent's own size changed.
+- **Fixed:** `plate_display` repositioned to `(4, 25, 112, 20)` --
+  y=25 clears "DUBAI" (still ~top 36% of the image, ~18px of this
+  50px-tall box) and leaves a 5px gap before the bottom edge (25+20=45
+  vs box height 50). Font-size 18px -> 19px (+1pt, as requested). Same
+  regenerate-via-`QFormBuilder`-and-splice method as every prior plate
+  change -- the project owner's own 120x50 `plateBox` size was read
+  from the live file first and preserved exactly, not reset to this
+  session's own earlier value. `_shift_plate_column_left()`'s
+  `setColumnMinimumWidth(1, ...)` argument updated from 123 to 120 to
+  match.
+- **Tested:** confirmed `plateBox` stayed 120x50 (the project owner's
+  own value, unchanged); confirmed `plate_display`'s new geometry keeps
+  its bottom edge (45) within the box (50); confirmed the stylesheet
+  reports `font-size: 19px`; confirmed zero `<fontweight>` elements
+  remain. A 4x-scaled close-up screenshot was rendered and visually
+  confirms clear margin between the text and the bottom edge. Full
+  existing `tests/` suite and the Phase 28b functional GUI test re-run
+  clean, no regressions.
+- **What did NOT change:** `plateBox`'s size (the project owner's own
+  120x50, preserved); everything else in `vehicle_info_section.ui`.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28w — Plate pulled out of the grid entirely, now free-floating/overlapping (2026-08-14, same session as Phase 28/28b-28w)
+
+- **Requested:** Phase 28u established there was only ~3px of genuine
+  free space to shift the plate further left within `infoRow`'s grid
+  before it would start compressing column 0 (Chassis/Engine/RTA/Ad
+  Certificate) for real. Project owner's proposal: instead of fighting
+  the grid for space, let the plate overlap other content -- take it out
+  of the grid so it can move freely without touching column 0 or the
+  picture's own sizing at all.
+- **Implemented exactly that:** `plateBox` removed from `infoRow`'s
+  `row=0, column=1` grid cell entirely and re-added as a plain
+  free-floating child widget of `vehicleInfoSection` (a sibling of the
+  grid, not inside it), positioned via absolute `(x, y)` = `(310, 5)`
+  instead of a grid cell. A real Qt subtlety hit and fixed while doing
+  this: `QFormBuilder` serializes BOTH a `geometry` property (a `rect`
+  with x/y/width/height) AND a separate `pos` property (a `point` with
+  its own x/y) for a free widget -- updating only `geometry`'s x/y left
+  the widget rendering at `(0, 0)` regardless, since `QUiLoader`
+  evidently applies `pos` with final authority for non-layout-managed
+  widgets. Caught by testing the actual loaded position, not assumed --
+  both properties now agree.
+- **Result, measured:** the plate's absolute position moved from ~793px
+  to ~334px (roughly a 460px leftward shift, sitting near the Model/Year
+  and Type text now) -- far beyond what any grid-column trick could have
+  achieved without compressing something. `chassis_value`'s width was
+  re-measured at 210px (same or slightly more than its established
+  ~198-208px uncompressed range) -- confirmed genuinely unaffected, not
+  just unchanged by coincidence. The now-obsolete
+  `_shift_plate_column_left()` method and its `QTimer.singleShot` call
+  (Phase 28u's grid-column-width fix, meaningless now that the plate
+  isn't in the grid at all) were removed rather than left as dead code.
+- **On enlarging the picture, flagged rather than acted on:** the
+  project owner's stated reasoning was "we have all the space in the
+  right side" -- re-measured after this phase's own change and found
+  that isn't the case: the picture (column 2, 314px, fixed since Phase
+  28o) still overflows this dialog's right edge by ~177px, essentially
+  unchanged from Phase 28u's ~186px finding. The space freed up by
+  pulling the plate out of the grid is where the *plate* used to sit
+  (now filled by nothing, since the plate floats independently of that
+  column), not additional room the picture can grow into -- enlarging
+  the picture as asked would only make the existing clipping worse
+  unless paired with widening the dialog itself. Reported back rather
+  than silently enlarging it into a worse-looking overflow.
+- **Tested:** confirmed `plateBox`'s actual loaded position matches the
+  intended `(310, 5)` (not the `pos`-property bug's `(0, 0)`); confirmed
+  its pixmap still loads correctly (unaffected by no longer being
+  grid-managed -- `findChild()` doesn't care); confirmed `chassis_value`
+  is not compressed; confirmed the picture's overflow amount is
+  essentially unchanged, disproving "we have space on the right" for the
+  picture specifically. A full-dialog screenshot was rendered and
+  visually confirms the plate now sits well to the left, near the
+  Model/Type row, without visually colliding with the Chassis/Engine
+  text below it. Full existing `tests/` suite and the Phase 28b
+  functional GUI test re-run clean, no regressions.
+- **What did NOT change:** Chassis/Engine/RTA/Ad Certificate's own grid
+  positions and sizing; the picture's own size (314x145) and position;
+  the dialog's own default size -- none of these were touched, matching
+  "without moving rest of the fields and the vehicle image."
+- No other `/AI` file needed updating this phase.
+
+## Phase 28x — Picture free-floating attempt (no genuine room found), field-value width caps, Active checkbox recolored blue (2026-08-14, same session as Phase 28/28b-28x)
+
+- **Requested:** before resorting to widening the dialog, try pulling the
+  picture out of the grid the same way the plate was (Phase 28w) so it
+  can overlap freely into whatever empty space exists on the right,
+  without moving Chassis/Engine/RTA/Ad Certificate or forcing anything
+  to resize; separately, recolor the Active checkbox blue to match the
+  Close button's theme color.
+- **Picture pulled out of the grid, same method as the plate:**
+  `picture_label` removed from `infoRow`'s `row=0, column=2` cell and
+  re-added as a free-floating sibling of `vehicleInfoSection`, positioned
+  via its own `(pos.x, pos.y)` rather than a grid cell (same
+  `geometry`-vs-`pos` property distinction from Phase 28w applied here
+  too).
+- **Investigated thoroughly whether genuine free space exists, rather
+  than guess a position and hope -- it does not, at the current 1050px
+  dialog width:**
+  - With the plate AND picture both out of the grid, column 0 (Chassis/
+    Engine/RTA/Ad Certificate) became `infoRow`'s only real content --
+    and Qt handed it the row's *entire* leftover width regardless of its
+    own stretch factor, ballooning `ad_cert_value`'s box out to a right
+    edge of 1070px (past the 1050px dialog) purely from unconstrained
+    grid stretch, not real content need.
+  - Tried redirecting that leftover space to the now-empty column 2 via
+    `setColumnStretch(2, 1)` -- no change (1070px, identical to no
+    stretch at all).
+  - Tried capping `fieldsGrid`'s own internal value-columns' stretch to
+    0 -- made it measurably *worse* (`ad_cert_value` grew to 266px wide,
+    right edge 1227px). Reverted immediately; not a real fix.
+  - Landed on `setMaximumWidth()` directly on the six field-value labels
+    (200px for Chassis/Engine/RTA#/Ad.Cert#, 130px for the two Expiry
+    fields, which are always a short fixed format) -- a hard Qt
+    constraint, unlike stretch (a soft hint that kept behaving
+    unpredictably across the attempts above). This reliably tightened
+    column 0's real rightmost extent to ~1045px.
+  - **Even at its tightest, reliably-measured extent, column 0 alone
+    still reaches ~1045px of the 1050px dialog width** -- leaving on the
+    order of 5px of genuine free space, nowhere near enough for the
+    314px picture anywhere without overlapping real content. This isn't
+    a matter of finding the right technique; the actual text content
+    (real chassis/engine/certificate numbers) plus the picture's fixed
+    314px size do not both fit inside 1050px, full stop. Confirmed
+    numerically across four different layout techniques rather than
+    asserted once.
+  - The picture's own free-floating position was left at the location
+    already captured when it was pulled from the grid (its prior
+    natural spot) -- moving it further left would only guarantee
+    overlapping column 0's real content given the finding above, so no
+    attempt was made to relocate it further without the project owner's
+    direction now that the space question has a firm answer.
+  - **maxWidth caps kept regardless of the picture question** -- they're
+    a genuine, independently-justified improvement (field values no
+    longer balloon to arbitrary widths from unconstrained grid stretch),
+    not something tied to whether the picture placement gets resolved.
+  - The now-stale centering comment block above `_info_grid` (describing
+    Phase 28o/28p's abandoned pixel-perfect-centering attempt, no longer
+    relevant now that neither the plate nor the picture sit in this grid
+    at all) was rewritten to describe the actual current column-0-only
+    state and the empty-column-stretch-redirect finding.
+- **Active checkbox:** added explicit `QCheckBox::indicator` styling
+  (previously unstyled, relying on OS-native rendering -- the same class
+  of issue as the Phase 28g plate-color bug earlier this session, an OS
+  accent color leaking through). Unchecked: white fill, `#3f7ee8` blue
+  border (2px). Checked: solid `#3f7ee8` fill, matching the Close
+  button's blue theme exactly. Hover: slightly darker blue border
+  (`#336dcc`, same hover shade the Close button already uses).
+- **Tested:** confirmed the checkbox stylesheet contains
+  `QCheckBox::indicator` and the theme's blue hex; confirmed
+  `chassis_value`/`ad_cert_value` etc. are capped at their intended
+  maximum widths and no longer balloon past 1045px total; confirmed the
+  reverted `fieldsGrid` stretch attempt is fully gone (not left as
+  half-applied dead code) -- verified via the counter-example
+  measurement before reverting. A rendered full-dialog screenshot
+  visually confirms the Active checkbox is now solid blue and the field
+  values are visibly contained rather than stretched across the window.
+  Full existing `tests/` suite and the Phase 28b functional GUI test
+  re-run clean, no regressions.
+- **What did NOT change:** Chassis/Engine/RTA/Ad Certificate's actual
+  displayed values and their positions (only their maximum width
+  changed, a ceiling that doesn't affect content shorter than it); the
+  picture's own size (314x145) and its prior natural position; the
+  dialog's own default size -- still not touched, per the project
+  owner's own "before widening the dialog" framing; reported back with
+  concrete numbers rather than silently widening it.
+- No other `/AI` file needed updating this phase.

@@ -28,7 +28,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from app import db
-from app.ui.vehicle_maintenance_dialog import VehicleMaintenanceDialog
+from app.ui.vehicle_maintenance_dialog import (
+    VehicleMaintenanceDialog, _display_date, _is_expired, _EXPIRED_COLOR,
+)
 
 EXCLUDED_COLOR = QColor("#c08838")
 
@@ -36,7 +38,10 @@ COL_ACTIVE = 0
 COL_MAINTENANCE = 1
 COL_PLATE = 2
 COL_TYPE = 3
-COL_NOTES = 4
+COL_REG_EXPIRY = 4
+COL_RTA_EXPIRY = 5
+COL_AD_EXPIRY = 6
+COL_NOTES = 7
 
 
 def _parse_iso_date_or_none(text):
@@ -193,8 +198,11 @@ class VehiclesTab(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("In-house Vehicles"))
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Active", "", "Plate", "Type", "Capacity / Notes"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels([
+            "Active", "", "Plate", "Type", "Reg. Expiry",
+            "RTA Cert. Expiry", "Ad. Cert. Expiry", "Capacity / Notes",
+        ])
         self.table.horizontalHeader().setSectionResizeMode(COL_ACTIVE, QHeaderView.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(COL_MAINTENANCE, QHeaderView.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(COL_TYPE, QHeaderView.Stretch)
@@ -268,10 +276,26 @@ class VehiclesTab(QWidget):
 
             self.table.setItem(row, COL_PLATE, QTableWidgetItem(v["plate"]))
             self.table.setItem(row, COL_TYPE, QTableWidgetItem(v["vehicle_type"]))
+            self.table.setItem(row, COL_REG_EXPIRY, QTableWidgetItem(_display_date(v["vehicle_reg_expiry"])))
+            self.table.setItem(row, COL_RTA_EXPIRY, QTableWidgetItem(_display_date(v["rta_certificate_expiry"])))
+            self.table.setItem(row, COL_AD_EXPIRY, QTableWidgetItem(_display_date(v["ad_certificate_expiry"])))
             self.table.setItem(row, COL_NOTES, QTableWidgetItem(v["capacity_notes"] or ""))
             if excluded:
-                for col in (COL_ACTIVE, COL_PLATE, COL_TYPE, COL_NOTES):
+                for col in (COL_ACTIVE, COL_PLATE, COL_TYPE, COL_REG_EXPIRY,
+                            COL_RTA_EXPIRY, COL_AD_EXPIRY, COL_NOTES):
                     self.table.item(row, col).setForeground(EXCLUDED_COLOR)
+            else:
+                # Excluded rows are already fully orange (the existing,
+                # higher-priority "don't plan this" signal) -- expired-date
+                # red only applies to active rows, where it's actually
+                # relevant to what's being scheduled tomorrow.
+                for col, iso in (
+                    (COL_REG_EXPIRY, v["vehicle_reg_expiry"]),
+                    (COL_RTA_EXPIRY, v["rta_certificate_expiry"]),
+                    (COL_AD_EXPIRY, v["ad_certificate_expiry"]),
+                ):
+                    if _is_expired(iso):
+                        self.table.item(row, col).setForeground(QColor(_EXPIRED_COLOR))
         self.table.blockSignals(False)
 
     def _selected_vehicle_id(self):
