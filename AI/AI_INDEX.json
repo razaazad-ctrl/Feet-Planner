@@ -94,9 +94,22 @@
           "purpose": "raw total hours, not overtime-specific"
         },
         {
+          "name": "_driver_month_daily_span_hours",
+          "signature": "_driver_month_daily_span_hours(conn, driver_id, year, month)",
+          "added": "2026-08-14, Phase 23",
+          "purpose": "Private helper: returns a plain list of per-day duty-SPAN hours (MIN(start_dt) to MAX(end_dt) per plan_date) from finalized_jobs for this driver/month. Shared by get_driver_month_overtime_hours (subtracts a baseline from each) and get_driver_month_span_hours (sums directly) so the day-grouped span calculation only needs to be written/fixed in one place."
+        },
+        {
           "name": "get_driver_month_overtime_hours",
           "signature": "get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day)",
-          "purpose": "sums per-day EXCESS over baseline, grouped by day first -- this is the real overtime-cap check basis"
+          "purpose": "sums per-day EXCESS over baseline, grouped by day first -- this is the real overtime-cap check basis, feeding DriverProfile.month_overtime_so_far read by all four allocation strategies. Also reused directly by the Drivers tab's 'Balance overtime / month' field (Phase 24).",
+          "corrected_2026_08_14_phase_23": "each day's excess is now computed against duty SPAN (MIN(start_dt) to MAX(end_dt) for that day), not summed job duration -- matches the Phase 21 (2026-08-10) span principle already applied to every live allocation-time overtime check; this historical/finalized-history function had been missed by that fix. Since span >= summed duration always, the old version could only under-count historical overtime. Found while scoping the 'Balance Overtime / month' Drivers-tab field. Now implemented via the shared _driver_month_daily_span_hours helper."
+        },
+        {
+          "name": "get_driver_month_span_hours",
+          "signature": "get_driver_month_span_hours(conn, driver_id, year, month)",
+          "added": "2026-08-14, Phase 24",
+          "purpose": "Sums a driver's total duty SPAN across every finalized day in the given month -- a plain running total, NOT an excess-over-baseline figure (contrast with get_driver_month_overtime_hours). Basis for the Drivers tab's 'Balance hours / month' field: total_hours_per_month_target minus this value. Distinct from the pre-existing get_driver_month_to_date_hours, which sums summed job duration (the `hours` column) rather than span -- the two can legitimately disagree on a month with gap days, by design, not a bug."
         },
         {
           "name": "get_driver_rules",
@@ -550,9 +563,11 @@
         },
         {
           "name": "allocate_by_solver",
-          "signature": "allocate_by_solver(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES, time_limit_seconds=15.0)",
+          "signature": "allocate_by_solver(jobs, drivers, vehicles, supplier_offerings, allowed_driver_ids=None, allowed_supplier_ids=None, allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES, time_limit_seconds=15.0, solver_status_out=None)",
           "added": "2026-08-09, Phase 16",
-          "purpose": "Fourth allocation strategy: Google OR-Tools CP-SAT constraint solver instead of a heuristic. See experimental_allocation_strategies.allocate_by_solver for the full model description, real-data result, disclosed scope boundaries, and bugs found while building it. Requires ortools (lazy import, not a hard app-wide dependency). Not wired into the UI."
+          "wired_into_ui": "2026-08-14, Phase 22 -- plan_day_tab.py's Run Planning button now calls this directly (straight replacement, not a strategy picker -- see NEXT_SESSION.md Section 6, formerly item 2/3, now resolved). allocate(), allocate_by_merit(), and allocate_by_anchor() remain fully intact in allocation_engine.py per Rule 1/13 -- only the UI's default call site changed.",
+          "purpose": "Fourth allocation strategy: Google OR-Tools CP-SAT constraint solver instead of a heuristic. See experimental_allocation_strategies.allocate_by_solver for the full model description, real-data result, disclosed scope boundaries, and bugs found while building it. Requires ortools -- as of Phase 22 this is a hard, pinned dependency (requirements.txt: ortools==9.15.6755) since Run Planning depends on it in normal use; the import inside the function remains a lazy try/except so a missing install raises a clear ImportError (caught by plan_day_tab.py and shown as a QMessageBox) rather than crashing at app startup.",
+          "solver_status_out_param": "Optional dict, added Phase 22. If passed, this function sets solver_status_out['status'] to the CP-SAT status name ('OPTIMAL', 'FEASIBLE', or a no-solution status like 'INFEASIBLE'; 'N/A (no jobs to plan)' for the zero-units edge case) right after solver.Solve() runs. Purely additive -- omitting it preserves the original bare `jobs` return for any other caller. plan_day_tab.py uses this to show 'Solved optimally' vs 'Best plan found within the time limit -- may not be the true optimum' plainly in the UI after Run Planning (Rule 8, explainable decisions)."
         },
         {
           "name": "_day_span_hours",
@@ -801,7 +816,7 @@
         "license_types (comma-separated in UI)"
       ],
       "save_handler": "_on_save_hard_rules calls db.set_driver_hard_rules",
-      "displays": "month-to-date hours (db.get_driver_month_to_date_hours) as read-only info"
+      "displays": "month-to-date hours (db.get_driver_month_to_date_hours) as read-only info. As of 2026-08-14 (Phase 24), two new read-only labels: 'Balance overtime / month' (directly below Max overtime hours/month) and 'Balance hours / month' (directly below Total hours/month target), both recomputed in _load_form each time a driver is selected -- not cached/persisted, matching the existing month_hours_label pattern. Each reads '0.0 (no monthly overtime/target configured)' when its OWN source field (max_overtime_hours_per_month / total_hours_per_month_target respectively) is blank -- the two fields are gated independently, not coupled to each other. Text turns red (#c0392b) if the balance goes negative (driver already over budget this month)."
     },
     {
       "file": "app/ui/suppliers_tab.py",
@@ -970,7 +985,7 @@
             "name": "total_hours_per_month_target",
             "type": "REAL",
             "migration": true,
-            "status": "informational only, NOT enforced anywhere in code"
+            "status": "informational only, NOT enforced as a hard rule by any allocation strategy. As of 2026-08-14 (Phase 24) IS read for a display-only calculation -- the Drivers tab's 'Balance hours / month' field (this value minus db.get_driver_month_span_hours()) -- but that's presentation, not a scheduling constraint."
           },
           {
             "name": "license_types",
@@ -1272,7 +1287,7 @@
   ],
   "experimental_allocation_strategies": {
     "added": "2026-08-06 (Phase 15), substantially extended 2026-08-09 (Phase 16) -- see CHANGELOG_AI.md and NEXT_SESSION.md Section 5/6",
-    "status": "NOT wired into the UI. plan_day_tab.py calls only allocate(). Built alongside it for real-data comparison, per Rule 13 -- never assume any of the three newer strategies has replaced allocate() without checking main_window.py/plan_day_tab.py imports first. As of Phase 16 (2026-08-09), allocate_by_anchor() and the new allocate_by_solver() both independently reach 0 unresolved / 0 supplier / all 11 drivers used on the real UNPLANNED.xlsx -- allocate_by_solver()'s result is additionally a PROVEN-optimal status, not just a found solution.",
+    "status": "UPDATED 2026-08-14 (Phase 22): allocate_by_solver() IS now wired into the UI -- plan_day_tab.py's Run Planning button calls it directly, replacing allocate() as the UI's default. allocate_by_merit() and allocate_by_anchor() remain built alongside it, still NOT reachable from the UI, kept for comparison per Rule 13 -- never assume either has been wired in without checking plan_day_tab.py's imports first. Trigger for the switch: the project owner reported Run Planning giving 6 unresolved/2 supplier in the live UI while allocate_by_solver() reached 0/0 on the identical UNPLANNED.xlsx -- confirmed as a wiring gap, not a bug (allocate() was simply still the only strategy the UI ever called), then resolved via three explicit decisions with the project owner: straight replacement (not a strategy picker), ortools made a hard/pinned dependency, and OPTIMAL vs. FEASIBLE status shown plainly in the UI. See CHANGELOG_AI.md Phase 22.",
     "trigger": "The project owner raised two structural concerns after Phase 14: 'Same Driver' grouping felt like it was ruling the allocation rather than assisting it (though removing it entirely made a real day WORSE, 12 unresolved, confirming it's genuinely load-bearing), and driver selection was effectively alphabetical in places rather than merit-based.",
     "shared_infrastructure": {
       "PlanningUnit": "dataclass wrapping 1 or 2 Job objects (jobs, start_dt, end_dt, vehicle_type_required, same_driver_key, event_id). Both new strategies operate on units instead of raw jobs.",
@@ -1301,8 +1316,8 @@
         "A first, logically-correct pairwise together[unit_i,unit_j,driver] encoding for the Same-Driver group-cohesion soft preference measurably slowed the solver -- proven-optimal in well under a second cold, versus over 60 seconds (status FEASIBLE, not OPTIMAL) with this encoding added, because pairwise terms create a lot of symmetric, equally-good alternatives. Replaced with the leaner touches_group[group,driver] encoding (O(members) instead of O(members^2) per group).",
         "The solver's first version of the daily-floor constraint hadn't replicated the existing Same-Driver-group exemption _repair_minimum_daily_hours already has (a driver whose whole day is grouped work isn't forced to hit the floor). Confirmed as a real gap via the real ground-truth file's own VISWANADHAN (5.0h, well under his 9h floor, entirely inside one flagged group) -- fixed by making the floor constraint's enforcement conditional on used[driver] AND NOT has_grouped_unit[driver]."
       ],
-      "requires": "The 'ortools' package (added to requirements.txt), imported LAZILY inside the function so the rest of the app -- including the other three strategies -- works with zero impact if it isn't installed.",
-      "not_wired_into_ui": "plan_day_tab.py still calls only allocate(). See NEXT_SESSION.md Section 6 item 2 for the open sub-questions."
+      "requires": "The 'ortools' package. As of Phase 22 (2026-08-14) this is a hard, pinned dependency (requirements.txt: ortools==9.15.6755) since plan_day_tab.py's Run Planning button now calls this function directly. The import inside the function itself remains a lazy try/except (not moved to module level) so a missing install still raises a clear, catchable ImportError instead of crashing at app startup -- plan_day_tab.py catches it and shows a QMessageBox.",
+      "wired_into_ui": "2026-08-14, Phase 22 -- plan_day_tab.py's Run Planning button calls this directly (straight replacement of allocate()). See CHANGELOG_AI.md Phase 22 and NEXT_SESSION.md Section 6 (formerly item 2/3, now resolved)."
     }
   },
   "workflows": [
@@ -1311,7 +1326,7 @@
       "steps": [
         "1. Upload Excel file -> excel_import.load_jobs_from_excel -> list[Job] in memory",
         "2. (optional) type free-text day notes",
-        "3. Run Planning -> allocation_engine.allocate() mutates jobs -> results table rendered, filter dropdown populated",
+        "3. Run Planning -> allocation_engine.allocate_by_solver() mutates jobs (Phase 22, 2026-08-14 -- was allocate() before this) -> results table rendered, filter dropdown populated, and a plain-language solver status ('Solved optimally' vs 'Best plan found within the time limit -- may not be the true optimum') shown alongside the job-count summary",
         "4. (optional) AI Review -> travel-time lookups via maps_client + db.resolve_location -> ai_review.review_plan() -> suggestion cards with Accept/Reject",
         "5. (per suggestion) Accept/Reject -> db.log_decision (does NOT auto-update the table -- known gap)",
         "6. Finalize Day -> db.save_finalized_jobs (skips unresolved jobs, overwrites existing rows for that date)",
@@ -1429,7 +1444,7 @@
       "openpyxl==3.1.5",
       "anthropic==0.120.0",
       "requests",
-      "ortools (unpinned, added 2026-08-09, used only by the experimental allocate_by_solver() strategy)"
+      "ortools==9.15.6755 (pinned 2026-08-14, Phase 22 -- was unpinned/optional; now a hard requirement since plan_day_tab.py's Run Planning calls allocate_by_solver() directly)"
     ],
     "run_command": "python -m app.main",
     "packaging": "NOT YET DONE -- discussed as PyInstaller (--noconsole --onefile) for a future .exe, deliberately deferred during active development",
@@ -1440,7 +1455,7 @@
     "both_keys_optional_at_runtime": "app functions without either key -- Run Planning works with zero API keys; AI Review requires Anthropic key at minimum, Maps key is optional (falls back to no travel-time data with a warning)"
   },
   "known_limitations": [
-    "total_hours_per_month_target is stored/displayed but never enforced by any logic",
+    "total_hours_per_month_target is stored/displayed but never enforced as a hard scheduling rule by any allocation strategy (it IS read for the display-only 'Balance hours / month' calculation as of Phase 24, 2026-08-14 -- that's presentation, not enforcement).",
     "AI suggestion Accept does not automatically update the results table -- planner must manually edit",
     "No UI for the allowed_driver_ids/allowed_supplier_ids 'daily shortlist' feature, though the backend function signature supports it",
     "No PDF export -- Excel export only",
@@ -1458,9 +1473,9 @@
     "off_day_log and comp_days tables exist with zero CRUD or UI -- reserved schema, not working features",
     "Vehicle-type/license-type matching is exact-string only -- real-world wording inconsistencies (e.g. 'Seated' vs 'Seater') cause silent zero-match failures with no error surfaced to the user. The embedded-newline variant of this same failure class was found and fixed fleet-wide 2026-08-06, see above.",
     "entity_rules_widget.py is legacy code, likely no longer imported -- verify before modifying",
-    "allocate_by_solver() (new 2026-08-09) has zero dedicated synthetic tests, same as the other experimental strategies -- validated so far only via one real-data run (0 unresolved, 0 supplier, all 11 drivers used, proven OPTIMAL). See NEXT_SESSION.md Section 6 item 1.",
-    "None of the three newer allocation strategies (allocate_by_merit, allocate_by_anchor, allocate_by_solver) are wired into plan_day_tab.py -- the UI's 'Run Planning' button still calls only the original allocate(), even though allocate_by_solver() now reaches 0 unresolved / 0 supplier on real data with a proven-optimal status. This is an explicit, undecided choice, not an oversight -- see NEXT_SESSION.md Section 6 item 2.",
-    "The 'Balance Overtime / month' and 'Balance hours / month' fields requested 2026-08-10 are not yet built -- see NEXT_SESSION.md Section 6 item 1 for the concrete implementation plan."
+    "allocate_by_solver() (new 2026-08-09, wired into the UI 2026-08-14 Phase 22) still has zero dedicated synthetic tests -- validated so far via real-data runs (0 unresolved, 0 supplier, all 11 drivers used, proven OPTIMAL, re-confirmed after the Phase 21 span fix and again after Phase 22's wiring change) plus the full existing heuristic-engine test suite (which doesn't touch the solver's own CP-SAT model). This is now a HIGHER-priority gap than before, since the solver is the UI's default engine, not just an experimental one on the side. See NEXT_SESSION.md Section 6.",
+    "UPDATED 2026-08-14 (Phase 22): allocate_by_solver() IS now wired into plan_day_tab.py -- Run Planning calls it directly, replacing allocate(). allocate_by_merit() and allocate_by_anchor() remain unwired, kept for comparison. The wiring decision (straight replacement, ortools now a hard dependency, OPTIMAL/FEASIBLE shown plainly) was made explicitly with the project owner -- see CHANGELOG_AI.md Phase 22. Still open: validating the solver against a bigger real file that genuinely needs supplier use (NEXT_SESSION.md Section 6 item 0), now more urgent since this is live in the UI, not just a side experiment.",
+    "BUILT 2026-08-14 (Phase 24): 'Balance Overtime / month' and 'Balance hours / month' fields, requested 2026-08-10 -- see the drivers_tab.py module entry above and CHANGELOG_AI.md Phase 24. Built after two related pre-existing bugs (Phase 23) were fixed first: a live NameError in _fill_gaps_with_unresolved_jobs, and get_driver_month_overtime_hours (which Balance Overtime/month reuses) still being sum-based rather than span-based."
   ],
   "future_plans_discussed": [
     "Combined one-click 'Plan My Day' button merging Run Planning + AI Review, once the deterministic engine is proven reliable over more real-world use",

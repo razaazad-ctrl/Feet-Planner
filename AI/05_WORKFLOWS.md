@@ -57,10 +57,14 @@ If no assignment:
 
 When the planner clicks **Summary**:
 
-→ Read the current in-memory job results
+→ Read the current in-memory job results, plus the last Run Planning's
+  driver profiles (for each driver's `working_hours_per_day`, needed by
+  the Overtime column -- Phase 25)
 → Count total trips, assigned in-house drivers, in-house-assigned trips, suppliers used, supplier trips, and unresolved jobs
 → Group assigned jobs by driver and supplier from the result objects only
-→ Calculate each driver's duty span, trip count, and merged worked hours
+→ Calculate each driver's duty span, trip count, merged worked hours, and
+  overtime (`max(0, span - working_hours_per_day)`, "--" if that driver's
+  working hours aren't known here or for supplier rows)
 → Display modern metric cards for the primary totals (including `In-house trips`)
 → Display a structured table with an explicit `IN-HOUSE DRIVERS` group first
 → Display a `SUPPLIERS` group second when supplier records exist
@@ -70,4 +74,6 @@ When the planner clicks **Summary**:
 → Display Total trips and Unresolved trips in the footer without repeating the
   other header-card totals
 
-No database read, API call, allocation rerun, or workbook modification occurs.
+No new database read, API call, allocation rerun, or workbook modification
+occurs -- the driver profiles used for the Overtime column were already
+fetched from the database once, at Run Planning time, not re-queried here.

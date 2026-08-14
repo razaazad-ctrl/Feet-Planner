@@ -24,7 +24,7 @@ from pathlib import Path
 from app import db
 from app.excel_import import load_jobs_from_excel, group_jobs_by_event
 from app.allocation_engine import (
-    allocate, build_driver_profiles, build_vehicle_profiles, build_supplier_offerings
+    allocate_by_solver, build_driver_profiles, build_vehicle_profiles, build_supplier_offerings
 )
 from app import maps_client
 from app import ai_review
@@ -154,7 +154,18 @@ class PlanDayTab(QWidget):
             )
             return
 
-        allocate(self.jobs, drivers, vehicles, supplier_offerings)
+        solver_status = {}
+        try:
+            allocate_by_solver(self.jobs, drivers, vehicles, supplier_offerings, solver_status_out=solver_status)
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Planning engine not installed",
+                "Run Planning needs the 'ortools' package, which isn't installed on this "
+                "computer.\n\nAsk whoever set up this app to run:\n\n    pip install ortools\n\n"
+                "then try Run Planning again.\n\n" + str(e)
+            )
+            return
+
         self.last_drivers = drivers
         self._render_results()
         self.ai_review_btn.setEnabled(True)
@@ -165,10 +176,22 @@ class PlanDayTab(QWidget):
         unresolved_count = sum(1 for j in self.jobs if j.unresolved)
         in_house_count = sum(1 for j in self.jobs if j.assigned_driver_id is not None)
         supplier_count = sum(1 for j in self.jobs if j.assigned_supplier_unit is not None)
+
+        # Surface OPTIMAL vs. FEASIBLE plainly (Rule 8, explainable decisions):
+        # OPTIMAL means a mathematical guarantee no better in-house plan exists
+        # under the hard rules; FEASIBLE means the 15-second time limit was hit
+        # and this is only the best plan found so far, not a proven best one.
+        status_word = solver_status.get("status", "")
+        status_text = {
+            "OPTIMAL": "Solved optimally (proven best plan).",
+            "FEASIBLE": "Best plan found within the time limit — may not be the true optimum.",
+        }.get(status_word, status_word)
+
         self.summary_label.setText(
             f"{len(self.jobs)} jobs total  |  {in_house_count} in-house  |  "
-            f"{supplier_count} supplier  |  {unresolved_count} unresolved"
+            f"{supplier_count} supplier  |  {unresolved_count} unresolved  |  {status_text}"
         )
+        self.summary_label.setStyleSheet("color: #a08030;" if status_word == "FEASIBLE" else "")
         if self.notes_input.toPlainText().strip():
             note_preview = self.notes_input.toPlainText().strip()
             self.summary_label.setText(
@@ -297,7 +320,7 @@ class PlanDayTab(QWidget):
     def _on_summary(self):
         if not self.jobs:
             return
-        dialog = DriverSupplierSummaryDialog(self.jobs, self)
+        dialog = DriverSupplierSummaryDialog(self.jobs, self.last_drivers, self)
         dialog.exec()
 
     def _on_export(self):
@@ -462,8 +485,20 @@ def _summary_supplier_name(job):
     return re.sub(r"\s+\d+$", "", label).strip() or label
 
 
-def build_summary(jobs):
-    """Build the popup report entirely from current in-memory Job results."""
+def build_summary(jobs, working_hours_by_driver_id=None):
+    """Build the popup report entirely from current in-memory Job results.
+
+    working_hours_by_driver_id: optional {driver_id: working_hours_per_day}
+    lookup, taken from the last Run Planning's driver profiles
+    (PlanDayTab.last_drivers), used only to compute each driver's overtime
+    for THIS day: shift span minus working_hours_per_day, floored at zero
+    -- the same span-based method the database's monthly overtime figure
+    uses (db.get_driver_month_overtime_hours, corrected Phase 23). This
+    does NOT query the database -- last_drivers is already in memory from
+    Run Planning, preserving this dialog's existing design principle that
+    it never reads SQLite/master-data tables directly (see ARCHITECTURE.md
+    Section 3.1)."""
+    working_hours_by_driver_id = working_hours_by_driver_id or {}
     from collections import OrderedDict
     assigned_jobs = [j for j in jobs if not j.unresolved]
     driver_groups = OrderedDict()
@@ -483,13 +518,23 @@ def build_summary(jobs):
             )["jobs"].append(job)
 
     drivers = []
-    for entry in driver_groups.values():
+    for driver_id, entry in driver_groups.items():
         driver_jobs = entry["jobs"]
         span, span_hours = _summary_span(driver_jobs)
+        working_hours_per_day = working_hours_by_driver_id.get(driver_id)
+        # None (not just 0) when the driver's working_hours_per_day isn't
+        # known here -- e.g. Run Planning hasn't been run this session, or
+        # the driver was removed from the roster after planning -- shown
+        # as "--" rather than a misleading 0.0.
+        overtime_hours = (
+            max(0.0, span_hours - working_hours_per_day)
+            if working_hours_per_day is not None else None
+        )
         drivers.append({
             "name": entry["name"],
             "span": span,
             "span_hours": span_hours,
+            "overtime_hours": overtime_hours,
             "trips": len(driver_jobs),
             "worked_hours": _summary_merged_hours(driver_jobs),
         })
@@ -509,6 +554,7 @@ def build_summary(jobs):
             "name": entry["name"],
             "span": span,
             "span_hours": span_hours,
+            "overtime_hours": None,  # overtime is a driver hard-rule concept (working_hours_per_day) -- not applicable to suppliers
             "trips": len(supplier_jobs),
             "worked_hours": supplier_hours,
         })
@@ -529,13 +575,21 @@ def build_summary(jobs):
 class DriverSupplierSummaryDialog(QDialog):
     """Read-only summary calculated exclusively from the current in-memory results."""
 
-    def __init__(self, jobs, parent=None):
+    def __init__(self, jobs, drivers=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Driver & Supplier Summary")
-        # Compact width, taller viewport so a normal day with up to 15 in-house
-        # drivers can be viewed without immediately scrolling.
-        self.resize(980, 900)
-        self.setMinimumSize(900, 820)
+        # Frameless: the window already has its own in-content "x" close
+        # button below, so the native OS title bar (with its own close/
+        # minimize controls) is redundant -- removing it also frees up
+        # vertical space, which matters now that the dialog is shorter.
+        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
+        # Reduced from 900 -- the previous height could get its bottom
+        # rows (including the Close button) clipped under the taskbar on
+        # smaller/laptop screens. The table scrolls internally, so a
+        # shorter dialog just means fewer rows visible before scrolling,
+        # not lost content.
+        self.resize(980, 720)
+        self.setMinimumSize(900, 620)
         self.setModal(True)
         self.setStyleSheet("""
             QDialog { background: #ffffff; color: #161616; }
@@ -584,7 +638,8 @@ class DriverSupplierSummaryDialog(QDialog):
             QPushButton#closeButton:hover { background: #336dcc; }
         """)
 
-        data = build_summary(jobs)
+        working_hours_by_driver_id = {d.id: d.working_hours_per_day for d in (drivers or [])}
+        data = build_summary(jobs, working_hours_by_driver_id)
         root = QVBoxLayout(self)
         root.setContentsMargins(26, 20, 26, 20)
         root.setSpacing(12)
@@ -667,10 +722,10 @@ class DriverSupplierSummaryDialog(QDialog):
         # the table itself explicitly separates in-house resources and suppliers.
         self.summary_table = QTableWidget()
         table = self.summary_table
-        table.setColumnCount(7)
+        table.setColumnCount(8)
         table.setHorizontalHeaderLabels([
             "#", "Driver / Supplier", "Shift Start", "Shift End",
-            "Shift Span", "Trips", "Total Hours",
+            "Shift Span", "Overtime", "Trips", "Total Hours",
         ])
         table.setAlternatingRowColors(True)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -678,7 +733,7 @@ class DriverSupplierSummaryDialog(QDialog):
         table.setFocusPolicy(Qt.NoFocus)
         table.verticalHeader().setVisible(False)
         table.setShowGrid(True)
-        table.setMinimumHeight(540)
+        table.setMinimumHeight(380)
         table.verticalHeader().setDefaultSectionSize(32)
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -688,12 +743,14 @@ class DriverSupplierSummaryDialog(QDialog):
         header.setSectionResizeMode(4, QHeaderView.Fixed)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setSectionResizeMode(7, QHeaderView.Fixed)
         header.resizeSection(0, 45)
         header.resizeSection(2, 112)
         header.resizeSection(3, 112)
         header.resizeSection(4, 105)
-        header.resizeSection(5, 58)
-        header.resizeSection(6, 92)
+        header.resizeSection(5, 85)
+        header.resizeSection(6, 58)
+        header.resizeSection(7, 92)
         root.addWidget(table, 1)
 
         self._summary_data = data
@@ -814,7 +871,7 @@ class DriverSupplierSummaryDialog(QDialog):
             empty = QTableWidgetItem("No assigned records in the current results.")
             empty.setTextAlignment(Qt.AlignCenter)
             table.setItem(0, 0, empty)
-            table.setSpan(0, 0, 1, 7)
+            table.setSpan(0, 0, 1, 8)
             return
 
         display_index = 0
@@ -830,7 +887,7 @@ class DriverSupplierSummaryDialog(QDialog):
                 group_item.setForeground(QColor("#3f7ee8"))
                 group_item.setBackground(QColor("#eef4ff"))
                 table.setItem(group_row, 0, group_item)
-                table.setSpan(group_row, 0, 1, 7)
+                table.setSpan(group_row, 0, 1, 8)
             elif kind == "supplier" and not supplier_group_inserted:
                 supplier_group_inserted = True
                 table.insertRow(table.rowCount())
@@ -840,7 +897,7 @@ class DriverSupplierSummaryDialog(QDialog):
                 group_item.setForeground(QColor("#7b4bc4"))
                 group_item.setBackground(QColor("#f7f0ff"))
                 table.setItem(group_row, 0, group_item)
-                table.setSpan(group_row, 0, 1, 7)
+                table.setSpan(group_row, 0, 1, 8)
 
             table.insertRow(table.rowCount())
             row = table.rowCount() - 1
@@ -850,21 +907,29 @@ class DriverSupplierSummaryDialog(QDialog):
                 span_start, span_end = span.split(" – ", 1)
             else:
                 span_start = span_end = "--"
+            overtime_hours = record.get("overtime_hours")
+            overtime_text = "--" if overtime_hours is None else _summary_hours_text(overtime_hours)
             values = [
                 f"{display_index:02d}",
                 record["name"],
                 span_start,
                 span_end,
                 _summary_hours_text(record["span_hours"]),
+                overtime_text,
                 str(record["trips"]),
                 _summary_hours_text(record["worked_hours"]),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if col in (0, 2, 3, 4, 5, 6):
+                if col in (0, 2, 3, 4, 5, 6, 7):
                     item.setTextAlignment(Qt.AlignCenter)
                 else:
                     item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                if col == 5 and overtime_hours is not None and overtime_hours > 0:
+                    # Flag today's overtime the same way the Drivers tab
+                    # flags an over-budget monthly balance -- explainable,
+                    # not hidden (Rule 8).
+                    item.setForeground(QColor("#c0392b"))
                 if kind == "supplier":
                     item.setBackground(QColor("#fcfaff"))
                 table.setItem(row, col, item)

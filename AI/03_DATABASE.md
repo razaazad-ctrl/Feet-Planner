@@ -45,7 +45,7 @@ scheduling/qualification rules.
 | `off_days` | TEXT, migration | Comma-separated lowercase weekday names, e.g. `"friday"` or `"friday,saturday"`. Hard rule — driver is skipped for jobs on these weekdays unless explicitly overridden per-date (`allow_override_days` param to `allocate()`, currently only usable programmatically — no UI for it yet). |
 | `max_overtime_hours_per_month` | REAL, migration | `NULL`/blank = **no overtime allowed** (working_hours_per_day becomes a strict daily ceiling) -- fixed some time ago from an earlier "unlimited" default; see AI_CONTEXT.md Section 9 item 9. Positive number = monthly overtime budget, checked against `finalized_jobs` history. |
 | `max_working_hours_per_day` | REAL, migration | **New 2026-08-03 (HR-002 rework).** The hard daily ceiling (including overtime), e.g. `12` paired with `working_hours_per_day=9`. Replaces the old hardcoded `MAX_OVERTIME_HOURS_PER_DAY = 2.0` module constant in `allocation_engine.py`, which had no UI field at all. `NULL`/blank falls back to `working_hours_per_day` (zero daily overtime allowed) -- fail-closed, same precedent as a blank `max_overtime_hours_per_month`, chosen deliberately over silently reopening the old unlimited-single-day bug. |
-| `total_hours_per_month_target` | REAL, migration | Informational only, mainly for temp drivers. **Not currently enforced anywhere in `allocate()`** — stored and displayed, no logic reads it yet. |
+| `total_hours_per_month_target` | REAL, migration | Informational only, mainly for temp drivers. **Not enforced as a hard rule anywhere in `allocate()`/`allocate_by_*()`** — no allocation decision reads it. As of 2026-08-14 (Phase 24) it IS read for a display-only calculation: the Drivers tab's "Balance hours / month" field (`total_hours_per_month_target` minus `db.get_driver_month_span_hours()`). Still purely informational for scheduling purposes — nothing about this changes allocation behavior. |
 | `license_types` | TEXT, migration | Comma-separated vehicle-type strings, EXACT text match required against `vehicles.vehicle_type` and `Job.vehicle_type_required`. This is the single most failure-prone field in the whole system — see AI_CONTEXT.md Section 6/9 re: exact-string matching and the "Seated" vs "Seater" real-world bug. |
 
 ### `driver_rules`
@@ -260,18 +260,59 @@ entity is deleted, by design (the loose coupling above).
 
 ## Important queries worth knowing
 
-**Month-to-date overtime for a driver** (the actual hard-cap check basis):
+**Month-to-date overtime for a driver** (the actual hard-cap check basis,
+consumed by every one of the four allocation strategies' hard-rule
+checks — see `allocation_engine.py`'s `DriverProfile.month_overtime_so_far`):
 ```sql
 -- db.get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day)
-SELECT plan_date, SUM(hours) AS day_total FROM finalized_jobs
+SELECT plan_date, MIN(start_dt) AS day_start, MAX(end_dt) AS day_end FROM finalized_jobs
 WHERE driver_id = ? AND plan_date LIKE ?   -- e.g. '2026-03%'
 GROUP BY plan_date
--- then in Python: sum(max(0, day_total - working_hours_per_day) for each day)
+-- then in Python: sum(max(0, span_hours - working_hours_per_day) for each day,
+-- where span_hours = (day_end - day_start) in hours)
 ```
-This groups by day *first*, then sums only the excess over baseline per
-day — a driver who works exactly their normal hours every day shows zero
-overtime even with a large month-to-date total. This is a deliberate
-design distinct from a naive "total hours" sum.
+This groups by day *first*, then sums only the excess **duty SPAN** (not
+summed job duration) over baseline per day — a driver who works exactly
+their normal hours every day shows zero overtime even with a large
+month-to-date total.
+
+**CORRECTED 2026-08-14 (Phase 23).** This function originally summed each
+day's `hours` column (`SUM(hours) AS day_total`, i.e. summed job
+duration) instead of computing that day's true span. Phase 21
+(2026-08-10) established that every daily/monthly overtime check in this
+engine must use duty SPAN (earliest job start to latest job end that
+day), not summed duration — but that fix only touched the live,
+in-memory checks in `allocation_engine.py`; this function, which supplies
+the *historical* `month_overtime_so_far` baseline those same checks read,
+was missed. Since span ≥ summed duration always (equal only when a
+driver's jobs that day are perfectly back-to-back with no gap), the old
+version could only ever under-count historical overtime — found and
+fixed while scoping the "Balance Overtime / month" Drivers-tab field,
+which reuses this function directly.
+
+**Shared helper (Phase 23):** both this function and
+`get_driver_month_span_hours` below now go through a private
+`db._driver_month_daily_span_hours(conn, driver_id, year, month)` helper
+that returns a plain list of per-day span hours (the `SELECT ...
+GROUP BY plan_date` query above, parsed into hours) — added so the
+day-grouped span calculation itself only has to be written, and fixed,
+once.
+
+**Month-to-date total SPAN hours for a driver, new 2026-08-14 (Phase 24)**
+— the basis for the Drivers tab's "Balance hours / month" field:
+```sql
+-- db.get_driver_month_span_hours(conn, driver_id, year, month)
+-- same underlying query as get_driver_month_overtime_hours above, via
+-- _driver_month_daily_span_hours, but summed directly with no baseline
+-- subtracted -- a plain running total, not an excess-over-baseline figure.
+```
+Unlike `get_driver_month_to_date_hours` (which sums the `hours` column
+directly, i.e. summed job duration across the month, ungrouped by day),
+this sums each day's true SPAN first, matching the Phase 21 principle.
+These two "total hours this month" figures can legitimately disagree on a
+month with any gap days — this is expected, not a bug in either one; they
+answer different questions (raw summed job duration vs. duty-span
+total).
 
 **Cross-day supplier fairness tiebreak:**
 ```sql

@@ -508,38 +508,40 @@ Section 3 below).
   Phase 21 for the full technical writeup, including which existing
   tests needed fixture updates (not weakening) to reflect the corrected
   rule.
-- **NEW, real, explicitly deferred: "Balance Overtime / month" and
-  "Balance hours / month" fields, requested 2026-08-10.** The project
-  owner wants two new derived numbers displayed on the Drivers tab:
+- ~~"Balance Overtime / month" and "Balance hours / month" fields,
+  requested 2026-08-10~~ **BUILT 2026-08-14, Phase 24.** Two new
+  read-only labels on the Drivers tab:
   - **Balance Overtime / month** = `max_overtime_hours_per_month` minus
-    however much span-based overtime the driver has actually used this
-    month so far (the same figure `db.get_driver_month_overtime_hours`
-    already computes for the monthly-cap check -- just not currently
-    displayed anywhere). Shown next to the existing "Max overtime
-    hours/month" field.
+    `db.get_driver_month_overtime_hours()`. Shown directly below "Max
+    overtime hours/month". Reads "0.0 (no monthly overtime configured)"
+    only when `max_overtime_hours_per_month` itself is blank.
   - **Balance hours / month** = `total_hours_per_month_target` minus the
-    total SPAN hours logged so far this month (a NEW monthly
-    accumulation this project doesn't currently track anywhere --
-    `total_hours_per_month_target` is presently informational-only, see
-    Section 5 above). Shown next to the existing "Total hours/month
-    target" field. If `total_hours_per_month_target` is blank, both
-    balance fields should read as zero, per the project owner's
-    instruction.
-  - **Both should be calculated when a day is Finalized/saved to
-    history, not computed live** -- mirroring the existing
-    `finalized_jobs`-based pattern `db.get_driver_month_overtime_hours`
-    already uses, not a new on-the-fly calculation. This means the
-    natural place to compute and persist "hours logged this month" is
-    likely a small addition alongside (or inside) `db.save_finalized_jobs`
-    or a sibling read function, following the same day-grouped,
-    finalized-history-driven approach already established for overtime.
-  - Explicitly NOT started this session -- the project owner offered
-    the choice to do it now or defer, and given it's genuinely separate
-    scope (new DB read logic + new Drivers tab UI fields, not an
-    allocation-engine change), it was deferred. This is now the
-    **top UI/DB priority** for the next session that picks up Drivers
-    tab or monthly-tracking work -- see item 0 below, now updated to
-    reflect this alongside the still-open bigger-file validation.
+    new `db.get_driver_month_span_hours()` (a genuinely new monthly
+    accumulation -- nothing tracked this before). Shown directly below
+    "Total hours/month target". Reads "0.0 (no monthly target
+    configured)" only when `total_hours_per_month_target` itself is
+    blank.
+  - **Resolved ambiguity:** an earlier draft of this note said "if
+    `total_hours_per_month_target` is blank, BOTH balance fields should
+    read zero" -- confirmed with the project owner that this was meant
+    per-field, not coupled: each balance reads zero only when its OWN
+    source field is blank, independently. A literal "both" reading would
+    have made Balance Overtime/month always show 0 for any driver without
+    a monthly target configured (the common case -- that field is mainly
+    for temp drivers), defeating its purpose for everyone else.
+  - **Recomputed live each time a driver is selected**, not
+    cached/persisted -- same pattern the existing "hours logged this
+    month" label already used. The underlying numbers only change when a
+    day is actually Finalized (since both source from `finalized_jobs`),
+    but there's no new caching table/column.
+  - Built only after fixing two pre-existing, unrelated bugs found while
+    scoping this work (Phase 23, same session): a live `NameError` in
+    `_fill_gaps_with_unresolved_jobs` (a leftover duplicate line from
+    Phase 21's own revert), and `get_driver_month_overtime_hours` itself
+    -- which Balance Overtime/month reuses directly -- still measuring
+    summed job duration per day instead of duty SPAN, contradicting
+    Phase 21's own corrected principle. See `CHANGELOG_AI.md` Phases
+    23-24 for the full writeup.
 
 ## 6. Recommended next improvements, roughly in priority order
 
@@ -559,8 +561,11 @@ real, already-disclosed gaps -- not about which algorithmic direction to
 pursue.
 
 0. **Validate `allocate_by_solver()` against a bigger, real file that
-   includes genuine supplier need (in progress as of the end of this
-   session).** Everything validated so far is the one `UNPLANNED.xlsx`
+   includes genuine supplier need.** Now HIGHER priority than before
+   Phase 22 -- this strategy is the UI's production default as of
+   2026-08-14, not a side experiment, so any gap here is now a live-app
+   risk, not just an open research question. Everything validated so far
+   is the one `UNPLANNED.xlsx`
    file the project owner deliberately built WITHOUT needing any
    supplier, specifically to prove the in-house engine could handle it
    alone first. The project owner's own words: "if this get[s] to 0
@@ -574,22 +579,9 @@ pursue.
    a larger scale (the current file is 44 jobs / 11 drivers, solving in
    a few seconds; a bigger file's actual size and solve time are both
    unknowns until tested).
-1. **Build "Balance Overtime / month" and "Balance hours / month"**
-   (requested 2026-08-10, explicitly deferred to this list -- see
-   Section 5's entry above for the exact field definitions and the
-   project owner's stated preference for computing these at Finalize-Day
-   time, not live). Concrete first steps: (a) a new `db` function
-   alongside `get_driver_month_overtime_hours` that sums SPAN hours (not
-   summed job duration -- consistent with Phase 21) per finalized day,
-   grouped by driver and month; (b) two new read-only fields on the
-   Drivers tab, positioned next to "Max overtime hours/month" and "Total
-   hours/month target" respectively; (c) confirm with the project owner
-   whether "hours logged this month" for the Balance-hours field should
-   also be span-based (matching the overtime field's logic) before
-   building it, since Phase 21 was specifically about the DAILY
-   floor/ceiling and monthly overtime, and this is a related but
-   distinct monthly figure that wasn't explicitly covered by that
-   correction.
+1. ~~Build "Balance Overtime / month" and "Balance hours / month"~~
+   **RESOLVED 2026-08-14, Phase 24.** See Section 5's entry above for the
+   full detail. Both fields are now live on the Drivers tab.
 2. **Write dedicated synthetic tests for ALL of Phase 15/16/21's new
    code before considering any of it production-ready.** Still
    completely unaddressed: `allocate_by_merit`, `allocate_by_anchor`,
@@ -604,23 +596,40 @@ pursue.
    hand-built scenarios checking one constraint at a time (see Section
    5's note on this) will likely be more useful than trying to mirror
    the existing `tests/*.py` pattern exactly.
-3. **Decide whether/when to wire `allocate_by_solver()` (or
-   `allocate_by_anchor`, as a fallback if `ortools` isn't available in
-   some environment) into `plan_day_tab.py`'s "Run Planning" button.**
-   Currently NONE of the four strategies except the original `allocate()`
-   are reachable from the UI at all -- this is still true after Phase 21.
-   Now that one of them has real, validated, proven-optimal results,
-   this is a much more concrete decision than it was before, but it's
-   still the project owner's call, not something to do unilaterally
-   (Rule 1/16). Related sub-questions worth raising explicitly when this
-   conversation happens: should the UI offer a choice of strategy, or
-   just replace `allocate()` outright? Should `ortools` become a hard
-   requirement (added to the base install) or stay optional with a
-   graceful fallback to `allocate_by_anchor` if it's missing (the lazy
-   import already supports this today)? What should happen in the UI if
-   the solver returns `FEASIBLE` instead of `OPTIMAL` (i.e. it hit the
-   time limit) -- silently accept the best-found result, or surface that
-   distinction to the planner?
+3. ~~Decide whether/when to wire `allocate_by_solver()` into
+   `plan_day_tab.py`'s "Run Planning" button~~ **RESOLVED 2026-08-14,
+   Phase 22.** The project owner reported Run Planning giving 6
+   unresolved/2 supplier in the live UI while `allocate_by_solver()`
+   reached 0/0 on the identical `UNPLANNED.xlsx` -- investigated and
+   confirmed as exactly the wiring gap this item flagged (the UI had
+   simply never been switched off the original `allocate()`), not a
+   regression or data bug. The three sub-questions below were then
+   answered explicitly by the project owner and implemented (see
+   `CHANGELOG_AI.md` Phase 22):
+   - **Straight replacement, not a strategy picker.** `plan_day_tab.py`
+     now calls `allocate_by_solver()` directly; `allocate()` stays fully
+     intact in `allocation_engine.py` (Rule 1/13), just no longer the
+     UI's default.
+   - **`ortools` is now a hard, pinned dependency**
+     (`requirements.txt`: `ortools==9.15.6755`), not optional -- Run
+     Planning depends on it in normal use. The import inside
+     `allocate_by_solver()` itself stays a lazy try/except so a missing
+     install raises a clear `ImportError`, caught by `plan_day_tab.py`
+     and shown as a `QMessageBox`, rather than crashing the app.
+   - **`OPTIMAL` vs. `FEASIBLE` is shown plainly** in the UI's summary
+     label after each Run Planning click ("Solved optimally" vs. "Best
+     plan found within the time limit -- may not be the true optimum"),
+     via a new optional `solver_status_out` param on
+     `allocate_by_solver()`.
+   - `allocate_by_merit()` and `allocate_by_anchor()` remain unwired,
+     kept in the codebase for comparison per Rule 13.
+   - **Not yet done as part of this change:** an actual click-through GUI
+     test (Upload -> Run Planning -> confirm the status label renders as
+     expected) -- verified so far only at the engine/logic level (the
+     exact `_on_run` computation was replicated and run standalone against
+     real data, plus `plan_day_tab.py` was confirmed to import cleanly)
+     and via the full existing test suite. See "Testing" in this phase's
+     `CHANGELOG_AI.md` entry for exactly what was and wasn't run.
 4. ~~Decide the duty-span question (spec OPT-001)~~ **RESOLVED 2026-08-10,
    Phase 21.** A driver's SPAN (first job to last job that day, including
    idle gaps) now counts toward daily/monthly hour limits -- confirmed

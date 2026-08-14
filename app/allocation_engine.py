@@ -394,9 +394,12 @@ def _fill_gaps_with_unresolved_jobs(jobs, driver_pool, vehicle_pool, travel_buff
                 # earlier version of this fix tried sum-based overtime
                 # instead -- reverted; the project owner clarified overtime
                 # tracks the same duty-span concept as the daily ceiling,
-                # not summed job duration.)
+                # not summed job duration. A leftover duplicate line from
+                # that reverted attempt silently overwrote this correct
+                # span-based value with a reference to an undefined
+                # `projected_sum` variable -- a live NameError landmine,
+                # found and removed 2026-08-14, Phase 22.)
                 overtime = max(0.0, projected_span - d.working_hours_per_day)
-                overtime = max(0.0, projected_sum - d.working_hours_per_day)
                 if d.max_overtime_hours_per_month is not None:
                     if d.month_overtime_so_far + overtime > d.max_overtime_hours_per_month + 1e-9:
                         continue
@@ -2470,23 +2473,32 @@ def _solver_effective_ceiling_minutes(driver):
 def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
                         allowed_driver_ids=None, allowed_supplier_ids=None,
                         allow_override_days=None, travel_buffer_minutes=DEFAULT_TRAVEL_BUFFER_MINUTES,
-                        time_limit_seconds=15.0):
+                        time_limit_seconds=15.0, solver_status_out=None):
     """Constraint-solver strategy (Google OR-Tools CP-SAT). See the module
     comment block above this function for the full design and its two
     disclosed scope boundaries. Mutates and returns `jobs`, same contract as
-    the other three strategies. Not yet wired into the UI -- exists so it
-    can be tested and compared against real data first (Rule 13).
+    the other three strategies. Wired into plan_day_tab.py's "Run Planning"
+    as of 2026-08-14 (Phase 22) -- see CHANGELOG_AI.md.
 
     Requires the `ortools` package. Raises ImportError with a clear message
     if it isn't installed, rather than letting the rest of this module (or
-    the app) fail to import."""
+    the app) fail to import.
+
+    solver_status_out: optional dict. If given, this function sets
+    solver_status_out["status"] to one of "OPTIMAL", "FEASIBLE", or the
+    CP-SAT status name for a no-solution case (e.g. "INFEASIBLE"), so a
+    caller (the UI) can surface whether the result is a proven-best plan or
+    just the best one found within time_limit_seconds. Purely additive --
+    existing callers that don't pass this keep the original bare `jobs`
+    return, unaffected."""
     try:
         from ortools.sat.python import cp_model
     except ImportError as e:
         raise ImportError(
             "allocate_by_solver() requires the 'ortools' package (pip install ortools). "
-            "It is not required for any other part of this app -- only this one "
-            "experimental strategy."
+            "As of 2026-08-14 this is the strategy 'Run Planning' uses by default, "
+            "so ortools is now a required dependency for normal use of this app "
+            "(see requirements.txt)."
         ) from e
 
     allow_override_days = allow_override_days or {}
@@ -2503,6 +2515,8 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
     units = build_planning_units(valid_jobs)
     n = len(units)
     if n == 0:
+        if solver_status_out is not None:
+            solver_status_out["status"] = "N/A (no jobs to plan)"
         return jobs
 
     # ---- Warm-start hint ----------------------------------------------------
@@ -2871,6 +2885,8 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
     solver.parameters.max_time_in_seconds = time_limit_seconds
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
+    if solver_status_out is not None:
+        solver_status_out["status"] = solver.StatusName(status)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         # No feasible solution found at all within the time limit (should be

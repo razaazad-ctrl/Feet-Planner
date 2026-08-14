@@ -67,6 +67,10 @@ automatically:
 1. **Deterministic rules engine** (`allocation_engine.py`) — hard
    constraints only (hours, shift windows, off-days, license/vehicle-type
    matching). No AI, no network calls, fully repeatable and testable.
+   As of 2026-08-14 (Phase 22), "Run Planning" calls `allocate_by_solver()`
+   (Google OR-Tools CP-SAT) rather than the original `allocate()` -- still
+   fully deterministic and rule-based, just a constraint solver instead of
+   a hand-written heuristic pass. See "The solver strategy" below.
 2. **AI review layer** (`ai_review.py` + `maps_client.py`) — called only
    when the planner clicks "AI Review". Uses Claude (Anthropic API) plus
    Google Maps (Routes API, traffic-aware) to reason about event-chain
@@ -230,8 +234,10 @@ validation added there as a safety net.
   `None`/blank = **no overtime allowed at all** (working_hours_per_day
   becomes a strict daily ceiling); any positive number = that many hours
   of overtime allowed per month, tracked via `finalized_jobs` history
-  (`db.get_driver_month_overtime_hours`, which sums *per-day excess over
-  working_hours_per_day*, not raw totals) -- but capped per-day at
+  (`db.get_driver_month_overtime_hours`, which sums *per-day excess of
+  duty SPAN over working_hours_per_day*, not raw totals or summed job
+  duration -- corrected 2026-08-14, Phase 23, to match the Phase 21 span
+  principle; see `DATABASE.md`) -- but capped per-day at
   `max_working_hours_per_day` regardless of how much of the monthly
   total remains, per the fix above. (Blank being treated as "no overtime"
   rather than "unlimited" was itself a bug fix, from an earlier session
@@ -502,15 +508,29 @@ linearly with group size instead of quadratically.
    combination it could find (its objective weights leaving something
    unresolved at 1,000,000x anything else in the model).
 
-**Practical notes:** requires the `ortools` package (added to
-`requirements.txt`), imported LAZILY inside the function so the rest of
-the app -- including the other three strategies -- works with zero
-impact if it isn't installed. Uses a warm-start hint (runs
-`allocate_by_anchor()` on independent scratch copies first, feeds the
-result to the solver via `model.add_hint()`) to help convergence, purely
-as a starting point; the solver is always free to find something
-better. Not yet wired into `plan_day_tab.py`'s UI -- see NEXT_SESSION.md
-Section 6 item 2 for the open sub-questions about if/how to do that.
+**Practical notes:** requires the `ortools` package. As of 2026-08-14
+(Phase 22) this is a hard, pinned dependency (`requirements.txt`:
+`ortools==9.15.6755`), since `plan_day_tab.py`'s "Run Planning" button now
+calls this function directly. The import inside the function itself
+remains a lazy try/except (not moved to module level) so a missing
+install still raises a clear, catchable `ImportError` -- `plan_day_tab.py`
+catches it and shows a `QMessageBox` rather than crashing the app.
+Uses a warm-start hint (runs `allocate_by_anchor()` on independent scratch
+copies first, feeds the result to the solver via `model.add_hint()`) to
+help convergence, purely as a starting point; the solver is always free
+to find something better.
+
+**Wired into the UI 2026-08-14 (Phase 22).** `plan_day_tab.py`'s Run
+Planning button calls `allocate_by_solver()` directly -- a straight
+replacement of `allocate()`, not a strategy picker (decided explicitly
+with the project owner; see CHANGELOG_AI.md Phase 22 and
+NEXT_SESSION.md). `allocate()`, `allocate_by_merit()`, and
+`allocate_by_anchor()` remain fully intact in `allocation_engine.py` per
+Rule 1/13 -- only the UI's default call site changed. The function gained
+an optional `solver_status_out` param (a dict the caller passes in;
+populated with the CP-SAT status name after `solver.Solve()` runs) so the
+UI can show "Solved optimally" vs. "Best plan found within the time
+limit -- may not be the true optimum" plainly after each run (Rule 8).
 
 ### Vehicle-type matching is exact string comparison
 `_type_matches()` does case-insensitive, whitespace-normalized *exact*
@@ -933,6 +953,11 @@ retyped from memory.
 - Export Filled Excel (preserves original file exactly)
 - Results table sorting/filtering
 - Settings PIN gating
+- **`allocate_by_solver()` wired into "Run Planning" as of 2026-08-14
+  (Phase 22)** -- see the dedicated entry below (moved here from the
+  EXPERIMENTAL list since it's now the UI's default engine, not a side
+  experiment). `allocate()` itself remains fully intact and available in
+  `allocation_engine.py` per Rule 1/13; only the UI's call site changed.
 - Real-data validation performed directly against the user's actual
   `fleetplanner.db` and a real day's `UNPLANNED.xlsx`/`PLANNED.xlsx`
   pair (see `CHANGELOG_AI.md` for the specific findings from that
@@ -940,7 +965,19 @@ retyped from memory.
   in the user's own database**, not code bugs — see Section 6's
   "Vehicle-type matching" and Section 9 item 8).
 
-**Built, tested, EXPERIMENTAL -- not wired into the UI, not yet
+**`allocate_by_solver()` -- production, wired into the UI as of 2026-08-14
+(Phase 22)** (built 2026-08-09, Phase 16; see below for full technical
+detail). Google OR-Tools CP-SAT constraint solver, states every hard rule
+as a mathematical constraint and the real goal as a weighted objective
+instead of a hand-written heuristic pass. `plan_day_tab.py`'s Run Planning
+button now calls this directly, replacing `allocate()` as the UI's
+default (a straight replacement, not a strategy picker -- decided
+explicitly with the project owner; see CHANGELOG_AI.md Phase 22). Still
+fully deterministic and rule-based -- no AI, no network calls (Rule 2/10
+of `PROJECT_RULES.md` unaffected). The UI now also shows the solver's
+`OPTIMAL`/`FEASIBLE` status plainly after each run.
+
+**Built, tested, EXPERIMENTAL -- NOT wired into the UI, not yet
 production-ready (2026-08-06 through 2026-08-09, see Section 9 items 14/15
 and CHANGELOG_AI.md Phases 15/16):**
 - `allocate_by_merit()` -- shift-partitioned strategy with event-diverse
@@ -962,8 +999,10 @@ and CHANGELOG_AI.md Phases 15/16):**
   enforcement" below). See CHANGELOG_AI.md Phase 16 for the full
   technical detail of each fix.
 - **`allocate_by_solver(jobs, drivers, vehicles, supplier_offerings, ...)`
-  -- NEW in Phase 16, a fundamentally different approach: Google OR-Tools'
-  CP-SAT constraint solver instead of a hand-written heuristic.** States
+  -- built Phase 16, WIRED INTO THE UI as of Phase 22 (2026-08-14, see the
+  production entry above) -- a fundamentally different approach: Google
+  OR-Tools' CP-SAT constraint solver instead of a hand-written heuristic.**
+  States
   every hard rule (license/vehicle-type match, off-days, the shift
   first-job-only gate, daily floor/ceiling folding in the monthly-
   overtime interaction, no-double-booking) as a mathematical constraint,
@@ -974,9 +1013,12 @@ and CHANGELOG_AI.md Phases 15/16):**
   real `UNPLANNED.xlsx`: 44/44 resolved, 0 supplier, all 11 drivers used,
   solver status PROVEN OPTIMAL (a mathematical guarantee no better
   in-house assignment exists under the modeled constraints, not just "a
-  solution was found"), 3.78 seconds.** Requires the `ortools` package
-  (added to `requirements.txt`, imported lazily inside the function so
-  the rest of the app works fine without it installed). Two disclosed
+  solution was found"), 3.78 seconds.** Requires the `ortools` package --
+  as of Phase 22 this is a hard, pinned dependency (`requirements.txt`:
+  `ortools==9.15.6755`) since the UI's Run Planning now depends on it; the
+  import inside the function itself remains a lazy try/except so a
+  missing install raises a clear, catchable `ImportError` instead of
+  crashing the app at startup. Two disclosed
   scope boundaries relative to the other three strategies (see the
   function's own module-level docstring in `allocation_engine.py` for
   the full reasoning): (1) genuine Same-Driver overlap-relaxation beyond
@@ -992,18 +1034,27 @@ and CHANGELOG_AI.md Phases 15/16):**
   the same "everyone used" goal directly via its objective function
   instead of a separate repair pass). Two real bugs were found and fixed
   building this (see item 14).
-- **None of the above have dedicated synthetic test files yet** -- all
-  validation so far is direct real-data testing against `UNPLANNED.xlsx`
-  + `fleetplanner.db`. This is a real, disclosed gap, not an oversight:
-  see NEXT_SESSION.md, now the top open item given how much further the
-  solver strategy in particular has come.
-- `plan_day_tab.py` still calls only `allocate()` -- switching the UI to
-  any new strategy has not been discussed or decided. This decision is
-  now considerably more concrete than before Phase 16 (one strategy has
-  proven-optimal, validated real-world results), but is still explicitly
-  the project owner's call to make, not something to do unilaterally.
-  See NEXT_SESSION.md Section 6 item 2 for the specific sub-questions
-  worth raising when that conversation happens.
+- **None of the above (including `allocate_by_solver()`, despite now
+  being wired into the UI) have dedicated synthetic test files yet** --
+  all validation so far is direct real-data testing against
+  `UNPLANNED.xlsx` + `fleetplanner.db`, plus the full existing heuristic
+  test suite (which doesn't exercise the solver's own CP-SAT model at
+  all). This is a real, disclosed gap, now higher-priority than before
+  Phase 22 since the solver is the production default, not a side
+  experiment -- see NEXT_SESSION.md.
+- **RESOLVED 2026-08-14, Phase 22: `plan_day_tab.py` now calls
+  `allocate_by_solver()`, not `allocate()`.** The switch was triggered by
+  the project owner reporting Run Planning giving 6 unresolved/2 supplier
+  in the live UI while `allocate_by_solver()` reached 0/0 on the identical
+  `UNPLANNED.xlsx` -- confirmed as a wiring gap (the UI had simply never
+  been switched off the original strategy), not a regression or bug. The
+  project owner then explicitly chose, of the sub-questions previously
+  listed in NEXT_SESSION.md: a straight replacement (not a strategy
+  picker), `ortools` as a hard/pinned dependency, and the solver's
+  `OPTIMAL`/`FEASIBLE` status shown plainly in the UI. See
+  `CHANGELOG_AI.md` Phase 22 for the full implementation writeup.
+  `allocate()`, `allocate_by_merit()`, and `allocate_by_anchor()` remain
+  unchanged and fully available in `allocation_engine.py`.
 
 **Explicitly NOT yet built** (see `NEXT_SESSION.md` for prioritization):
 - PDF export (Excel export is done and preserves formatting; PDF likely

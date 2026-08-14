@@ -170,17 +170,32 @@ intermediate controller/presenter class.
 
 `PlanDayTab` owns a read-only `DriverSupplierSummaryDialog` opened by the
 `Summary` button beside `Export Filled Excel`. The dialog is deliberately a
-reporting layer over `PlanDayTab.self.jobs` only:
+reporting layer over `PlanDayTab.self.jobs` (plus, as of 2026-08-14 Phase
+25, `PlanDayTab.self.last_drivers`) only:
 
-- It never queries SQLite or master-data tables.
+- It never queries SQLite or master-data tables directly -- `DriverSupplierSummaryDialog.__init__(jobs, drivers, parent)`
+  is handed `self.last_drivers` (the `DriverProfile` list already built in memory by the
+  last Run Planning click), the same object `_on_ai_review` already reuses for its own
+  hours summary. No new `db.*` call was added anywhere in this dialog.
 - It counts total trips, unique in-house drivers present in the results, in-house-assigned
   trips, unique suppliers present in the results, supplier-assigned trips, and unresolved jobs.
 - The popup uses a modern card-style header for the four primary totals; the second
   card is specifically `In-house trips`, not total trips.
 - The main report is a proper table with rows for assigned in-house drivers and,
   when enabled, supplier records. Columns cover first-job start, last-job end,
-  duty span, trip count, and merged worked hours. This keeps detailed workload
-  information aligned and easy to scan instead of rendering each record as a card.
+  duty span, **overtime (new, Phase 25)**, trip count, and merged worked hours. This
+  keeps detailed workload information aligned and easy to scan instead of rendering
+  each record as a card.
+- **Overtime column (new 2026-08-14, Phase 25):** `max(0, shift_span_hours -
+  driver.working_hours_per_day)` -- the same span-based method
+  `db.get_driver_month_overtime_hours()` uses per day (Phase 23), just for this one
+  day instead of summed across a month. Shows `"--"` for a driver whose
+  `working_hours_per_day` isn't known here (not present in `last_drivers`, e.g. Run
+  Planning wasn't run this session) and for every supplier row -- overtime is a
+  driver-specific hard-rule concept (`drivers.working_hours_per_day`), not applicable
+  to suppliers. The cell's text turns red (`#c0392b`) when overtime is greater than
+  zero, matching the same color the Drivers tab uses for an over-budget monthly
+  balance (Phase 24).
 - The table always shows both populations when they exist. There is no filter
   checkbox in the popup: explicit `IN-HOUSE DRIVERS` and `SUPPLIERS` group
   headers keep the ordering unambiguous, with in-house drivers first and suppliers
@@ -198,10 +213,18 @@ reporting layer over `PlanDayTab.self.jobs` only:
   occupied-hour accounting.
 - Supplier detail is grouped from the assignment results themselves; numbered
   supplier hires and `SAME ...` labels are treated as the same supplier company.
-  Supplier rows always appear after the in-house-driver group. No database lookup
-  is introduced.
+  Supplier rows always appear after the in-house-driver group.
 - Opening the popup does not modify jobs, assignments, the database, or the
   uploaded workbook.
+- **Window chrome (changed 2026-08-14, Phase 25):** the dialog is now frameless
+  (`Qt.FramelessWindowHint`) -- the native OS title bar was removed since the
+  dialog already has its own in-content "×" close button, and removing it frees
+  vertical space. Default/minimum size reduced from 980×900/900×820 to
+  980×720/900×620, since the previous height could clip the bottom rows (including
+  the Close button) under the taskbar on smaller screens; the table scrolls
+  internally, so a shorter dialog only reduces how many rows are visible before
+  scrolling, not what data is available. Being frameless also means the dialog can
+  no longer be dragged by a title bar -- not addressed, since it wasn't requested.
 
 This keeps the summary a true snapshot of the plan currently visible in memory,
 including any future planner edits made before export/finalization.
@@ -225,10 +248,19 @@ including any future planner edits made before export/finalization.
    -> allocation_engine.build_supplier_offerings(conn, db) [reads
       supplier_offerings joined with suppliers, computes
       cumulative_hours_history via db.get_supplier_cumulative_hours]
-   -> allocation_engine.allocate(jobs, drivers, vehicles, offerings)
-      [MUTATES jobs in place -- see Section 5 for the algorithm]
+   -> allocation_engine.allocate_by_solver(jobs, drivers, vehicles,
+      offerings, solver_status_out=solver_status)
+      [MUTATES jobs in place -- CP-SAT constraint solver, see Section 5c
+      for the algorithm. CHANGED 2026-08-14, Phase 22 -- this call site
+      used to be allocate() (Section 5's hand-written heuristic); see
+      CHANGELOG_AI.md Phase 22 for why and how the switch was made.
+      Wrapped in try/except ImportError -- if `ortools` isn't installed,
+      shows a QMessageBox rather than crashing, since this is now a hard
+      runtime dependency for Run Planning.]
    -> PlanDayTab._render_results() populates the QTableWidget,
-      populates the driver/supplier filter dropdown
+      populates the driver/supplier filter dropdown, and the summary
+      label shows the solver's OPTIMAL/FEASIBLE status in plain language
+      alongside the job-count summary
 
 4. User optionally clicks "AI Review (event chains + day notes)"
    (PlanDayTab._on_ai_review)
@@ -467,11 +499,15 @@ owner before implementing (do not change without re-confirming):
 
 ## 5b. Experimental alternative strategies (2026-08-06, allocation_engine.py)
 
-**Not wired into the UI.** `plan_day_tab.py` still calls only
-`allocate()`. These exist alongside it, built to be compared against real
-data before any decision to switch (Rule 13) -- see CHANGELOG_AI.md
-Phase 15 for the real-data results and AI_CONTEXT.md Section 9 item 14
-for the full story.
+**`allocate_by_merit()` and `allocate_by_anchor()` are NOT wired into the
+UI.** (`allocate_by_solver()`, described separately in Section 5c, WAS
+wired in as of 2026-08-14, Phase 22 -- see that section.) `plan_day_tab.py`
+calls `allocate_by_solver()`, not `allocate()`, as of Phase 22; `allocate()`
+itself remains fully intact and unused by the UI. `allocate_by_merit()`
+and `allocate_by_anchor()` exist alongside both, built to be compared
+against real data before any further switch (Rule 13) -- see
+CHANGELOG_AI.md Phase 15 for the real-data results and AI_CONTEXT.md
+Section 9 item 14 for the full story.
 
 ### `PlanningUnit` and `build_planning_units()`
 
@@ -686,10 +722,16 @@ anything not pre-merged, even within a flagged group; (2) supplier
 hiring isn't modeled inside the solver at all, handled entirely by the
 reused fallback pass described above.
 
-**Not wired into `plan_day_tab.py`.** See `NEXT_SESSION.md` Section 6
-item 2 for the open sub-questions (strategy choice in the UI vs. a
-straight replacement, whether `ortools` becomes a hard requirement, how
-to surface an `OPTIMAL` vs. `FEASIBLE` result to the planner).
+**Wired into `plan_day_tab.py` as of 2026-08-14 (Phase 22).** The three
+open sub-questions previously listed here (strategy choice in the UI vs.
+a straight replacement; whether `ortools` becomes a hard requirement; how
+to surface an `OPTIMAL` vs. `FEASIBLE` result to the planner) were
+resolved explicitly with the project owner: straight replacement of
+`allocate()` (no strategy picker), `ortools` pinned as a hard dependency
+in `requirements.txt`, and the solver status shown plainly in the UI
+summary label after each Run Planning click. See `CHANGELOG_AI.md`
+Phase 22 for the full implementation writeup, and `AI_CONTEXT.md`'s "The
+solver strategy" subsection for the design detail.
 
 ## 6. Data flow diagram (text form)
 
@@ -803,17 +845,17 @@ rules_parser
 - `requests` (unpinned) — used by `maps_client.py` for direct HTTP calls
   to the Google Routes API (no Google SDK used, deliberately, to avoid
   the extra dependency weight)
-- `ortools` (unpinned, added 2026-08-09) — Google's constraint-solver
-  toolkit, used ONLY by the experimental `allocate_by_solver()` strategy
-  in `allocation_engine.py`. Imported LAZILY inside that one function,
-  not at module level, so every other part of the app -- including the
-  other three allocation strategies -- works with zero impact if it
-  isn't installed. Not yet a genuine runtime requirement for the app as
-  a whole; see `NEXT_SESSION.md` Section 6 item 2 for the open question
-  of whether it should become one if `allocate_by_solver()` gets wired
-  into the UI. Worth factoring into the PyInstaller packaging
-  conversation whenever that happens (`ortools` adds meaningfully to
-  bundle size).
+- `ortools==9.15.6755` (pinned 2026-08-14, Phase 22 — was unpinned/
+  optional before this) — Google's constraint-solver toolkit, used by
+  `allocate_by_solver()` in `allocation_engine.py`, which `plan_day_tab.py`'s
+  Run Planning button now calls directly as the UI's default engine. Still
+  imported LAZILY inside that one function, not at module level, so a
+  missing install raises a clear, catchable `ImportError` (caught by
+  `plan_day_tab.py`, shown as a `QMessageBox`) instead of crashing the
+  whole app at startup — but it IS now a genuine runtime requirement for
+  normal use of the app, not an optional extra. Worth factoring into the
+  PyInstaller packaging conversation whenever that happens (`ortools`
+  adds meaningfully to bundle size).
 
 No web framework, no ORM, no task queue, no external message broker —
 this is intentionally a simple, single-process desktop application.

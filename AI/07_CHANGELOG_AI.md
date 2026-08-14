@@ -1694,3 +1694,420 @@ this prompted about keeping changelog entries appended in one place.)*
   `db.get_driver_month_overtime_hours` already works from
   `finalized_jobs`), not computed live on every keystroke. Not started
   this session. See `NEXT_SESSION.md` for the concrete next-step plan.
+
+## Phase 22 — Wired allocate_by_solver() into the UI: the real fix for a live symptom (2026-08-14)
+
+- **Reported symptom:** the project owner ran Plan a Day in the live app
+  against `UNPLANNED.xlsx` and got 6 unresolved jobs and 2 supplier
+  hires, while `allocate_by_solver()` had already been shown (Phase 16,
+  re-confirmed Phase 21) to reach 0 unresolved / 0 supplier / all 11
+  drivers used, status `OPTIMAL`, on the exact same file. Framed as a
+  hypothesis to verify before changing anything, per this project's own
+  discipline: `plan_day_tab.py` calls `allocate()` -- the original
+  greedy engine -- not `allocate_by_solver()`, so the UI had simply never
+  been switched to the newer, already-validated strategy.
+- **Confirmed at the code level first, before running anything:**
+  `app/ui/plan_day_tab.py` imported only `allocate` from
+  `allocation_engine` (line 27) and called it at exactly one site (line
+  157). None of `allocate_by_merit`, `allocate_by_anchor`, or
+  `allocate_by_solver` were imported or referenced anywhere under
+  `app/ui/`.
+- **Confirmed at the data level, per this project's own recurring
+  failure pattern:** checked `drivers.license_types`,
+  `vehicles.vehicle_type`, and `supplier_offerings.vehicle_type` in
+  `fleetplanner.db` for the embedded-newline issue that has silently
+  broken exact-string matching twice before (Phase 15, recurred
+  2026-08-10). Clean this time -- not the cause.
+- **Confirmed by direct comparison, all four strategies against the same
+  real `UNPLANNED.xlsx` + `fleetplanner.db` (44 jobs, 11 drivers)** using
+  a throwaway diagnostic script (not committed to the repo):
+
+  | strategy | unresolved | supplier | drivers used |
+  |---|---|---|---|
+  | `allocate()` (then the UI default) | 6 | 2 | 10 |
+  | `allocate_by_merit()` | 9 | 5 | 10 |
+  | `allocate_by_anchor()` | 1 | 0 | 11 |
+  | `allocate_by_solver()` | 0 | 0 | 11 (status `OPTIMAL`) |
+
+  `allocate()`'s result matched the reported UI symptom exactly,
+  confirming the wiring-gap hypothesis with no ambiguity. `ortools` had
+  to be installed first (`pip install ortools` via PowerShell -- the
+  sandboxed Bash tool's `pip` failed with a Windows socket-permission
+  error, `urllib` and PowerShell's `pip` both worked fine, so this was an
+  environment quirk of the Bash tool specifically, not a real network
+  issue).
+- **Three explicit decisions made with the project owner** (Rule 16 --
+  asked, not assumed, since NEXT_SESSION.md had already flagged these as
+  open sub-questions requiring the project owner's call):
+  1. **Straight replacement, not a strategy picker.** Simpler for a
+     single non-developer planner; `allocate()` stays fully intact in
+     `allocation_engine.py` either way (Rule 1/13).
+  2. **`ortools` becomes a hard, pinned dependency.** If Run Planning
+     depends on the solver, it must always be installed, or Run Planning
+     breaks on a fresh install.
+  3. **`OPTIMAL` vs. `FEASIBLE` shown plainly in the UI**, not hidden and
+     not only flagged on the non-optimal case -- matches Rule 8
+     (explainable decisions).
+- **Implementation, deliberately minimal (Rule 6/15):**
+  - `app/ui/plan_day_tab.py`: import changed from `allocate` to
+    `allocate_by_solver`; `_on_run` now calls
+    `allocate_by_solver(self.jobs, drivers, vehicles, supplier_offerings,
+    solver_status_out=solver_status)`, wrapped in `try/except ImportError`
+    that shows a `QMessageBox` (matching the project's existing pattern
+    for `AIReviewError`/`MapsClientError`/`DigestError` -- external/
+    environment failures are caught at the UI layer, never a raw
+    traceback) if `ortools` isn't installed. The summary label now
+    appends a plain-language solver status ("Solved optimally (proven
+    best plan)." vs. "Best plan found within the time limit — may not be
+    the true optimum.") and turns amber for the non-optimal case, reusing
+    the existing `summary_label` widget rather than adding a new one.
+  - `app/allocation_engine.py`: `allocate_by_solver()` gained a new
+    optional `solver_status_out` parameter (a dict; if passed, the
+    function sets `solver_status_out["status"]` to the CP-SAT status name
+    right after `solver.Solve()`, and also for the two early-return edge
+    cases -- no feasible solution found, and zero planning units). Purely
+    additive -- omitting it preserves the exact original bare-`jobs`
+    return contract for any other caller, so nothing about the function's
+    existing behavior changed for `allocate_by_anchor()`'s use of it as a
+    warm-start source, or for the diagnostic script. The function's
+    `ImportError` message was reworded (it previously said ortools "is
+    not required for any other part of this app -- only this one
+    experimental strategy," which is no longer true).
+  - `requirements.txt`: `ortools` pinned to `9.15.6755` (the version
+    actually installed and tested this session), matching the pinning
+    convention already used for every other dependency in this file.
+  - `tests/test_shift_start.py` deleted. This was unrelated to the
+    wiring change itself, but the full test suite run (below) surfaced
+    that this file -- confirmed dead and recorded as deleted back in
+    Phase 21's own changelog entry -- was still physically present on
+    disk and still failing to import (`_parse_shift_start_time` /
+    `_job_is_before_shift_start`, removed in the Phase 10 shift redesign,
+    2026-08-03). Phase 21's own record of deleting it was apparently
+    never actually executed. Deleted now so the suite is honestly clean;
+    a one-line, zero-risk cleanup, not a scope expansion.
+- **Testing performed:**
+  - The four-strategy comparison table above, run directly against the
+    real `UNPLANNED.xlsx` + `fleetplanner.db`.
+  - Full existing test suite (`python -m unittest discover -s tests`):
+    all 10 remaining test files completed with no tracebacks and their
+    own internal `PASS`/`ALL ... TESTS PASSED` assertions all firing (this
+    suite is script-style, not `unittest.TestCase`-based, so `unittest`'s
+    own "Ran 0 tests" formal count is expected and not a failure signal
+    -- each file's assertions are what actually validate it).
+  - `plan_day_tab.py` confirmed to import cleanly with the new wiring,
+    and `allocate_by_solver`'s new signature (including
+    `solver_status_out`) inspected directly to confirm the parameter
+    landed correctly.
+  - The exact computation inside the new `_on_run` (build profiles, call
+    `allocate_by_solver` with `solver_status_out`, compute the summary
+    line including the OPTIMAL/FEASIBLE phrasing) was replicated
+    standalone and run against the real data, confirming the exact string
+    the UI will display: `"44 jobs total  |  44 in-house  |  0 supplier  |
+    0 unresolved  |  Solved optimally (proven best plan)."`
+  - Confirmed `allocate_by_solver()` commits through the same shared
+    `_commit_unit()` helper `allocate_by_anchor()`/`allocate_by_merit()`
+    already use (not a divergent code path), so `Job.assigned_driver_name`,
+    `assigned_vehicle_plate`, `assignment_note`, etc. are populated
+    identically to before -- `export.py` and the results table needed no
+    changes and none were made.
+  - **NOT performed, explicitly disclosed (Rule 16/19):** an actual
+    click-through GUI test (Upload Excel -> click Run Planning -> visually
+    confirm the results table and the new status text render correctly
+    in the live PySide6 window). This session's environment has no
+    attached display to drive/screenshot a Qt window. The project owner
+    should click through this once before relying on it day-to-day --
+    concrete steps in the session's final report.
+- **What did NOT change:** `allocate()`, `allocate_by_merit()`, and
+  `allocate_by_anchor()` are untouched in `allocation_engine.py` (Rule
+  1/13 -- extended, not replaced). `export.py`, `db.py`, the results
+  table's columns/coloring, the Summary popup, AI Review, Finalize Day,
+  and every hard business rule (including the Phase 21 span-based
+  floor/ceiling/overtime logic) are unaffected -- this was purely a UI
+  wiring change plus the one dead-test cleanup.
+- **Still open, now higher priority since the solver is the production
+  default rather than a side experiment:** validating `allocate_by_solver()`
+  against a bigger real file that genuinely needs supplier use
+  (NEXT_SESSION.md item 0), and writing dedicated synthetic tests for the
+  solver's own CP-SAT model (NEXT_SESSION.md item 2) -- neither was in
+  scope for this session, which was specifically about closing the
+  wiring gap the project owner reported.
+- `AI_CONTEXT.md`, `ARCHITECTURE.md`, `NEXT_SESSION.md`, and
+  `AI_INDEX.json` updated to match (Rule 14/17/19). No change was needed
+  to `DATABASE.md` or `BUSINESS_RULES.md` -- no schema or business-rule
+  change this session, purely UI wiring plus one dependency/test
+  housekeeping fix.
+
+## Phase 23 — Two bugs found while scoping "Balance Overtime / month": a live NameError, and month_overtime_so_far still sum-based (2026-08-14, same day as Phase 22)
+
+- **Trigger:** started scoping the "Balance Overtime / month" / "Balance
+  hours / month" Drivers-tab fields deferred back in Phase 21 (see
+  `NEXT_SESSION.md` Section 6 item 1). Before building the UI, traced
+  every real consumer of `db.get_driver_month_overtime_hours()` (the
+  function the spec says "Balance Overtime / month" should directly
+  reuse) to understand exactly what it feeds — this surfaced two real,
+  pre-existing bugs, confirmed with the project owner before fixing
+  either (Rule 16), not built into the new feature yet.
+- **Bug 1 -- live `NameError` landmine in `_fill_gaps_with_unresolved_jobs`.**
+  `allocation_engine.py` (previously lines 398-399) had:
+  ```python
+  overtime = max(0.0, projected_span - d.working_hours_per_day)
+  overtime = max(0.0, projected_sum - d.working_hours_per_day)
+  ```
+  `projected_sum` is never defined anywhere in the module -- the second
+  line unconditionally overwrites the first, correct, span-based value
+  with a reference to a nonexistent variable. Root cause: a leftover
+  duplicate from Phase 21's own "reverted the interim sum-based attempt
+  everywhere it had been applied" cleanup (2026-08-10) -- the revert at
+  every OTHER call site correctly replaced the interim sum-based line;
+  at this one call site, the interim line was left in place instead of
+  being deleted, sitting directly below the correct replacement. Dormant
+  in every real-data run so far (including this project's own repeated
+  `UNPLANNED.xlsx` validation runs) only because no unresolved job in
+  that file ever found a bounded-gap-fit candidate driver with
+  `working_hours_per_day` configured at the same time -- the exact
+  narrow condition needed to reach this line at all. Fixed by deleting
+  the duplicate line; `projected_span`'s correct assignment is untouched.
+- **Bug 2 -- `db.get_driver_month_overtime_hours()` still measured summed
+  job duration, not duty SPAN, contradicting Phase 21.** Confirmed by
+  reading the function directly ([db.py](../app/db.py)): it grouped
+  `finalized_jobs` by `plan_date` and summed each day's `hours` column
+  (`SUM(hours) AS day_total`), then took `day_total - working_hours_per_day`
+  as that day's overtime -- the exact pre-Phase-21 model. Phase 21
+  (2026-08-10) established that every daily/monthly overtime check in
+  this engine must use duty SPAN (earliest job start to latest job end
+  that day), not summed duration -- but that fix's own changelog entry
+  only lists `allocation_engine.py` call sites; this function, which
+  supplies the *historical* `month_overtime_so_far` baseline every one
+  of those live checks reads (`DriverProfile.month_overtime_so_far`, set
+  once per `build_driver_profiles()` call and consumed by `allocate()`,
+  `_repair_minimum_daily_hours`, `_fill_gaps_with_unresolved_jobs`,
+  `_unit_driver_feasible` -- shared by `allocate_by_merit`,
+  `allocate_by_anchor`, `_swap_repair`, and the chain search -- and
+  `_solver_effective_ceiling_minutes` for `allocate_by_solver`), was
+  missed. Since duty span is always >= summed job duration for the same
+  set of intervals (equal only when a driver's jobs that day are
+  perfectly back-to-back with no gap), the old version could only ever
+  UNDER-count historical overtime -- meaning every hard-rule check
+  reading `month_overtime_so_far` has been more permissive than the
+  corrected model intends whenever a driver had a genuine idle gap on a
+  past finalized day, and "Balance Overtime / month" would have shown an
+  inflated remaining budget if built directly on top of this as-is.
+  Fixed: `get_driver_month_overtime_hours()` now queries
+  `MIN(start_dt)`/`MAX(end_dt)` per `plan_date` (both columns already
+  exist on `finalized_jobs`, no schema change needed) and computes each
+  day's span in Python via `datetime.fromisoformat()`, summing
+  `max(0, span_hours - working_hours_per_day)` across days -- structurally
+  identical to `allocation_engine._day_span_hours()`'s definition, kept
+  as a small self-contained calculation in `db.py` rather than importing
+  `allocation_engine` (preserves the existing one-way dependency: `db.py`
+  must own no business logic, `allocation_engine.py` must not import
+  `db` at module level).
+- **Tested:** a throwaway sanity script (not committed) built a temp
+  SQLite database via `db.init_db()`, inserted two finalized days for one
+  driver -- one with a genuine 4-hour gap between two jobs (2h+2h summed,
+  8h span) and one fully back-to-back (5h summed, 5h span, sum and span
+  agreeing by construction) -- and confirmed `get_driver_month_overtime_hours`
+  with `working_hours_per_day=7` now returns `1.0` (the gap day's true
+  8h span minus 7h baseline), not the old buggy `0.0` (4h summed minus 7h
+  baseline, floored at zero). Full existing test suite
+  (`python -m unittest discover -s tests`) re-run clean, zero tracebacks,
+  after both fixes -- `tests/test_gap_filling.py` in particular exercises
+  the exact function Bug 1 was in. The real `UNPLANNED.xlsx` four-strategy
+  comparison (allocate/merit/anchor/solver) was also re-run and produced
+  identical unresolved/supplier/drivers-used numbers to before either fix
+  -- expected, since that database's `finalized_jobs` history is empty
+  for this test file, so `month_overtime_so_far` was `0.0` under both the
+  old and corrected calculation; the fix only changes behavior once real
+  finalized history with a gap day exists.
+- **What did NOT change:** the "Balance Overtime / month" and "Balance
+  hours / month" UI+DB feature itself is NOT built yet -- these were two
+  bug fixes found while scoping it, done first and separately per the
+  project owner's explicit go-ahead, before any new UI/DB work for that
+  feature begins. `allocate()`, `allocate_by_merit()`, `allocate_by_anchor()`,
+  and `allocate_by_solver()`'s own logic are otherwise unchanged --
+  `_day_span_hours()`/`_same_day_intervals()` (Phase 21) were not touched,
+  only the one duplicate-line removal and the one `db.py` query.
+- `AI_CONTEXT.md` and `DATABASE.md` updated to match (Rule 14/17/19) --
+  both had described `get_driver_month_overtime_hours()`'s calculation
+  method in a way that was accurate before Phase 21 but had gone stale
+  once Phase 21 changed the underlying principle without this function
+  being updated to match. No schema change, so no other `/AI` file needed
+  updating.
+
+## Phase 24 — Built "Balance Overtime / month" and "Balance hours / month" on the Drivers tab (2026-08-14, same day as Phase 22-23)
+
+- **Built directly on top of Phase 23's two fixes** (the `NameError` and
+  the sum-vs-span correction to `get_driver_month_overtime_hours()`) --
+  this feature was deferred back in Phase 21 (2026-08-10) specifically so
+  it could be scoped properly rather than built on top of a function that
+  turned out to still be on the pre-Phase-21 model.
+- **One design ambiguity resolved with the project owner before building
+  (Rule 16):** the original Phase 21 deferral note read "if
+  `total_hours_per_month_target` is blank, both balance fields should
+  read as zero," which taken literally would couple Balance
+  Overtime/month's zero-state to a field it has no formula relationship
+  with (`total_hours_per_month_target` vs. its own actual dependency,
+  `max_overtime_hours_per_month`). Confirmed with the project owner:
+  **each balance field is gated independently by its own source field
+  being blank**, not coupled to the other. This matters in practice
+  because `total_hours_per_month_target` is documented everywhere as
+  "mainly for temp drivers" -- a literal "both" reading would have made
+  Balance Overtime/month always show 0 for every regular driver who
+  simply never had a reason to set a monthly hours target.
+- **Implementation:**
+  - `app/db.py`: added a new private `_driver_month_daily_span_hours(conn,
+    driver_id, year, month)` helper -- returns a plain list of per-day
+    duty-SPAN hours from `finalized_jobs`, factored out of
+    `get_driver_month_overtime_hours()` (which now calls it and
+    subtracts a baseline from each entry) so the underlying day-grouped
+    span query exists in exactly one place. Added a new
+    `get_driver_month_span_hours(conn, driver_id, year, month)` function
+    on top of that same helper -- sums the per-day spans directly with no
+    baseline subtracted, a plain running total. This is the genuinely new
+    piece: nothing tracked a driver's monthly span-hours total before.
+    Distinct on purpose from the pre-existing
+    `get_driver_month_to_date_hours()`, which sums the `hours` column
+    (summed job duration) rather than span -- the two can legitimately
+    disagree on a month with any gap day, by design, not a bug.
+  - `app/ui/drivers_tab.py`: added `self.balance_overtime_label` and
+    `self.balance_hours_label` (read-only `QLabel`s) as new
+    `QFormLayout` rows directly below "Max overtime hours/month" and
+    "Total hours/month target" respectively. Populated in `_load_form`
+    alongside the existing "hours logged this month" label -- recomputed
+    live each time a driver is selected (not cached/persisted; the
+    underlying numbers only change when a day is Finalized, since both
+    source from `finalized_jobs`, matching the existing pattern this tab
+    already used for its "hours logged this month" display). Each shows
+    a short explanatory string (e.g. `"4.0  (1.0 used of 5.0)"`) rather
+    than a bare number, and turns red (`#c0392b`) if the balance goes
+    negative (driver already over budget this month) -- a small,
+    unprompted addition consistent with this tab's existing color
+    conventions (e.g. `EXCLUDED_COLOR` for excluded drivers) and Rule 8
+    (explainable decisions, don't hide a problem state).
+  - A guard mirrors `build_driver_profiles()`'s own fallback: if
+    `working_hours_per_day` is blank for a driver who DOES have
+    `max_overtime_hours_per_month` set, Balance Overtime/month can't
+    compute a per-day baseline to subtract, so overtime-used is treated
+    as `0.0` (same fallback `build_driver_profiles` already uses) rather
+    than crashing on a `None` subtraction.
+- **Tested:**
+  - A throwaway sanity script (not committed) built a temp SQLite
+    database with three finalized days for one driver (a genuine-gap day,
+    a back-to-back day, and a short day) and confirmed
+    `get_driver_month_overtime_hours` (1.0h, matching Phase 23's fix),
+    `get_driver_month_span_hours` (14.0h total across all three days),
+    both derived Balance figures against sample caps/targets (including
+    an explicit over-budget case producing a correct negative balance),
+    and a fresh driver with zero finalized history correctly returning
+    `0.0` for both new functions.
+  - `app/ui/drivers_tab.py` confirmed to import cleanly with the new
+    widgets and logic (no Qt event loop needed just to import the
+    module and check the class defines `_load_form`/`_clear_form`).
+  - Full existing test suite re-run clean after the `db.py` refactor,
+    zero tracebacks.
+  - **NOT performed, explicitly disclosed:** an actual click-through GUI
+    test (open the Drivers tab, select a driver with finalized history,
+    visually confirm the two new labels render, update on driver
+    switch, and turn red when over budget). No attached display in this
+    session's environment. Concrete manual-test steps in this session's
+    final report.
+- **What did NOT change:** no schema change (both new columns' worth of
+  display data are derived live from existing `finalized_jobs` columns,
+  nothing new persisted). `total_hours_per_month_target` remains
+  unenforced as a hard scheduling rule -- it's read for this one
+  display calculation only, nothing about allocation behavior changed.
+  `allocate()`/`allocate_by_merit()`/`allocate_by_anchor()`/
+  `allocate_by_solver()` are untouched by this phase (Phase 23's fixes,
+  immediately prior, are the only allocation-engine changes from this
+  session).
+- `AI_CONTEXT.md` (n/a -- no change needed beyond Phase 23's), `DATABASE.md`,
+  `BUSINESS_RULES.md`, `NEXT_SESSION.md`, and `AI_INDEX.json` updated to
+  match (Rule 14/17/19).
+
+## Phase 25 — Overtime column on the Result Summary popup, plus a UI-chrome fix (2026-08-14, same day as Phase 22-24)
+
+- **Requested:** add an Overtime column to the Result Summary popup
+  (`DriverSupplierSummaryDialog`, `app/ui/plan_day_tab.py`) -- explicitly
+  scoped by the project owner as: this table reads from the current
+  in-memory results, not the database, so the calculation must use the
+  "Shift Span" column already shown, minus the driver's
+  `working_hours_per_day` field, to get that day's overtime. The project
+  owner separately confirmed this is also the correct method for the
+  database-side monthly figure -- exactly what Phase 23 had already
+  fixed `db.get_driver_month_overtime_hours()` to do (span minus
+  baseline, floored at zero, per finalized day); no further database
+  change was needed here, just confirmation the two now agree.
+- **Implementation:**
+  - `build_summary(jobs, working_hours_by_driver_id=None)` gained the new
+    optional parameter and now computes `overtime_hours =
+    max(0.0, span_hours - working_hours_per_day)` per driver record, or
+    `None` when that driver's `working_hours_per_day` isn't available in
+    the lookup (shown as `"--"` rather than a misleading `0.0`) or for
+    supplier records (overtime is a driver hard-rule concept --
+    `drivers.working_hours_per_day` -- with no equivalent for suppliers).
+  - The lookup itself (`working_hours_by_driver_id`) is NOT a new
+    database query -- it's built from `PlanDayTab.self.last_drivers`
+    (the `DriverProfile` list already in memory from the last Run
+    Planning click), the exact same object `_on_ai_review` already
+    reuses for its own hours summary. This preserves the popup's
+    existing, documented design principle that it never queries SQLite
+    directly (see `ARCHITECTURE.md` Section 3.1) -- `_on_summary` now
+    passes `self.last_drivers` into the dialog's constructor alongside
+    `self.jobs`.
+  - New "Overtime" column added to the summary table between "Shift
+    Span" and "Trips" (column count 7 -> 8; all three `setSpan(...)`
+    calls for the group-header rows and the empty-state row updated from
+    `7` to `8` accordingly; column-width/resize-mode arrays and the
+    center-alignment column-index tuple updated to match). The cell's
+    text turns red (`#c0392b`) when overtime is greater than zero,
+    matching the color the Drivers tab already uses for an over-budget
+    monthly balance (Phase 24) -- a small, unprompted but consistent
+    addition (Rule 8, explainable/visible problem states), not a
+    separate ask.
+- **Also requested in the same message, two UI-chrome fixes:**
+  1. **Reduce the popup's height** -- the previous `resize(980, 900)` /
+     `setMinimumSize(900, 820)` could clip the bottom rows (including the
+     Close button) under the Windows taskbar on smaller/laptop screens.
+     Reduced to `resize(980, 720)` / `setMinimumSize(900, 620)`, with the
+     table's own `setMinimumHeight` reduced from `540` to `380` to match.
+     The table already scrolls internally, so a shorter dialog only means
+     fewer rows visible before scrolling, not lost data.
+  2. **Remove the native OS title bar** -- the dialog already has its own
+     in-content "×" close button (`close_x`), making the native title
+     bar's own close/minimize controls redundant; removing it
+     (`self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)`)
+     also frees vertical space, helping with fix 1. Disclosed
+     side-effect, not separately asked about: a frameless window can no
+     longer be dragged by a title bar -- not addressed, since dragging
+     wasn't part of the request.
+- **Tested:**
+  - `build_summary()`'s new overtime calculation verified directly with
+    synthetic `Job` objects and a `{driver_id: working_hours_per_day}`
+    lookup covering four cases: a driver over their baseline (span 11h,
+    baseline 9h -> overtime correctly `2.0`), a driver under baseline
+    (span 2h, baseline 8h -> correctly floored to `0.0`, not negative), a
+    driver with no entry in the lookup (correctly `None`, displayed as
+    `"--"`), and a supplier record (correctly `None`, not applicable).
+  - `plan_day_tab.py` confirmed to import cleanly with the new
+    `DriverSupplierSummaryDialog(jobs, drivers=None, parent=None)`
+    signature and `build_summary(jobs, working_hours_by_driver_id=None)`
+    signature.
+  - Full existing test suite re-run clean, zero tracebacks (this phase
+    touches no allocation-engine or `db.py` code).
+  - **NOT performed, explicitly disclosed:** an actual click-through GUI
+    test (open Plan a Day, run planning, click Summary, visually confirm
+    the new column renders, the red highlight fires correctly, and the
+    frameless/shorter window no longer clips under the taskbar). No
+    attached display in this session's environment -- the project owner
+    noted the database is currently empty and plans to test this
+    end-to-end once real driver/planning data is entered.
+- **What did NOT change:** `db.get_driver_month_overtime_hours()` and
+  `get_driver_month_span_hours()` (Phase 23/24) are untouched -- this
+  phase only added a same-day, in-memory version of the identical
+  span-minus-baseline formula to a different display surface. No schema
+  change, no allocation-engine change, no change to Export/Finalize.
+- `ARCHITECTURE.md` (Section 3.1) and `WORKFLOWS.md` (Result Summary
+  workflow) updated to match (Rule 14/17/19). No change needed to
+  `AI_CONTEXT.md`, `DATABASE.md`, `BUSINESS_RULES.md`, `NEXT_SESSION.md`,
+  or `AI_INDEX.json` -- this popup isn't described at that level of
+  detail in any of those files.

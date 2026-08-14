@@ -307,23 +307,66 @@ def get_driver_month_to_date_hours(conn, driver_id, year, month):
     return row["total"]
 
 
-def get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day):
-    """
-    Sums OVERTIME specifically (hours beyond working_hours_per_day on each
-    individual finalized day), not just total hours -- a driver working
-    exactly their normal hours every day should show zero overtime even
-    with a high month-to-date total. Groups finalized_jobs by day first.
-    """
+def _driver_month_daily_span_hours(conn, driver_id, year, month):
+    """Returns a list of per-day duty-SPAN hours (earliest finalized job
+    start to latest finalized job end, per calendar day) for this driver in
+    the given month. Shared by get_driver_month_overtime_hours (which
+    subtracts a per-day baseline from each) and get_driver_month_span_hours
+    (which sums these directly) -- centralizes the day-grouped span
+    calculation in one place so a future correction to it (see Phase 23,
+    2026-08-14) only has to happen once."""
     prefix = f"{year:04d}-{month:02d}"
     rows = conn.execute(
-        "SELECT plan_date, SUM(hours) AS day_total FROM finalized_jobs "
-        "WHERE driver_id = ? AND plan_date LIKE ? GROUP BY plan_date",
+        "SELECT plan_date, MIN(start_dt) AS day_start, MAX(end_dt) AS day_end "
+        "FROM finalized_jobs WHERE driver_id = ? AND plan_date LIKE ? "
+        "GROUP BY plan_date",
         (driver_id, f"{prefix}%"),
     ).fetchall()
-    total_overtime = 0.0
+    spans = []
     for r in rows:
-        total_overtime += max(0.0, r["day_total"] - working_hours_per_day)
-    return total_overtime
+        if not r["day_start"] or not r["day_end"]:
+            continue
+        spans.append((datetime.fromisoformat(r["day_end"]) - datetime.fromisoformat(r["day_start"])).total_seconds() / 3600.0)
+    return spans
+
+
+def get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day):
+    """
+    Sums OVERTIME specifically (SPAN beyond working_hours_per_day on each
+    individual finalized day -- earliest job start to latest job end that
+    day -- not summed job duration), not just total hours -- a driver
+    working exactly their normal hours every day should show zero overtime
+    even with a high month-to-date total. Groups finalized_jobs by day
+    first (via _driver_month_daily_span_hours).
+
+    CORRECTED 2026-08-14 (Phase 23) to match the Phase 21 (2026-08-10)
+    principle that every daily/monthly overtime check in this project uses
+    duty SPAN, not summed job duration: this function previously summed
+    each day's `hours` column (per-job durations), which under-counts
+    whenever a driver had a genuine idle gap between two jobs on the same
+    day (summed duration < span any time jobs aren't perfectly
+    back-to-back) -- meaning the historical month_overtime_so_far figure
+    every allocate_by_*() strategy's hard-rule checks depend on was
+    silently more permissive than the corrected model intends. Found while
+    building the "Balance Overtime / month" Drivers-tab field, which
+    reuses this function directly.
+    """
+    return sum(
+        max(0.0, span_hours - working_hours_per_day)
+        for span_hours in _driver_month_daily_span_hours(conn, driver_id, year, month)
+    )
+
+
+def get_driver_month_span_hours(conn, driver_id, year, month):
+    """
+    Sums this driver's total duty SPAN across every finalized day in the
+    given month -- a plain running total (NOT an excess-over-baseline
+    figure like get_driver_month_overtime_hours). Basis for the Drivers
+    tab's "Balance hours / month" field: total_hours_per_month_target
+    minus this value. New 2026-08-14 (Phase 23) -- nothing tracked this
+    monthly span accumulation before.
+    """
+    return sum(_driver_month_daily_span_hours(conn, driver_id, year, month))
 
 
 # ------------------------------------------------------------ driver rules

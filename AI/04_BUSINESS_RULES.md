@@ -81,15 +81,30 @@ BUT:
   deducted from `max_overtime_hours_per_month` -- the exact same duty-span
   concept as the daily ceiling above, not a separate one. See
   CHANGELOG_AI.md Phase 21.
-- **Two new derived fields requested 2026-08-10, not yet built** (see
-  NEXT_SESSION.md Section 6 item 1 for the concrete implementation plan):
-  "Balance Overtime / month" (`max_overtime_hours_per_month` minus
-  overtime actually used so far this month) and "Balance hours / month"
-  (`total_hours_per_month_target` minus total span-hours logged so far
-  this month, reading zero for both if `total_hours_per_month_target` is
-  blank). Both intended to be calculated when a day is Finalized/saved
-  to history, not computed live, mirroring the existing
-  `finalized_jobs`-based pattern already used for overtime tracking.
+- **Two new derived fields requested 2026-08-10, BUILT 2026-08-14 (Phase
+  24)** on the Drivers tab: "Balance Overtime / month"
+  (`max_overtime_hours_per_month` minus overtime actually used so far
+  this month, via `db.get_driver_month_overtime_hours`) and "Balance
+  hours / month" (`total_hours_per_month_target` minus total SPAN-hours
+  logged so far this month, via the new `db.get_driver_month_span_hours`).
+  Each field reads zero only when its OWN source field is blank --
+  Balance Overtime/month is gated by `max_overtime_hours_per_month`
+  being blank, Balance hours/month independently by
+  `total_hours_per_month_target` being blank (confirmed with the project
+  owner; the two are NOT coupled to each other, since most regular
+  drivers leave `total_hours_per_month_target` blank -- it's mainly for
+  temp drivers -- and coupling both fields to that one blank would have
+  made Balance Overtime/month useless for the common case). Both are
+  recomputed live from `finalized_jobs` each time a driver is selected on
+  the Drivers tab (same pattern the existing "hours logged this month"
+  label already used) -- the underlying numbers only change when a day
+  is actually Finalized, but there's no separate caching/persistence
+  layer. Built only after fixing two pre-existing bugs found while
+  scoping this work (Phase 23): a live `NameError` in
+  `_fill_gaps_with_unresolved_jobs`, and `get_driver_month_overtime_hours`
+  itself still measuring summed job duration instead of duty SPAN,
+  contradicting Phase 21. See `CHANGELOG_AI.md` Phases 23-24 for the
+  full writeup.
 
 ---
 

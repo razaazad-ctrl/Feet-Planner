@@ -94,9 +94,17 @@ class DriversTab(QWidget):
         self.max_overtime_input.setPlaceholderText("e.g. 20  (leave blank = unlimited overtime)")
         form.addRow("Max overtime hours / month:", self.max_overtime_input)
 
+        self.balance_overtime_label = QLabel("")
+        self.balance_overtime_label.setStyleSheet("color: #888888; font-size: 11px;")
+        form.addRow("Balance overtime / month:", self.balance_overtime_label)
+
         self.monthly_target_input = QLineEdit()
         self.monthly_target_input.setPlaceholderText("e.g. 208  (mainly for temp drivers)")
         form.addRow("Total hours / month target:", self.monthly_target_input)
+
+        self.balance_hours_label = QLabel("")
+        self.balance_hours_label.setStyleSheet("color: #888888; font-size: 11px;")
+        form.addRow("Balance hours / month:", self.balance_hours_label)
 
         self.license_types_input = QLineEdit()
         self.license_types_input.setPlaceholderText("e.g. 5 Ton Chiller Truck (with lift), Driver Only")
@@ -203,6 +211,8 @@ class DriversTab(QWidget):
         self.shift_period_input.setCurrentIndex(0)
         self.notes_list.clear()
         self.month_hours_label.setText("")
+        self.balance_overtime_label.setText("")
+        self.balance_hours_label.setText("")
 
     def _load_form(self, driver_id):
         row = self.conn.execute("SELECT * FROM drivers WHERE id = ?", (driver_id,)).fetchone()
@@ -219,6 +229,41 @@ class DriversTab(QWidget):
         today = date.today()
         month_hours = db.get_driver_month_to_date_hours(self.conn, driver_id, today.year, today.month)
         self.month_hours_label.setText(f"Hours logged this month so far (from finalized days): {month_hours:.1f}")
+
+        # Balance Overtime / month: gated by max_overtime_hours_per_month
+        # specifically (not total_hours_per_month_target) -- each balance
+        # field reads zero only when its OWN source field is blank.
+        max_overtime = row["max_overtime_hours_per_month"]
+        if max_overtime is None:
+            self.balance_overtime_label.setText("0.0  (no monthly overtime configured)")
+            self.balance_overtime_label.setStyleSheet("color: #888888; font-size: 11px;")
+        else:
+            working_hours = row["working_hours_per_day"]
+            if working_hours is None:
+                # No daily baseline to measure excess against -- mirrors
+                # build_driver_profiles()'s own fallback (treats missing
+                # working_hours_per_day as zero overtime-so-far) rather
+                # than crashing on a None subtraction.
+                overtime_used = 0.0
+            else:
+                overtime_used = db.get_driver_month_overtime_hours(self.conn, driver_id, today.year, today.month, working_hours)
+            balance_overtime = max_overtime - overtime_used
+            color = "#c0392b" if balance_overtime < 0 else "#888888"
+            self.balance_overtime_label.setText(f"{balance_overtime:.1f}  ({overtime_used:.1f} used of {max_overtime:.1f})")
+            self.balance_overtime_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+        # Balance hours / month: gated by total_hours_per_month_target
+        # specifically -- independent of the overtime field above.
+        monthly_target = row["total_hours_per_month_target"]
+        if monthly_target is None:
+            self.balance_hours_label.setText("0.0  (no monthly target configured)")
+            self.balance_hours_label.setStyleSheet("color: #888888; font-size: 11px;")
+        else:
+            span_hours_logged = db.get_driver_month_span_hours(self.conn, driver_id, today.year, today.month)
+            balance_hours = monthly_target - span_hours_logged
+            color = "#c0392b" if balance_hours < 0 else "#888888"
+            self.balance_hours_label.setText(f"{balance_hours:.1f}  ({span_hours_logged:.1f} logged of {monthly_target:.1f})")
+            self.balance_hours_label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
         rules = db.get_driver_rules(self.conn, driver_id)
         self.notes_list.blockSignals(True)
