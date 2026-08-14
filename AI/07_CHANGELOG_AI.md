@@ -3892,3 +3892,157 @@ this prompted about keeping changelog entries appended in one place.)*
   owner's own "before widening the dialog" framing; reported back with
   concrete numbers rather than silently widening it.
 - No other `/AI` file needed updating this phase.
+
+## Phase 28y — Dialog widened; picture repositioned to genuinely clear column 0 (2026-08-14, same session as Phase 28/28b-28y)
+
+- **Requested:** widen the dialog now that Phase 28x established there
+  genuinely isn't room for the picture at 1050px width, confirmed four
+  different ways rather than assumed.
+- **A second problem found while implementing this, not just the
+  overflow already known about:** re-measured at several candidate
+  widths (1050/1250/1450) before picking one, rather than guessing --
+  found that `picture_label`'s free-floating x position (887, inherited
+  from wherever it happened to sit before Phase 28x pulled it out of the
+  grid) is *less* than column 0's real rightmost extent (1045, from
+  Phase 28x's maxWidth caps). This means the picture was already
+  overlapping the tail end of Ad. Certificate #/Expiry's text
+  regardless of dialog width -- widening the dialog alone would only
+  have fixed the right-edge overflow, not this separate overlap on the
+  picture's left side.
+- **Fixed both together:**
+  - `picture_label` repositioned in `vehicle_info_section.ui` from
+    `x=887` to `x=1065` (past column 0's measured 1045px extent, with a
+    20px clearance margin) -- both the `geometry` and `pos` properties
+    updated together this time (the Phase 28w lesson: `QUiLoader` uses
+    `pos` with final authority for free-floating widgets, updating only
+    `geometry` silently does nothing).
+  - Dialog's default width (`__init__`, still going through the
+    existing Phase 28i screen-availability clamp unchanged) widened
+    from 1050 to 1450 -- covers `1065 (picture x) + 314 (picture width)
+    + ~70px margin`.
+- **Tested:** confirmed at the true target width (1450, simulating a
+  normal monitor -- this session's headless environment's own tiny
+  virtual screen otherwise clamps the dialog down via the existing Phase
+  28i logic, which is correct behavior for a genuinely small screen but
+  not representative of a real one, so verified explicitly against an
+  unclamped size) that column 0's rightmost extent (1045) and the
+  picture's left edge (1089 in dialog-absolute coordinates -- 1065 plus
+  the dialog's own 24px content margin) now have a clean 44px gap
+  between them, and the picture's right edge sits 47px inside the
+  dialog's own right edge (no overflow, previously -175px/-225px
+  overflow depending on width tested). A full-dialog screenshot was
+  rendered and visually confirms the wider layout with no visible
+  overlap and genuine empty space reserved for the picture. Full
+  existing `tests/` suite and the Phase 28b functional GUI test re-run
+  clean, no regressions.
+- **What did NOT change:** the dialog's minimum size (still 950x700,
+  unchanged -- only the *default/target* opening width grew); the
+  screen-availability clamp logic itself (Phase 28i); Chassis/Engine/
+  RTA/Ad Certificate's own positions and the Phase 28x maxWidth caps
+  that keep them tight; the picture's own size (314x145).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28z — Picture doubled in size (100% bigger); two more real bugs found and fixed along the way (2026-08-14, same session as Phase 28/28b-28z)
+
+- **Requested:** the vehicle picture looks too small in the empty space
+  next to it now (per a real screenshot) -- enlarge it by at least 100%,
+  up to 150%.
+- **Picture size:** `picture_label` 314x145 -> 628x290 (exactly 2x,
+  100% bigger, preserving the original aspect ratio -- the middle of
+  the requested 100-150% range). Dialog default width widened again,
+  1450 -> 1800, to keep the larger picture from overflowing the right
+  edge (same `x=1065` position, `1065 + 628 + ~25px margin` needs
+  ~1720px minimum).
+- **Real bug #1, found immediately on the first test -- the resize
+  silently did nothing:** updated the picture's `geometry`/`size`/
+  `minimumSize`/`maximumSize`/`frameRect` properties in the `.ui` file
+  (all the `<width>314</width>`/`<height>145</height>` pairs), reloaded,
+  and the label was still 314x145. Root cause: `QLabel` *also* has
+  separate scalar `minimumWidth`/`minimumHeight`/`maximumWidth`/
+  `maximumHeight` properties (`<number>` elements, a different XML shape
+  from the `<size>`/`<rect>` blocks already updated) that were still
+  314/145 -- `maximumWidth`/`maximumHeight` were silently capping it
+  straight back down regardless of everything else. Found by testing
+  the standalone `.ui` file in isolation (ruling out the dialog/Python
+  side first) before finding the actual property. Fixed by updating
+  those four separately; verified the label genuinely reports 628x290
+  afterward, not assumed from the file edit alone.
+- **Real bug #2, a functional bug entirely independent of this resize,
+  not just a layout quirk -- the real vehicle photo has been rendering
+  small since Phase 28o:** `_load_vehicle()`'s pixmap scaling was
+  hardcoded to `pixmap.scaled(150, 100, ...)` -- the box's size from
+  *before* Phase 28o ever enlarged `picture_label` to 314x145. Every
+  phase since (28o, 28r, this one) changed the label's own box size but
+  never touched this line, so the actual uploaded vehicle photo has
+  been rendering at a fixed tiny 150x100 and just sitting centered
+  inside a much bigger, mostly-empty box this entire time -- likely
+  the real reason the picture "looked small" even before this specific
+  request. Fixed to read `self.picture_label.width()`/`.height()`
+  dynamically instead of a hardcoded value, so it automatically stays
+  correct through any future resize, in code or in Designer, without
+  needing this line touched again. Verified with a synthetic 600x400
+  test photo: now renders at 435x290 (correctly filling the new box's
+  full height via `KeepAspectRatio`), not 150x100.
+- **Real bug #3, a genuine vertical overlap, measured not assumed:**
+  `section`'s own reported height comes from `infoRow`'s grid sizeHint,
+  which only accounts for column 0 (the plate and picture are
+  free-floating, not grid-managed, since Phase 28w/28x) -- enlarging the
+  picture didn't grow `section`'s reported height at all, so the
+  divider/cards/table below it (each added via a separate
+  `root.addWidget()`/`addLayout()` call in the dialog's own outer
+  `QVBoxLayout`) never moved down to make room. Measured a genuine 120px
+  overlap between the enlarged picture's bottom edge and the cards row
+  before fixing this. Fixed by explicitly computing the lowest bottom
+  edge of the plate and picture (whichever free-floating element
+  extends furthest down) and calling `section.setMinimumHeight()` to
+  match -- the standard, correct way to tell a `QVBoxLayout` an item
+  needs more room; the divider/cards/table shifted down accordingly
+  in response, exactly as regular layout items are meant to.
+- **Tested:** confirmed `picture_label` genuinely reports 628x290 after
+  the fix (not just that the file was edited); confirmed a real test
+  photo scales to fill the new box's height; confirmed the previously
+  measured 120px overlap became a 24px clear *gap* instead, both before
+  and after comparisons taken from actual widget geometry. A full-dialog
+  screenshot (with a synthetic photo, since this environment can't
+  supply a real one) visually confirms the enlarged picture, no overlap
+  with the cards row below or the text to its left. Full existing
+  `tests/` suite and the Phase 28b functional GUI test re-run clean, no
+  regressions.
+- **What did NOT change:** the plate's own size/position (Phase 28v,
+  untouched); Chassis/Engine/RTA/Ad Certificate's positions and width
+  caps (Phase 28x); the dialog's minimum size (still 950x700 -- only the
+  default/target width grew again).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28aa — Phase 28z's picture enlargement reverted (2026-08-14, same session as Phase 28/28b-28z)
+
+- **Reported:** Phase 28z's 2x picture enlargement (plus the dialog
+  widening and height-reservation fix that came with it) pushed the
+  divider/cards/table down too far, leaving too little vertical room
+  for the service-history table -- unacceptable, asked to revert to the
+  prior state.
+- **Reverted:** `picture_label` back to 314x145 in
+  `vehicle_info_section.ui` (all six size-related properties -- the
+  `<size>`/`<rect>`-based ones and the separate scalar `minimumWidth`/
+  `minimumHeight`/`maximumWidth`/`maximumHeight` ones found during Phase
+  28z); its position (`x=1065, y=11`) was untouched by Phase 28z in the
+  first place, so nothing to revert there. Dialog default width back to
+  1450 (was briefly 1800). The `section.setMinimumHeight(...)` fix
+  written specifically to make room for the larger picture was removed
+  entirely -- it only mattered because the picture had grown taller than
+  the row's natural height, which is no longer true at 314x145.
+- **Explicitly kept, per instruction:** the dynamic pixmap-scaling fix
+  in `_load_vehicle()` (`self.picture_label.width()`/`.height()` instead
+  of the old hardcoded `150, 100`) -- a genuine, independent bug fix
+  (the real uploaded photo had been rendering small regardless of the
+  box's own size since Phase 28o) that has nothing to do with what size
+  the box itself ends up being.
+- **Tested:** confirmed `picture_label` reports 314x145 again and its
+  position is unchanged; confirmed the cards row's top position matches
+  its exact pre-Phase-28z measurement (y=261, same dialog/data). Full
+  existing `tests/` suite and the Phase 28b functional GUI test re-run
+  clean, no regressions.
+- **What did NOT change:** the pixmap-scaling fix (kept); the plate;
+  Chassis/Engine/RTA/Ad Certificate's positions and width caps; the
+  dialog's minimum size.
+- No other `/AI` file needed updating this phase.

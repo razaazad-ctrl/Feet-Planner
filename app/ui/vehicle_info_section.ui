@@ -4607,7 +4607,7 @@
      </property>
      <property name="geometry">
       <rect>
-       <x>887</x>
+       <x>1065</x>
        <y>11</y>
        <width>314</width>
        <height>145</height>
@@ -4615,7 +4615,7 @@
      </property>
      <property name="pos" stdset="0">
       <point>
-       <x>887</x>
+       <x>1065</x>
        <y>11</y>
       </point>
      </property>

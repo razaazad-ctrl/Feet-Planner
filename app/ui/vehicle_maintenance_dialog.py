@@ -127,7 +127,21 @@ class VehicleMaintenanceDialog(QDialog):
         # target size and leaving setMinimumSize(950, 700) as a hard floor
         # would let a later setMinimumSize call force the width/height
         # straight back past the clamp on a small/constrained screen.
-        target_w, target_h = 1050, 950
+        # Widened from 1050 (Phase 28y): measured that Chassis/Engine/RTA/
+        # Ad. Certificate's real content (even after Phase 28x's maxWidth
+        # caps) reaches ~1045px on its own, and the free-floating picture
+        # needs to start past that (1065, see vehicle_info_section.ui) to
+        # avoid overlapping it -- 1065 + 314px picture + ~20px right
+        # margin needs ~1400px minimum; 1450 leaves a bit of breathing
+        # room rather than sitting exactly at the wall.
+        #
+        # Phase 28z briefly doubled the picture to 628x290 and widened
+        # this to 1800 to match -- reverted at the project owner's
+        # request (pushed the cards/table row down too far, leaving too
+        # little vertical room for the service-history table). Back to
+        # 1450/314x145; the picture's dynamic-scaling fix from that phase
+        # was kept (see _load_vehicle()).
+        target_w, target_h = 1450, 950
         min_w, min_h = 950, 700
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
@@ -466,8 +480,20 @@ class VehicleMaintenanceDialog(QDialog):
             pixmap = QPixmap()
             pixmap.loadFromData(row["vehicle_picture"])
             if not pixmap.isNull():
+                # Scaled to picture_label's own actual current size, not a
+                # hardcoded value -- a real, previously undiscovered bug:
+                # this was still hardcoded to 150x100 (the box's original
+                # Phase 28-era size) even after later phases enlarged the
+                # label itself to 314x145 and beyond, so the real photo
+                # was always rendering small and centered inside a much
+                # bigger, mostly-empty box. Reading the label's own size
+                # here means it automatically stays correct through any
+                # future resize of picture_label, in code or in Designer.
                 self.picture_label.setPixmap(
-                    pixmap.scaled(150, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    pixmap.scaled(
+                        self.picture_label.width(), self.picture_label.height(),
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                    )
                 )
         else:
             self.picture_label.setText("No picture")
