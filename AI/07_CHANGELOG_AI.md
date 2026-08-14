@@ -2111,3 +2111,114 @@ this prompted about keeping changelog entries appended in one place.)*
   `AI_CONTEXT.md`, `DATABASE.md`, `BUSINESS_RULES.md`, `NEXT_SESSION.md`,
   or `AI_INDEX.json` -- this popup isn't described at that level of
   detail in any of those files.
+
+## Phase 26 — Background-threaded Run Planning: a busy indicator that actually animates (2026-08-14, same day as Phase 22-25)
+
+- **Reported symptom:** clicking "Run Planning" gave no feedback while the
+  solver ran -- "feels like the whole thing is stuck doing nothing." The
+  project owner asked for a waiting/loading indicator and specifically
+  asked to research current industry practice first, rather than just
+  adding a spinner.
+- **Research done before implementing (not from memory alone):** for a
+  wait in the 2-10 second range (this solve's typical duration -- 3.78s
+  measured on the 44-trip real file, up to the 15s `time_limit_seconds`
+  ceiling on harder days), current guidance is a simple looping/marquee
+  busy indicator, not a fake determinate progress bar (CP-SAT doesn't
+  expose a real linear percentage to report, so a determinate bar would
+  be dishonest UX). Feedback needs to land within ~1 second of the click.
+  Critically, the research also surfaced *why* it felt stuck, not just
+  that it lacked a spinner: `_on_run` called `allocate_by_solver()`
+  directly on the GUI thread, so Qt's event loop couldn't paint or
+  animate anything for the whole solve -- a spinner widget alone, without
+  moving the work off the GUI thread, would have rendered as a single
+  frozen frame, not an animation. The standard PySide6/PyQt fix is a
+  background `QThread` with signals reporting completion back to the
+  main thread -- confirmed against multiple current sources before
+  building anything.
+- **This is the first threaded code anywhere in this app.** Called out
+  explicitly as a real architectural addition (Rule 13), not folded
+  silently into what could look like a cosmetic change -- confirmed with
+  the project owner before implementing, since introducing threading is
+  materially different in risk from every other UI change made this
+  session.
+- **Implementation** (`app/ui/plan_day_tab.py`):
+  - New `_SolverWorker(QObject)` with three signals -- `finished(dict)`
+    (solver_status on success), `missing_dependency(str)` (the `ortools`
+    `ImportError` case, same message as Phase 22 before this), and
+    `failed(str)` (any other unexpected exception -- explicitly added so
+    a background-thread crash can never vanish silently or leave the UI
+    stuck in "Running..." forever, matching this project's "never
+    silently swallow errors" convention). `run()` wraps the exact same
+    `allocate_by_solver(...)` call `_on_run` used to make directly.
+  - `_on_run` now: runs the three `build_*_profiles` calls synchronously
+    (cheap DB reads, not worth backgrounding), gives immediate feedback
+    (disables Run Planning + Upload buttons, changes the button text to
+    "Running...", shows a new indeterminate `QProgressBar`
+    (`setRange(0, 0)`), updates the status label) BEFORE starting the
+    thread, then constructs the worker, moves it to a `QThread`, wires
+    all three signals to dedicated slots, and starts it. `self._run_thread`
+    / `self._run_worker` are held as instance attributes -- an
+    unreferenced `QThread` can be garbage-collected mid-run and crash the
+    app, a well-documented PySide6 footgun avoided here deliberately, not
+    by accident.
+  - `_on_run_finished`, `_on_run_missing_dependency`, `_on_run_failed`:
+    the exact same post-solve logic `_on_run` used to run synchronously
+    (render results, enable AI Review/Finalize/Export/Summary, show the
+    OPTIMAL/FEASIBLE status text from Phase 22) now lives in
+    `_on_run_finished`, reached via the `finished` signal instead of a
+    direct return. `_reset_run_controls()` (shared by all three outcomes)
+    restores the button/progress-bar state whether the run succeeded or
+    failed.
+  - `self.jobs` is mutated in place by the background thread, same as
+    `allocate_by_solver()` has always done -- documented explicitly as
+    safe here because nothing on the GUI thread reads `self.jobs` between
+    starting the thread and receiving its completion signal (every button
+    that would read it stays disabled for the whole run). Flagged in
+    `ARCHITECTURE.md` as an invariant future changes must not silently
+    break.
+- **Tested:**
+  - Full existing test suite re-run clean (this phase touches no
+    allocation-engine or `db.py` code).
+  - A functional smoke test using Qt's `offscreen` platform plugin (no
+    physical display needed) actually drove the real event loop: clicked
+    Run Planning programmatically against the real `UNPLANNED.xlsx` +
+    `fleetplanner.db`, confirmed the immediate-feedback state took effect
+    on the very next event-loop tick (button disabled, text changed to
+    "Running...", upload disabled, status label updated), then polled
+    until the background thread completed and confirmed the final state
+    matched the old synchronous behavior exactly: 44/44 in-house, 0
+    unresolved, `last_drivers` populated, status text "Solved optimally
+    (proven best plan)."
+  - The progress bar's own `isVisible()` read `False` in the very first
+    version of this test -- traced to the test harness never having called
+    `.show()` on the tab (Qt's `isVisible()` requires the whole ancestor
+    chain to be shown, not just the widget's own flag), not a real bug;
+    re-verified `True` once the tab was actually shown, confirming the
+    widget-level logic was correct all along.
+  - Both failure paths tested by monkeypatching `allocate_by_solver` to
+    raise `ImportError` and a generic `RuntimeError` respectively (via
+    the offscreen harness, with `QMessageBox.critical` also patched to
+    avoid blocking on a real click) -- both correctly reset every button/
+    progress-bar state and surfaced the right dialog title ("Planning
+    engine not installed" vs. "Run Planning failed").
+  - **NOT performed, explicitly disclosed:** an actual click-through with
+    a real display and a real mouse click (no attached display in this
+    session's environment) -- the offscreen harness exercises the real
+    Qt event loop and real signal/slot wiring, which is what actually
+    validates the threading correctness, but visually confirming the
+    progress bar's on-screen appearance/animation is still worth a quick
+    manual look.
+- **What did NOT change:** no allocation-engine or database code touched.
+  `allocate_by_solver()` itself, its `solver_status_out` contract (Phase
+  22), and every hard business rule are unaffected -- this phase is
+  purely about which thread the existing call happens on and what the UI
+  shows while it runs.
+- **Disclosed, not built:** no cancellation support, and no explicit
+  handling for closing the tab/window while a run is in flight -- out of
+  scope for what was asked, not a silent gap (see `ARCHITECTURE.md`
+  Section 3.2).
+- `ARCHITECTURE.md` (new Section 3.2, "Background-threaded Run Planning",
+  plus the Section 4 function-flow update) updated to match (Rule
+  14/17/19). No change needed to `AI_CONTEXT.md`, `DATABASE.md`,
+  `BUSINESS_RULES.md`, `NEXT_SESSION.md`, or `AI_INDEX.json` -- no
+  business rule, schema, or allocation-behavior change this phase.

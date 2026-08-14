@@ -15,10 +15,10 @@ The daily workflow screen:
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit,
     QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QHeaderView,
-    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout
+    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout, QProgressBar
 )
 from PySide6.QtGui import QColor, QPixmap, QPainter, QPen, QBrush
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, QObject, Signal
 from pathlib import Path
 
 from app import db
@@ -35,6 +35,44 @@ UNRESOLVED_COLOR = QColor("#5a2020")
 SUPPLIER_COLOR = QColor("#3a3a20")
 
 
+class _SolverWorker(QObject):
+    """Runs allocate_by_solver() on a background thread. Added 2026-08-14
+    so Run Planning stops blocking the GUI event loop for the whole solve
+    (previously up to ~15s) -- that's why the app used to look frozen
+    rather than working: nothing could paint or animate while the solve
+    ran synchronously on the main thread. Mutates the jobs list it's given
+    in place, same as allocate_by_solver() always has; the caller must not
+    touch that list again until `finished` fires."""
+    finished = Signal(dict)
+    missing_dependency = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, jobs, drivers, vehicles, supplier_offerings):
+        super().__init__()
+        self.jobs = jobs
+        self.drivers = drivers
+        self.vehicles = vehicles
+        self.supplier_offerings = supplier_offerings
+
+    def run(self):
+        solver_status = {}
+        try:
+            allocate_by_solver(
+                self.jobs, self.drivers, self.vehicles, self.supplier_offerings,
+                solver_status_out=solver_status,
+            )
+        except ImportError as e:
+            self.missing_dependency.emit(str(e))
+            return
+        except Exception as e:
+            # Never let a background-thread exception vanish silently --
+            # surface it the same way a synchronous crash would have,
+            # rather than leaving the UI stuck in "Running..." forever.
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(solver_status)
+
+
 class PlanDayTab(QWidget):
     def __init__(self, conn, parent=None):
         super().__init__(parent)
@@ -42,6 +80,9 @@ class PlanDayTab(QWidget):
         self.jobs = []
         self.uploaded_path = None
         self.last_drivers = []
+        self._run_thread = None
+        self._run_worker = None
+        self._pending_drivers = None
         self._build_ui()
 
     def _build_ui(self):
@@ -89,6 +130,17 @@ class PlanDayTab(QWidget):
         run_row.addWidget(self.summary_btn)
         run_row.addWidget(self.summary_label, stretch=1)
         layout.addLayout(run_row)
+
+        # Indeterminate ("busy") progress bar -- Run Planning's solve time
+        # (a few seconds, up to a 15s time limit) doesn't have a real linear
+        # percentage to report, so a marquee-style bar is the honest choice
+        # over a fake determinate one. Hidden until a run is in progress.
+        self.run_progress = QProgressBar()
+        self.run_progress.setRange(0, 0)
+        self.run_progress.setTextVisible(False)
+        self.run_progress.setMaximumHeight(6)
+        self.run_progress.setVisible(False)
+        layout.addWidget(self.run_progress)
 
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("Filter by driver/supplier:"))
@@ -154,19 +206,42 @@ class PlanDayTab(QWidget):
             )
             return
 
-        solver_status = {}
-        try:
-            allocate_by_solver(self.jobs, drivers, vehicles, supplier_offerings, solver_status_out=solver_status)
-        except ImportError as e:
-            QMessageBox.critical(
-                self, "Planning engine not installed",
-                "Run Planning needs the 'ortools' package, which isn't installed on this "
-                "computer.\n\nAsk whoever set up this app to run:\n\n    pip install ortools\n\n"
-                "then try Run Planning again.\n\n" + str(e)
-            )
-            return
+        # Immediate feedback (within a second of the click) BEFORE the solve
+        # even starts, then the actual solve runs on a background thread so
+        # this bar can genuinely animate instead of the whole window
+        # freezing for the next few seconds.
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Running...")
+        self.upload_btn.setEnabled(False)
+        self.run_progress.setVisible(True)
+        self.summary_label.setStyleSheet("")
+        self.summary_label.setText("Planning your day... this can take a few seconds.")
 
-        self.last_drivers = drivers
+        self._pending_drivers = drivers
+        self._run_thread = QThread(self)
+        self._run_worker = _SolverWorker(self.jobs, drivers, vehicles, supplier_offerings)
+        self._run_worker.moveToThread(self._run_thread)
+        self._run_thread.started.connect(self._run_worker.run)
+        self._run_worker.finished.connect(self._on_run_finished)
+        self._run_worker.missing_dependency.connect(self._on_run_missing_dependency)
+        self._run_worker.failed.connect(self._on_run_failed)
+        for signal in (self._run_worker.finished, self._run_worker.missing_dependency, self._run_worker.failed):
+            signal.connect(self._run_thread.quit)
+            signal.connect(self._run_worker.deleteLater)
+        self._run_thread.finished.connect(self._run_thread.deleteLater)
+        self._run_thread.start()
+
+    def _reset_run_controls(self):
+        self.run_progress.setVisible(False)
+        self.run_btn.setText("Run Planning")
+        self.run_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+
+    def _on_run_finished(self, solver_status):
+        self.last_drivers = self._pending_drivers
+        self._pending_drivers = None
+        self._reset_run_controls()
+
         self._render_results()
         self.ai_review_btn.setEnabled(True)
         self.finalize_btn.setEnabled(True)
@@ -197,6 +272,23 @@ class PlanDayTab(QWidget):
             self.summary_label.setText(
                 self.summary_label.text() + "   (day notes recorded — will be used once the AI review layer is added)"
             )
+
+    def _on_run_missing_dependency(self, detail):
+        self._pending_drivers = None
+        self._reset_run_controls()
+        self.summary_label.setText("")
+        QMessageBox.critical(
+            self, "Planning engine not installed",
+            "Run Planning needs the 'ortools' package, which isn't installed on this "
+            "computer.\n\nAsk whoever set up this app to run:\n\n    pip install ortools\n\n"
+            "then try Run Planning again.\n\n" + detail
+        )
+
+    def _on_run_failed(self, detail):
+        self._pending_drivers = None
+        self._reset_run_controls()
+        self.summary_label.setText("")
+        QMessageBox.critical(self, "Run Planning failed", f"Run Planning failed unexpectedly:\n\n{detail}")
 
     def _on_ai_review(self):
         anthropic_key = db.get_setting(self.conn, ANTHROPIC_KEY_SETTING)

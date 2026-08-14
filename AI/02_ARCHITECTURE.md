@@ -229,6 +229,69 @@ reporting layer over `PlanDayTab.self.jobs` (plus, as of 2026-08-14 Phase
 This keeps the summary a true snapshot of the plan currently visible in memory,
 including any future planner edits made before export/finalization.
 
+## 3.2 Background-threaded Run Planning
+
+New 2026-08-14 (Phase 26). Before this, `PlanDayTab._on_run` called
+`allocate_by_solver()` directly on the GUI thread -- since a solve can take
+up to `time_limit_seconds` (15s default), Qt's event loop couldn't paint,
+animate, or respond to anything for that whole window, so the app visibly
+froze (and Windows itself could flag it as "Not Responding"). This is
+**the first threaded code anywhere in this app** -- a deliberate, real
+architectural addition, not a cosmetic tweak, called out explicitly rather
+than folded silently into a UI-polish change.
+
+```
+_SolverWorker(QObject)                      # app/ui/plan_day_tab.py
+├── finished = Signal(dict)                 # solver_status on success
+├── missing_dependency = Signal(str)        # ortools ImportError detail
+├── failed = Signal(str)                    # any other unexpected exception
+└── run()                                   # calls allocate_by_solver(),
+                                               executed on the QThread, never
+                                               on the GUI thread
+```
+
+`PlanDayTab._on_run`:
+1. Runs the three `build_*_profiles(conn, db)` calls synchronously (cheap
+   DB reads, not worth backgrounding).
+2. Gives immediate feedback (within ~0ms of the click, before the thread
+   even starts): disables `run_btn` and `upload_btn`, changes `run_btn`'s
+   text to "Running...", shows an indeterminate `QProgressBar`
+   (`setRange(0, 0)` -- a marquee/busy bar, not a fake determinate one,
+   since CP-SAT doesn't expose a real linear progress percentage to
+   report), and sets `summary_label` to a "Planning your day..." message.
+3. Constructs a `_SolverWorker`, moves it to a new `QThread`, connects
+   `thread.started -> worker.run`, connects all three of the worker's
+   signals back to dedicated slots (`_on_run_finished`,
+   `_on_run_missing_dependency`, `_on_run_failed`), and starts the thread.
+   `self._run_thread` / `self._run_worker` are held as instance attributes
+   (not locals) -- a required PySide6 pattern, since an unreferenced
+   `QThread` can be garbage-collected mid-run and crash the app.
+4. `self._pending_drivers` holds the `DriverProfile` list built in step 1
+   until the worker reports back (needed for `self.last_drivers` once the
+   run completes -- `last_drivers` also feeds the Result Summary popup's
+   Overtime column, Section 3.1, and the AI Review hours summary).
+
+On completion (`finished`/`missing_dependency`/`failed`, whichever fires),
+each signal is separately connected to `thread.quit` and `worker.deleteLater`
+so the thread and worker clean themselves up; `_reset_run_controls()`
+(shared by all three outcomes) restores the button/progress-bar state.
+`_on_run_finished` then does exactly what `_on_run` used to do
+synchronously after the old direct call: render results, enable the other
+buttons, show the OPTIMAL/FEASIBLE status text (Phase 22).
+
+**`self.jobs` is mutated in place by the worker's background thread.**
+This is safe here specifically because nothing on the GUI thread reads
+`self.jobs` between starting the thread and receiving its completion
+signal (every button that would read it -- AI Review, Finalize, Export,
+Summary -- stays disabled for the whole run). Do not add any code that
+reads `self.jobs` while a run is in flight without re-checking this
+invariant.
+
+**Known, disclosed limitation (Rule 16/20), not addressed this phase:**
+no cancellation support, and no explicit handling if the tab/window is
+closed while a run is in flight. Out of scope for what was asked (a busy
+indicator so Run Planning doesn't feel frozen), not a silent gap.
+
 ## 4. Function flow — the daily workflow, end to end
 
 ```
@@ -248,15 +311,22 @@ including any future planner edits made before export/finalization.
    -> allocation_engine.build_supplier_offerings(conn, db) [reads
       supplier_offerings joined with suppliers, computes
       cumulative_hours_history via db.get_supplier_cumulative_hours]
-   -> allocation_engine.allocate_by_solver(jobs, drivers, vehicles,
-      offerings, solver_status_out=solver_status)
+   -> (all three build_* calls above stay synchronous on the GUI thread --
+      cheap DB reads, not worth backgrounding)
+   -> **runs on a background QThread as of 2026-08-14, Phase 26** (see
+      "Background-threaded Run Planning" below): a `_SolverWorker(QObject)`
+      calls allocation_engine.allocate_by_solver(jobs, drivers, vehicles,
+      offerings, solver_status_out=solver_status) on that thread
       [MUTATES jobs in place -- CP-SAT constraint solver, see Section 5c
       for the algorithm. CHANGED 2026-08-14, Phase 22 -- this call site
       used to be allocate() (Section 5's hand-written heuristic); see
-      CHANGELOG_AI.md Phase 22 for why and how the switch was made.
-      Wrapped in try/except ImportError -- if `ortools` isn't installed,
-      shows a QMessageBox rather than crashing, since this is now a hard
-      runtime dependency for Run Planning.]
+      CHANGELOG_AI.md Phase 22 for why and how the switch was made.]
+   -> the worker emits one of three signals back to the GUI thread:
+      `finished(solver_status)` on success, `missing_dependency(detail)`
+      if `ortools` isn't installed (shows the same QMessageBox as before,
+      Phase 22), or `failed(detail)` for any other unexpected exception
+      (never silently swallowed -- shows a QMessageBox rather than hanging
+      forever in the "Running..." state)
    -> PlanDayTab._render_results() populates the QTableWidget,
       populates the driver/supplier filter dropdown, and the summary
       label shows the solver's OPTIMAL/FEASIBLE status in plain language
