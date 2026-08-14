@@ -114,8 +114,18 @@ automatically:
 3. **Suppliers** (`suppliers_tab.py`) — structured offerings (vehicle
    type + rate/hour + max available/day, repeatable per supplier) plus
    free-text AI notes. Same exclusion-toggle pattern.
-4. **Vehicles** (`vehicles_tab.py`) — plate, type, notes, workshop
-   toggle, and the same "don't use tomorrow" exclusion toggle.
+4. **Vehicles** (`vehicles_tab.py`) — plate, type, notes, and (as of
+   2026-08-14, Phase 28) a single Active/Deactive checkbox, same visual
+   pattern as Drivers/Suppliers's exclusion toggle -- replacing the old
+   separate "In Workshop" and "Don't Use Tomorrow" toggles, which did
+   overlapping jobs. Each row also has a wrench-icon button opening that
+   vehicle's **Vehicle Maintenance Log** (`vehicle_maintenance_dialog.py`)
+   — model/year/chassis/engine/registration, RTA/Ad certificate numbers
+   and expiry dates (red if expired), tyre size, battery type, a picture,
+   and a full service history (`service_records` table) with five
+   at-a-glance summary cards. Purely master-data/UI -- doesn't affect
+   `allocate()`/`allocate_by_solver()` in any way; see `ARCHITECTURE.md`
+   Section 3.3 and `DATABASE.md` for the structural detail.
 5. **Locations** (`locations_tab.py`) — short-code → real-address
    mapping for accurate Maps lookups (e.g. "CPK" → "Central Production
    Kitchen, Al Quoz, Dubai").
@@ -1073,10 +1083,13 @@ and CHANGELOG_AI.md Phases 15/16):**
   planning (spec SS-003), and showing month-to-date overtime-so-far on
   the Drivers tab (spec NEW-006) — both flagged as small, well-scoped
   follow-ups from the 2026-08-03 rework, not built yet.
-- Vehicle maintenance/inspection log — a planner-suggested feature,
-  explicitly deferred until the core planning flow is solid. Schema-wise
-  this is independent of everything else (a new table hanging off
-  `vehicles`), so it can be added later without touching existing code.
+- ~~Vehicle maintenance/inspection log~~ **BUILT 2026-08-14, Phase 28.**
+  See the Vehicles tab entry in Section 5 above, `ARCHITECTURE.md`
+  Section 3.3, and `DATABASE.md`'s `service_records` table. The concrete
+  design (exact fields, a linked service-history table, the Maintenance
+  Log window layout) came from the project owner's own mockups, not the
+  vague "drivers report issues, auto-timestamped, weekly printout" this
+  entry originally described -- that description is now obsolete.
 - The "restrict today's planning to a shortlist of drivers/suppliers"
   toggle — designed and agreed (per-day, optional, defaults to
   everyone), not yet implemented in the UI (the `allocate()` function

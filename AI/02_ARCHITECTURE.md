@@ -33,11 +33,28 @@ FleetPlanner/
 │       ├── plan_day_tab.py        # Daily workflow screen, result table, filters, summary popup (largest UI file)
 │       ├── drivers_tab.py         # Structured driver hard rules + AI notes
 │       ├── suppliers_tab.py       # Structured supplier offerings + AI notes
-│       ├── vehicles_tab.py        # Vehicle roster + workshop/exclusion toggle
+│       ├── vehicles_tab.py        # Vehicle roster + Active/Deactive toggle (Phase 28)
+│       ├── vehicle_maintenance_dialog.py  # Vehicle Maintenance Log window (Phase 28, new)
 │       ├── locations_tab.py       # Short-code -> address mapping
 │       ├── settings_tab.py        # API keys, PIN, digest refresh control
-│       └── entity_rules_widget.py # LEGACY/unused generic widget (see below)
+│       ├── entity_rules_widget.py # LEGACY/unused generic widget (see below)
+│       ├── trip_clipart.png       # Summary popup trip-card icon
+│       ├── vehicle_maintenance_icon.png   # Maintenance Log window title icon (Phase 28)
+│       ├── maintenance_log_button.png     # Vehicles-tab per-row wrench button icon (Phase 28)
+│       ├── plate_background.png           # Blank plate graphic behind the Plate field (Phase 28)
+│       ├── vehicle_expiry_icon.jpg        # "Vehicle Expiry" summary-card icon (Phase 28)
+│       ├── tyre_icon.png, battery_icon.png, chiller_icon.png, oilfilter_icon.png
+│       │                                  # the other four summary-card icons (Phase 28)
 ```
+
+All image assets are plain files sitting beside the `.py` files that use
+them, loaded via `Path(__file__).with_name(...)` / `Path(__file__).parent`
+-- the same pattern `trip_clipart.png` already established (see Section
+3.1). Not embedded in code, not a Qt `.qrc` resource bundle -- both were
+considered and rejected as unnecessary for this project's scale (see
+`CHANGELOG_AI.md` Phase 28 for the reasoning). If this app is ever
+packaged into a `.exe` (still deferred), the packaging step will need to
+explicitly bundle these image files alongside the code.
 
 **`entity_rules_widget.py` status:** built early as a shared
 Drivers/Suppliers widget using free-text rule lines. Superseded by the
@@ -291,6 +308,198 @@ invariant.
 no cancellation support, and no explicit handling if the tab/window is
 closed while a run is in flight. Out of scope for what was asked (a busy
 indicator so Run Planning doesn't feel frozen), not a silent gap.
+
+## 3.3 Vehicle Maintenance Log
+
+New 2026-08-14 (Phase 28, revised same day in Phase 28b after the
+project owner reviewed the actual running window against their own
+mockup). `VehiclesTab` (`vehicles_tab.py`) gained a wrench-icon button
+per row (`COL_MAINTENANCE`) that opens `VehicleMaintenanceDialog`
+(`vehicle_maintenance_dialog.py`, new file) for that specific vehicle.
+Design came directly from the project owner's own reference images
+(`MISC/1.png`-`4.jpg` at design time, since deleted per the project
+owner's own cleanup) -- this section is the structural record of what
+was built from them, including a real design correction made after
+seeing the first version rendered.
+
+**Vehicles tab changes:**
+- Replaced the old separate "In Workshop" / "Don't Use Tomorrow" columns
+  and their two toggle buttons with a single Active/Deactive checkbox
+  column (`COL_ACTIVE`), using the exact same checkbox-in-table-item
+  pattern (`Qt.ItemIsUserCheckable`, `itemChanged` signal) Drivers/
+  Suppliers already use in their `QListWidget`s -- ported to
+  `QTableWidget` here since Vehicles has always been table-based, not
+  list+form-based, and the project owner's own mockup kept it that way.
+  Checked = active/included; unchecked = excluded, row turns orange
+  (`EXCLUDED_COLOR`) and sorts to the bottom, identical visual convention
+  to Drivers/Suppliers.
+- `db.set_vehicle_workshop_status()` was deleted outright (not just
+  deprecated) -- nothing calls it anymore, matching the precedent set
+  when `_parse_shift_start_time`/`_job_is_before_shift_start` were fully
+  removed from `allocation_engine.py` once `shift_period` replaced
+  `shift_start` (the DB *column* stays either way, since this project's
+  migration system can't drop columns -- only the now-dead *code* was
+  removed).
+- `allocation_engine.build_vehicle_profiles()` no longer reads
+  `in_workshop` -- `excluded_from_planning` alone now decides
+  `VehicleProfile.in_workshop` (the dataclass field name itself was kept
+  unchanged, to avoid touching every candidate-filter call site across
+  `allocation_engine.py` that already reads it; only what feeds it
+  changed).
+- **`EditVehicleDialog` (Phase 28b) is now the ONLY place any vehicle
+  field is edited.** Expanded from its original 3 fields (Plate, Type,
+  Capacity/Notes) to cover every column on `vehicles`, including the
+  detail fields that originally lived in `VehicleMaintenanceDialog`
+  (model, year, chassis, engine, registration + expiry, tyre size,
+  battery type, both certificates + their expiries, picture with a file
+  picker). Two-column `QFormLayout`/`QGridLayout` combo, ~640x560.
+  `basic_values()` feeds the existing `db.update_vehicle()` (unchanged
+  signature), `maintenance_field_values()` feeds
+  `db.update_vehicle_maintenance_fields()` -- `VehiclesTab._on_edit`
+  calls both in sequence. Date fields are validated (YYYY-MM-DD or
+  blank) before the dialog will accept.
+
+**`VehicleMaintenanceDialog` (Phase 28b): a read-only report, not a
+form.** The project owner's direct feedback after seeing Phase 28's
+first version rendered: "the vehicle maintenance log will be just read
+only fields like a report. if we want to change anything we go in
+vehicle tab and click edit selected." Every vehicle-detail widget that
+was previously an editable `QLineEdit` (model, year, chassis, engine,
+registration, certificates, tyre size, battery type, details) is now a
+plain read-only `QLabel` (`objectName="fieldValue"`), laid out in a
+single flat `QGridLayout` with explicit `(row, col)` coordinates per
+field pair -- **not** two independent side-by-side `QFormLayout`s, which
+is what Phase 28's first version used and which visually overlapped
+(each `QFormLayout` negotiates its own row heights independently, and
+nesting two of them side-by-side in one grid cell doesn't force them to
+agree, so the taller-content column's rows drifted out of alignment
+with the shorter one and overlapped it -- root-caused directly from a
+rendered screenshot, not guessed). The flat-grid approach has no such
+negotiation to go wrong. Same section-level fix philosophy as the QThread
+worker-reference issue (Phase 26) and the QScrollArea theming issue
+(this same phase, see below): a rendered screenshot plus the concrete
+before/after comparison is what confirmed each fix, not just re-reading
+the code.
+- Header: title icon, "VEHICLE MAINTENANCE LOG", an Active/Deactive
+  checkbox -- kept here too (not moved exclusively into `EditVehicleDialog`)
+  per the project owner's explicit choice ("if it stays functional in
+  maint log as well then both... if keeping it makes things worse then
+  remove it") -- it's an operational status toggle, not a "detail" field
+  like model/chassis, and stayed functional/consistent with the Vehicles
+  tab's own checkbox (same `excluded_from_planning` column either way),
+  so it stayed in both places.
+- Vehicle info + detail fields: all read-only now (see above).
+- Five summary cards (Vehicle Expiry, Battery/Tyre/Oil/Chiller Change),
+  unchanged from Phase 28 -- built by `_refresh_cards()`, see
+  `DATABASE.md`'s `service_records` entry for exactly how "last service
+  of this type" is derived (a single `list_service_records` call, then a
+  plain Python dict keyed by `service_type`, no per-card query).
+- **Service history: rebuilt as an Access-style "Continuous Forms" grid
+  (Phase 28b), replacing Phase 28's separate add/edit-form-above-a-
+  read-only-table design entirely.** The project owner's own term and
+  reference behavior: every row in the `QTableWidget` is a live,
+  directly-editable record (native cell editing for the text/number
+  columns, a real `QComboBox` via `setCellWidget` for the Service Type
+  column so it always shows as a dropdown, not just when a row is
+  selected) -- no separate form, no per-row "Save" button. A row
+  auto-saves as soon as it's edited: `itemChanged` (plain cells) or a
+  combo box's `currentIndexChanged` triggers `_save_service_row(row)`,
+  which INSERTs via `db.add_service_record()` if that row has no
+  `service_records.id` yet (tracked in column 0's `Qt.UserRole`, set
+  once the INSERT returns an id) or UPDATEs otherwise -- verified by
+  test that editing an already-saved row updates in place rather than
+  creating a duplicate. `"+ Add a Record"` appends one blank editable
+  row at the bottom and scrolls to it; `self._suppress_save` guards
+  population/insertion so rows being constructed don't fire a premature
+  save. Date-format validation here is deliberately lenient (a cell with
+  an unparseable date simply isn't auto-saved yet, no interrupting
+  popup) -- appropriate for a live continuous grid, unlike
+  `EditVehicleDialog`'s modal validate-then-accept pattern. The table
+  always opens scrolled to the bottom (most recent rows) via
+  `scrollToBottom()`, matching the project owner's own "always show the
+  last rows that fit" note -- this reverts Phase 28's earlier
+  "deliberate adaptation" away from an editable grid (that adaptation
+  reasoned no editable-table-cell pattern existed elsewhere in this
+  codebase; the project owner's Continuous Forms clarification
+  explicitly asked for exactly that pattern here, so it's now the one
+  place in this app that has it).
+- **A separate, unrelated theming bug found and fixed in the same
+  review pass:** Phase 28's first version wrapped the dialog's content in
+  a `QScrollArea` for vertical overflow; the `QScrollArea`'s internal
+  viewport is a distinct widget that does not inherit a `QDialog {
+  background: ... }` stylesheet rule the way a plain child widget does,
+  so the window rendered with the app's OS-default dark background (no
+  app-level stylesheet exists anywhere else in this codebase) underneath
+  text colors that assumed a white one -- dark-on-dark, effectively
+  unreadable, confirmed from an actual rendered screenshot the project
+  owner shared. Fixed by dropping the `QScrollArea` entirely (content
+  sits directly on `self`, the same approach `DriverSupplierSummaryDialog`
+  / Summary popup already uses successfully) and explicitly styling
+  every remaining widget class used in the window (`QLineEdit` had
+  previously never in fact needed a rule here since Phase 28b removed
+  them from this dialog entirely, but `QComboBox`/`QPushButton`/
+  `QCheckBox` all needed explicit rules they hadn't had before, since
+  they'd been silently inheriting the OS theme rather than this dialog's
+  intended white/card look).
+
+- **Vehicle-info section now loaded from a `.ui` file at runtime (Phase
+  28p), a deliberate one-file exception to this codebase's normal
+  "hand-written Python widget construction" convention.** After several
+  rounds of visual-fit changes (plate sizing/position, picture
+  enlargement) that this session's headless `offscreen` Qt platform
+  couldn't verify against what the project owner actually saw, they
+  asked for a mouse-driven tool instead of continued code-only
+  iteration. `_build_vehicle_info()` (Model/Year, Type, Chassis, Engine,
+  RTA/Ad. Certificate, plate, picture) now loads
+  `app/ui/vehicle_info_section.ui` via `QUiLoader` (raw XML parsed at
+  every app launch, **no compile/`pyside6-uic` step, no
+  convert-back-to-Python step** -- an explicit project-owner requirement)
+  and pulls out its named children by `objectName` via `findChild()`
+  into the same `self.<attr>` names the rest of the class already uses
+  (`model_year_label`, `chassis_value`, `plate_display`,
+  `picture_label`, etc.) -- `_load_vehicle()` needed no changes beyond
+  one styling fix (below). The header, summary cards, and
+  service-history table are deliberately **not** part of this -- they're
+  populated/rebuilt dynamically at runtime
+  (`_refresh_cards()`/`_reload_service_records()`), which a static `.ui`
+  file isn't suited for, so they remain hand-written Python.
+  `app/ui/vehicle_info_section.ui` itself was generated once via
+  `QFormBuilder` (not hand-typed XML) from the exact prior Python
+  widget tree, then hand-verified and fixed for three round-trip
+  pitfalls a naive generate-and-load wouldn't have caught: (1)
+  `QFormBuilder` serializes each widget's literal `visible` state at
+  save time, so a never-`.show()`n generator script produces a file
+  where everything loads hidden -- the generator now calls `.show()`
+  before saving; (2) arbitrary dynamic properties (`setProperty()` with
+  a custom key) are **not** serialized by `QFormBuilder`, so
+  style-matching via a custom property + dialog-level attribute selector
+  silently matches nothing after a reload -- field label/value colors
+  and font sizes are baked directly into each widget's own `styleSheet`
+  property in the generator instead; (3) `setColumnStretch()` is a
+  method call, not a serialized property, so it must be (and is)
+  re-applied in Python immediately after loading. The project owner can
+  now open `vehicle_info_section.ui` in `designer.exe` (bundled with the
+  project's installed PySide6, no separate download) and adjust sizing/
+  position by mouse; saved changes take effect on the app's next launch.
+  Object names in the `.ui` file must stay in sync with the
+  `findChild(...)` calls in `_build_vehicle_info()` if renamed.
+  **Note, disclosed rather than silently dropped:** an earlier
+  Phase 28o mechanism that forced pixel-perfect horizontal centering for
+  the plate (by matching the picture's grid column width to the left
+  column's measured content width) was removed here -- tested against
+  the project owner's actual-length sample data (real chassis/engine/
+  certificate numbers, not placeholder text), the left column's natural
+  width alone (870px) exceeded what a normal dialog width has room to
+  mirror on both sides, so pixel-perfect centering was never reliably
+  achievable for realistic data in the first place, and continuing to
+  chase it in Python would work against the entire point of moving this
+  to a visually-editable file. Equal grid-column stretch remains as a
+  reasonable default; exact centering for their own real data is now
+  the project owner's to adjust in Designer.
+
+**What does NOT depend on any of this:** `allocation_engine.py` reads
+none of the new vehicle fields or `service_records` at all -- this is
+pure master-data/UI, same as every other Vehicles-tab field before it.
 
 ## 4. Function flow — the daily workflow, end to end
 

@@ -542,43 +542,61 @@ Section 3 below).
     summed job duration per day instead of duty SPAN, contradicting
     Phase 21's own corrected principle. See `CHANGELOG_AI.md` Phases
     23-24 for the full writeup.
+- **RESOLVED 2026-08-14 (Phase 27): validated `allocate_by_solver()`
+  against the bigger 81-trip `unPlanned_Full.xlsx`, per item 0's own
+  request above -- see that entry for the full result.** Two things worth
+  keeping in mind for future sessions: (1) **a blank/unrecognized Excel
+  header cell silently drops that entire column, for every row, with no
+  error** -- this is the exact fragility `excel_import.py`'s `_HEADER_MAP`
+  section (Section 4 below) already warned about in the abstract; this
+  session hit a real, concrete instance of it (a blank "Same Driver"
+  header cell in `unPlanned_Full.xlsx` caused 9 unresolved jobs that
+  looked like an algorithm/capacity problem but were actually a one-cell
+  data issue). If a future "why isn't X being read" report comes in,
+  check the header row's exact cell contents before assuming a code bug.
+  (2) **SR15 in `unPlanned_Full.xlsx` is a genuine, disclosed capacity
+  gap, not a bug:** needs `5 Ton Open Truck (with lift)`, only one
+  in-house vehicle of that type exists, and no supplier offers it either
+  -- the same class of finding as the 10-Ton-Chiller-Truck scarcity noted
+  earlier in this section, confirmed the same way (checked driver
+  licenses, in-house vehicle count, and supplier offerings directly,
+  not assumed). Not something to code around.
 
 ## 6. Recommended next improvements, roughly in priority order
 
 Based on what's explicitly still open and what would unblock the most
-value. **This list changed substantially after Phase 16, and got one
-more addition after Phase 21** -- the question that used to sit at
-position 0 ("should we move toward production, or keep iterating") has
-effectively been answered by results, not by discussion:
-`allocate_by_solver()` now reaches 0 unresolved / 0 supplier / all
-drivers used, PROVEN optimal, on the real file that motivated all of
-Phase 14/15/16's work, and Phase 21 corrected a foundational hard-rule
-bug (span vs. summed duration) across every strategy. The open questions
-now are about validating that this holds up on a bigger, more realistic
-file (one that actually needs some supplier use), a genuinely new
-feature the project owner asked for (the Balance fields), and closing
-real, already-disclosed gaps -- not about which algorithmic direction to
-pursue.
+value. **This list changed substantially after Phase 16, got an addition
+after Phase 21, and item 0 was resolved in Phase 27** -- the question
+that used to sit at position 0 ("should we move toward production, or
+keep iterating") has now been answered twice over: `allocate_by_solver()`
+reaches 0 unresolved / 0 supplier / all drivers used, PROVEN optimal, on
+the original 44-trip real file, AND (Phase 27) 48 in-house / 32 supplier
+/ 1 genuinely-unresolved on the bigger 81-trip file that actually needs
+supplier use -- both validated milestones the project owner set are now
+met. The open questions now are about closing real, already-disclosed
+test-coverage gaps and picking up the next genuinely new feature, not
+about production-readiness or which algorithmic direction to pursue.
 
-0. **Validate `allocate_by_solver()` against a bigger, real file that
-   includes genuine supplier need.** Now HIGHER priority than before
-   Phase 22 -- this strategy is the UI's production default as of
-   2026-08-14, not a side experiment, so any gap here is now a live-app
-   risk, not just an open research question. Everything validated so far
-   is the one `UNPLANNED.xlsx`
-   file the project owner deliberately built WITHOUT needing any
-   supplier, specifically to prove the in-house engine could handle it
-   alone first. The project owner's own words: "if this get[s] to 0
-   unresolved with following all the hard rules then i will be
-   confident to introduce the bigger schedule and will know that
-   suppliers used were necessary." That milestone is now reached -- the
-   next real test is a file where SOME supplier use is genuinely
-   expected, to confirm (a) the solver still resolves everything
-   in-house-first correctly, (b) supplier use only appears where truly
-   necessary (matching Rule 7), and (c) solve time stays reasonable at
-   a larger scale (the current file is 44 jobs / 11 drivers, solving in
-   a few seconds; a bigger file's actual size and solve time are both
-   unknowns until tested).
+0. ~~Validate `allocate_by_solver()` against a bigger, real file that
+   includes genuine supplier need~~ **RESOLVED 2026-08-14, Phase 27.**
+   The project owner supplied `unPlanned_Full.xlsx` (81 trips -- the same
+   real day as `UNPLANNED.xlsx`, but WITH the supplier trips left in).
+   Initial result looked concerning: 38 in-house / 34 supplier / 9
+   unresolved, vs. `UNPLANNED.xlsx`'s 44/0/0. Root-caused, not assumed:
+   the file's "Same Driver" column header cell was blank, so
+   `excel_import.py` (per the exact fragility already flagged in Section
+   4 below) silently never read that column for any of the 81 rows --
+   the grouping data was sitting in the file the whole time. Fixed with a
+   single header-cell edit (confirmed byte-for-byte identical otherwise
+   against the git-committed original). Final validated result:
+   **48 in-house / 32 supplier / 1 unresolved, solver status OPTIMAL**,
+   confirming all three things this item asked to confirm: (a) the solver
+   resolves everything in-house-first correctly, (b) supplier use appears
+   only where genuinely needed (32 of the 81 rows -- a real, expected mix,
+   not a fallback-avoidance failure), (c) solve time stayed reasonable at
+   81 jobs. The one remaining unresolved row (SR15) is a genuine capacity
+   gap, not a bug -- see Section 5's new entry. See `CHANGELOG_AI.md`
+   Phase 27 for the full investigation writeup.
 1. ~~Build "Balance Overtime / month" and "Balance hours / month"~~
    **RESOLVED 2026-08-14, Phase 24.** See Section 5's entry above for the
    full detail. Both fields are now live on the Drivers tab.
@@ -688,7 +706,184 @@ technically interesting — confirm priority with the user, since they've
 consistently driven prioritization decisions throughout this project
 rather than deferring to default technical judgment.
 
-## 7. How to work with this specific person
+## 7. New UI/DB feature requests (registered 2026-08-14, first item BUILT same day)
+
+Four requests given together in one session, after Phase 22-27. The
+project owner asked for these to be logged and numbered in recommended
+execution order — **recommended order was 4 -> 2 -> 1 -> 3**, reasoning
+under each item. **Item 4 (Section 7.1) was built the same day, Phase
+28.** The other three (7.2/7.3/7.4 below) have not been scoped in detail
+with the project owner yet beyond what's captured here -- treat those as
+"registered," not "designed."
+
+### 7.1 (do first) Vehicles tab overhaul + new Vehicle Maintenance Log
+
+**BUILT 2026-08-14, Phase 28.** See `CHANGELOG_AI.md` Phase 28,
+`ARCHITECTURE.md` Section 3.3, and `DATABASE.md`'s `vehicles`/
+`service_records` entries for the full implementation writeup. The
+`MISC/` reference images this section originally pointed to were deleted
+by the project owner after the feature was built (their own cleanup,
+expected) -- the rest of this subsection is kept as the historical spec
+record, not a pointer to files that still exist.
+
+**Vehicles tab changes:**
+- Add an Active/Deactive checkbox column, identical in behavior to the
+  existing Drivers/Suppliers pattern: unchecked = excluded from
+  planning, row turns orange and sorts to the bottom.
+- **Remove `in_workshop` ("In Workshop") and `excluded_from_planning`
+  ("Don't Use Tomorrow") as SEPARATE toggles entirely** -- the new
+  Active/Deactive checkbox replaces both. Real implication for whoever
+  builds this: `allocation_engine.build_vehicle_profiles()` currently
+  treats a vehicle as unavailable if EITHER `in_workshop` OR
+  `excluded_from_planning` is set (see `DATABASE.md`); collapsing to one
+  flag changes that to a single condition. The `in_workshop` DB column
+  itself likely can't be safely dropped outright (this project's
+  migration system is additive-only, see Section 3/4 above) -- probably
+  needs to become a deprecated, unread column following the same
+  precedent as `drivers.shift_start`, not an actual `DROP COLUMN`.
+- New button in the table, positioned just before the "Plate" column
+  (see `2.png`) -- a small wrench/gear icon that opens the Vehicle
+  Maintenance Log window for that specific row's vehicle.
+
+**New fields on the vehicles table** (see `3.png`, Table 1 -- 17 fields
+plus the Active/Deactive checkbox already covered above):
+`Vehicle_Picture` (image), `Vehicle_Model` (text), `Type` (text --
+already exists as `vehicle_type`), `Vehicle_Year` (number), `Plate`
+(already exists), `Vehicle_Chasis` (text/number), `Vehicle_Engine`
+(text/number), `Vehicle_Registration` (number), `Vehicle_Reg_Expiry`
+(date), `Tyre_Size` (text/number), `Battery_Type` (text/number),
+`Details` (text/number), `RTA_Certificate` (text/number),
+`RTA_Certificate_Expiry` (date), `Ad_Certificate` (text/number),
+`Ad_Certificate_Expiry` (date).
+
+**New `service` table** (see `3.png`, Table 2 -- linked to vehicles via
+`Plate`): `Start Date` (date), `End Date` (date), `Service Type` (combo
+box: Quotation / Oil-Filter Change / Chiller Unit Service / Accident /
+Battery Change / Repair / Mechanical Work / Body Work / Tyre Change),
+`Details` (text/number), `Current Reading` (number), `Next Reading`
+(number), `Qty` (number), `Person` (text/number), `Workshop`
+(text/number).
+
+**Vehicle Maintenance Log window** (see `4.jpg` for the full mockup --
+white/card-based modern theme, NOT the app's current dark theme):
+- Header: icon + "VEHICLE MAINTENANCE LOG" title, Active/Deactive
+  checkbox top-right, vehicle picture top-right (a transparent plate
+  graphic sits behind the Plate field, centered).
+- Vehicle_Model + Vehicle_Year on one line, Type below it, Plate shown
+  styled like a real plate.
+- VIN/Chassis, Engine#, Registration# on the left; RTA Certificate# +
+  expiry date and Ad Certificate# + expiry date on the right -- **both
+  expiry dates turn red font if expired.**
+- Five colored summary cards in a row: Vehicle Expiry, Battery Change,
+  Tyre Change, Oil Service, Chiller Service -- each shows the LAST
+  relevant date pulled from the Service table (e.g. Battery Change card
+  shows the most recent `Service Type = "Battery Change"` row's date),
+  plus battery type / tyre size shown inline, and "Next Reading" shown
+  for Oil Service and Chiller Service specifically (pulled from that
+  service type's last row).
+- A Service Table at the bottom matching the new `service` table's
+  columns, with a `Service Type` combo-box dropdown per row, and
+  Save/Edit/Delete buttons. **Explicit display rule from the mockup:**
+  when opened, always show the LAST N rows that fit the visible window
+  (i.e. most recent history first/visible by default), not the oldest.
+- This supersedes the old, vaguer "Vehicle maintenance/inspection log"
+  entry that's been sitting in `future_plans_discussed`
+  (`AI_INDEX.json`) since early in the project ("drivers report issues,
+  auto-timestamped, weekly printout") -- that description is now
+  obsolete; this section is the real, concrete spec.
+
+**Why first:** fully specified (no open design questions beyond normal
+implementation detail), self-contained (new tab changes + one new DB
+table + one new window, doesn't depend on how items 7.2/7.3/7.4 turn
+out), and its own reference design (`4.jpg`) is already a modern
+white/card-based look similar in spirit to the Summary popup -- building
+it now doesn't create rework once the app-wide theme (7.3) happens
+later; if anything it's a preview of that direction.
+
+### 7.2 (do second) Plan a Day: full columns, inline driver/vehicle editing, event filter
+
+- **Show every Excel column**, not just the current curated 8 (SR, Time,
+  Event, Vehicle Type Required, Pick Up, Driver/Supplier, Vehicle/Unit,
+  Note) -- add Order#, Contact Person, Order Location, Additional Info,
+  Charge Code, Same Driver (all already exist as `Job` fields, just not
+  currently shown as table columns).
+- **Column resize** (mostly already works -- `QTableWidget`'s default
+  interactive resize applies to columns not explicitly set to
+  `QHeaderView.Stretch`; confirm this covers what's meant here, or
+  clarify if something more specific is wanted).
+- **Column hide/unhide** -- genuinely new, no such control exists today
+  (e.g. a column-visibility toggle menu/checklist).
+- **Driver and Vehicle columns become combo boxes**, letting the planner
+  directly reassign a job's driver or vehicle from the table, "then save
+  the final version in database." Flagged by the project owner as the
+  more important part of this item. **Open design question, needs a
+  short scoping conversation before building** (similar depth to the
+  trip-count-meter and Balance-fields discussions earlier this session):
+  does an edit save immediately (writes into `self.jobs` and/or
+  `finalized_jobs` right away), or only get persisted when the existing
+  "Finalize Day" button is clicked (matching how every other edit to the
+  in-memory plan currently works)? Does a manual reassignment re-check
+  the driver's hard rules (hours, license, off-day) or is manual
+  override explicitly allowed to violate them, matching Rule 3
+  (`PROJECT_RULES.md`: "the human planner is always the final decision
+  maker... must always be able to override any recommendation")?
+- **New filter: by event** (alongside the existing filter-by-driver/
+  supplier dropdown) -- same UI pattern, filtering on `Job.event_id`/
+  `event_text` instead.
+
+**Why second:** high real planner value (the project owner's own
+framing -- "more important"), well-motivated (matches Rule 3, planner
+overrides), but the persistence-semantics question above needs answering
+before code is written, so it can't just be started blind the way 7.1
+can.
+
+### 7.3 (do third) App-wide theme change
+
+Restyle every tab (`Plan a Day`, `Drivers`, `Suppliers`, `Vehicles`,
+`Locations`, `Settings`) to match the Summary popup's current look
+(white background, card-style elements, rounded corners, blue accent) --
+replacing the app's current dark theme (see `MISC/1.png` for what the
+Vehicles tab looks like today, as one example). **Open question the
+project owner explicitly wants input on:** should tabs move from the top
+(current `QTabWidget` layout in `main_window.py`) to a left-side
+sidebar? No recommendation logged yet -- worth discussing once 7.1/7.2
+exist, since a Vehicle Maintenance Log window and a much busier Plan a
+Day table both add real screen content that should inform whether a
+sidebar earns its keep, not just an aesthetic preference in the
+abstract.
+
+**Why third, not first:** doing this AFTER 7.1 and 7.2 means restyling
+each screen exactly once, with the full, final set of screens/controls
+already in place, instead of theming early and then having to re-touch
+everything again as 7.1/7.2 add new widgets. It's also the least
+concretely specified of the four (no exact mockup beyond "match the
+Summary popup," and the top-vs-left question is explicitly still open)
+-- better to have more of the app's shape settled first.
+
+### 7.4 (do last) Database viewer/editor window
+
+A new screen to directly view and edit raw database tables/rows --
+motivated by correcting schedule changes made during the day (after a
+day's already been Finalized) so month-to-date overtime calculations
+stay accurate. Least specified of the four -- no field list, no target
+tables named, no mockup. Real open questions before this should be
+designed, let alone built: which tables/columns are actually meant to be
+editable (a full raw editor is a very different, much riskier thing than
+a scoped "correct a finalized day's job times" tool)? Does editing a
+`finalized_jobs` row need to re-trigger anything (nothing currently
+recomputes `month_overtime_so_far` retroactively -- it's read fresh
+every time `build_driver_profiles` runs, so a direct edit would just
+take effect the next time planning runs, no cache to invalidate)?
+
+**Why last:** least specified, and touches the most sensitive territory
+(direct edits to historical data bypassing every structured-field
+safeguard this project has built up). There's also real conceptual
+overlap with 7.2 (both are "edit already-assigned schedule data after
+the fact," just current-day vs. historical) -- building 7.2 first will
+likely clarify what safety rails 7.4 actually needs, rather than
+designing both from scratch independently.
+
+## 8. How to work with this specific person
 
 - They think in **real operational scenarios**, not abstractions — when
   proposing a design, it lands better paired with a concrete example

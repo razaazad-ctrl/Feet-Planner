@@ -837,21 +837,35 @@
         "EditVehicleDialog(QDialog)",
         "VehiclesTab(QWidget)"
       ],
-      "responsibility": "Vehicle roster CRUD, workshop toggle, exclusion toggle, edit dialog.",
+      "responsibility": "Vehicle roster CRUD, Active/Deactive exclusion toggle, edit dialog (now the sole place any vehicle field is edited), per-row Vehicle Maintenance Log button.",
+      "changed_2026_08_14_phase_28": "Replaced the old separate 'In Workshop' and 'Don't Use Tomorrow' columns/toggle-buttons with a single Active/Deactive checkbox column (COL_ACTIVE), same visual/behavioral pattern as Drivers/Suppliers (checked=included, unchecked=excluded+orange+sorts to bottom), driving the existing excluded_from_planning column alone. db.set_vehicle_workshop_status() was deleted (nothing calls it anymore); in_workshop column kept in schema but no longer read anywhere.",
+      "changed_2026_08_14_phase_28b": "EditVehicleDialog expanded from 3 fields (Plate/Type/Notes) to every vehicles column, including the detail fields (model/year/chassis/engine/registration+expiry/tyre/battery/both certificates+expiries/picture) that originally lived in VehicleMaintenanceDialog -- per the project owner's explicit direction that Edit Selected should be the ONLY place any vehicle field is edited, with the Maintenance Log becoming read-only. basic_values() -> db.update_vehicle() (unchanged), maintenance_field_values() -> db.update_vehicle_maintenance_fields() (Phase 28), _on_edit calls both. Date fields validated (YYYY-MM-DD or blank) before accept.",
       "table_columns": [
+        "Active (checkbox, COL_ACTIVE)",
+        "(wrench button, COL_MAINTENANCE -- opens VehicleMaintenanceDialog)",
         "Plate",
         "Type",
-        "Capacity / Notes",
-        "In Workshop",
-        "Don't Use Tomorrow"
+        "Capacity / Notes"
       ],
       "buttons": [
         "Add Vehicle",
-        "Edit Selected (opens EditVehicleDialog)",
-        "Delete Selected",
-        "Toggle Workshop Status",
-        "Toggle Don't Use Tomorrow"
+        "Edit Selected (opens EditVehicleDialog -- now covers every vehicle field, Phase 28b)",
+        "Delete Selected"
       ]
+    },
+    {
+      "file": "app/ui/vehicle_maintenance_dialog.py",
+      "class": "VehicleMaintenanceDialog(QDialog)",
+      "added": "2026-08-14, Phase 28, new file; substantially revised same day in Phase 28b",
+      "responsibility": "READ-ONLY report of a vehicle's detail record (model/year/chassis/engine/registration/certificates/tyre/battery/picture, Phase 28b -- editing moved to vehicles_tab.py's EditVehicleDialog) plus a fully editable service history (service_records table, Access-style 'Continuous Forms' grid) with five summary cards (Vehicle Expiry, Battery/Tyre/Oil/Chiller Change). Opened from vehicles_tab.py's wrench button. See ARCHITECTURE.md Section 3.3 for the full design writeup, including two real bugs found from a rendered screenshot and fixed same-day: a nested-QFormLayout row-overlap bug in the (now read-only) detail-field grid, and a QScrollArea-viewport theming bug that left the whole window dark-on-dark.",
+      "service_history_phase_28b": "Rebuilt as an Access-style Continuous Forms grid, replacing Phase 28's separate add/edit-form-above-read-only-table design -- every QTableWidget row is live-editable in place (a real QComboBox per row for Service Type via setCellWidget, native cell editing for the rest), auto-saves on itemChanged/currentIndexChanged (INSERT if the row's Qt.UserRole id is still None, UPDATE otherwise), '+ Add a Record' appends one blank row and scrolls to it, table always opens scrolled to the bottom (most recent) via scrollToBottom(). This is the one place in the app with an editable-table-cell pattern -- Phase 28's original 'no such pattern exists elsewhere, so avoid it' reasoning was explicitly overridden by the project owner's own Continuous Forms request.",
+      "vehicle_info_phase_28p": "_build_vehicle_info() (Model/Year, Type, Chassis, Engine, RTA/Ad. Certificate, plate, picture) now loads app/ui/vehicle_info_section.ui at runtime via QUiLoader instead of building those widgets in Python -- the one section of this dialog editable by mouse in Qt Designer. See ARCHITECTURE.md Section 3.3 and the vehicle_info_section.ui entry below.",
+      "does_not_touch": "allocation_engine.py -- none of these fields are read by any allocation strategy, pure master-data/UI."
+    },
+    {
+      "file": "app/ui/vehicle_info_section.ui",
+      "added": "2026-08-14, Phase 28p, new file",
+      "responsibility": "Qt Designer .ui file for VehicleMaintenanceDialog's vehicle-info section (Model/Year, Type, Chassis, Engine, RTA/Ad. Certificate, plate, picture) -- loaded at runtime by vehicle_maintenance_dialog.py's _build_vehicle_info() via QUiLoader (raw XML parsed every launch, no compile/pyside6-uic step). Editable directly in designer.exe (bundled with the project's installed PySide6). Object names (model_year_label, chassis_value, plate_display, picture_label, etc.) must stay in sync with the findChild(...) calls in _build_vehicle_info() if renamed in Designer. The header, summary cards, and service-history table are NOT part of this file -- they're populated dynamically at runtime and remain hand-written Python."
     },
     {
       "file": "app/ui/locations_tab.py",
@@ -1113,7 +1127,8 @@
           },
           {
             "name": "in_workshop",
-            "type": "INTEGER"
+            "type": "INTEGER",
+            "status": "DEPRECATED 2026-08-14 (Phase 28), same precedent as drivers.shift_start -- no longer read by build_vehicle_profiles or shown in the UI. excluded_from_planning alone now controls availability."
           },
           {
             "name": "active",
@@ -1132,14 +1147,115 @@
             "name": "excluded_from_planning",
             "type": "INTEGER",
             "migration": true,
-            "note": "treated as equivalent to in_workshop by build_vehicle_profiles"
+            "note": "As of Phase 28 (2026-08-14) this is the SOLE thing controlling vehicle availability -- driven by the Vehicles tab's single Active/Deactive checkbox. Previously treated as equivalent to in_workshop (either set = unavailable); in_workshop is now deprecated and unread."
           },
           {
             "name": "exclusion_reason",
             "type": "TEXT",
             "migration": true
+          },
+          {
+            "name": "vehicle_picture",
+            "type": "BLOB",
+            "migration": true,
+            "added": "2026-08-14, Phase 28",
+            "note": "Raw image bytes, loaded via QPixmap.loadFromData() -- no file path stored."
+          },
+          {
+            "name": "vehicle_model",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "vehicle_year",
+            "type": "INTEGER",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "vehicle_chassis",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "vehicle_engine",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "vehicle_registration",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "vehicle_reg_expiry",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28",
+            "note": "ISO date. Drives the Maintenance Log window's 'Vehicle Expiry' summary card, red if past today."
+          },
+          {
+            "name": "tyre_size",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "battery_type",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "rta_certificate",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "rta_certificate_expiry",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28",
+            "note": "ISO date, red if past today."
+          },
+          {
+            "name": "ad_certificate",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28"
+          },
+          {
+            "name": "ad_certificate_expiry",
+            "type": "TEXT",
+            "migration": true,
+            "added": "2026-08-14, Phase 28",
+            "note": "ISO date, red if past today."
           }
         ]
+      },
+      {
+        "name": "service_records",
+        "added_via": "migration executescript, not original _SCHEMA",
+        "added": "2026-08-14, Phase 28",
+        "purpose": "One row per service/repair/inspection event for one vehicle -- the Vehicle Maintenance Log window's service history table.",
+        "columns": [
+          "id PK",
+          "vehicle_id FK -> vehicles(id) ON DELETE CASCADE",
+          "start_date, end_date (ISO date)",
+          "service_type (TEXT, UI-level combo box of 9 fixed values, no DB CHECK constraint)",
+          "details",
+          "current_reading, next_reading (REAL)",
+          "qty (REAL)",
+          "person, workshop",
+          "created_at, updated_at"
+        ],
+        "service_type_values": ["Quotation", "Oil/Filter Change", "Chiller Unit Service", "Accident", "Battery Change", "Repair", "Mechanical Work", "Body Work", "Tyre Change"],
+        "note": "Linked by vehicle_id, not plate text, even though the project owner's original design sketch drew the relationship on Plate -- vehicle_id is the stable key every other relationship in this schema uses. The five summary cards are derived entirely in Python from one list_service_records() call (last-seen row per service_type while iterating an oldest-first list), not five separate queries."
       },
       {
         "name": "off_day_log",
@@ -1475,11 +1591,12 @@
     "entity_rules_widget.py is legacy code, likely no longer imported -- verify before modifying",
     "allocate_by_solver() (new 2026-08-09, wired into the UI 2026-08-14 Phase 22) still has zero dedicated synthetic tests -- validated so far via real-data runs (0 unresolved, 0 supplier, all 11 drivers used, proven OPTIMAL, re-confirmed after the Phase 21 span fix and again after Phase 22's wiring change) plus the full existing heuristic-engine test suite (which doesn't touch the solver's own CP-SAT model). This is now a HIGHER-priority gap than before, since the solver is the UI's default engine, not just an experimental one on the side. See NEXT_SESSION.md Section 6.",
     "UPDATED 2026-08-14 (Phase 22): allocate_by_solver() IS now wired into plan_day_tab.py -- Run Planning calls it directly, replacing allocate(). allocate_by_merit() and allocate_by_anchor() remain unwired, kept for comparison. The wiring decision (straight replacement, ortools now a hard dependency, OPTIMAL/FEASIBLE shown plainly) was made explicitly with the project owner -- see CHANGELOG_AI.md Phase 22. Still open: validating the solver against a bigger real file that genuinely needs supplier use (NEXT_SESSION.md Section 6 item 0), now more urgent since this is live in the UI, not just a side experiment.",
-    "BUILT 2026-08-14 (Phase 24): 'Balance Overtime / month' and 'Balance hours / month' fields, requested 2026-08-10 -- see the drivers_tab.py module entry above and CHANGELOG_AI.md Phase 24. Built after two related pre-existing bugs (Phase 23) were fixed first: a live NameError in _fill_gaps_with_unresolved_jobs, and get_driver_month_overtime_hours (which Balance Overtime/month reuses) still being sum-based rather than span-based."
+    "BUILT 2026-08-14 (Phase 24): 'Balance Overtime / month' and 'Balance hours / month' fields, requested 2026-08-10 -- see the drivers_tab.py module entry above and CHANGELOG_AI.md Phase 24. Built after two related pre-existing bugs (Phase 23) were fixed first: a live NameError in _fill_gaps_with_unresolved_jobs, and get_driver_month_overtime_hours (which Balance Overtime/month reuses) still being sum-based rather than span-based.",
+    "BUILT 2026-08-14 (Phase 28): Vehicle Maintenance Log -- see the vehicle_maintenance_dialog.py module entry above, ARCHITECTURE.md Section 3.3, and DATABASE.md's service_records table. Supersedes the old, vaguer future_plans_discussed entry below (that description is now obsolete -- the real design came from the project owner's own concrete mockups). Also consolidated the Vehicles tab's old separate 'In Workshop'/'Don't Use Tomorrow' toggles into one Active/Deactive checkbox."
   ],
   "future_plans_discussed": [
     "Combined one-click 'Plan My Day' button merging Run Planning + AI Review, once the deterministic engine is proven reliable over more real-world use",
-    "Vehicle maintenance/inspection log -- planner-suggested feature (drivers report issues, auto-timestamped, weekly printout), explicitly deferred until core planning flow is solid; would be a new table hanging off vehicles, independent of existing schema",
+    "~~Vehicle maintenance/inspection log~~ BUILT 2026-08-14, Phase 28 -- see known_limitations above and ARCHITECTURE.md Section 3.3. This entry's original description (drivers report issues, auto-timestamped, weekly printout) is obsolete; the real feature is a per-vehicle detail record + service history with summary cards.",
     "PDF export via Excel COM automation (pywin32), since target machine is Windows and likely has Excel installed",
     "Daily shortlist UI for restricting planning to specific drivers/suppliers (backend-ready)",
     "PyInstaller packaging into a distributable .exe, deferred during active iteration to avoid rebuild friction",

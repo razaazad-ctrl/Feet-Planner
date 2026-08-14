@@ -211,9 +211,14 @@ def build_driver_profiles(conn, db):
 
 
 def build_vehicle_profiles(conn, db):
+    # in_workshop dropped from this check 2026-08-14 -- deprecated
+    # alongside the Vehicles tab's old separate "In Workshop" toggle
+    # (see db.py's _MIGRATIONS comment). excluded_from_planning, driven
+    # by the tab's single Active/Deactive checkbox, is now the only
+    # thing that makes a vehicle unavailable for planning.
     return [
         VehicleProfile(id=row["id"], plate=row["plate"], vehicle_type=row["vehicle_type"],
-                        in_workshop=bool(row["in_workshop"]) or bool(row["excluded_from_planning"]))
+                        in_workshop=bool(row["excluded_from_planning"]))
         for row in db.list_vehicles(conn)
     ]
 

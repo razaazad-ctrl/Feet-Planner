@@ -186,6 +186,26 @@ _MIGRATIONS = [
     # working_hours_per_day (fail-closed, matching the same precedent as
     # max_overtime_hours_per_month=None elsewhere in this file).
     ("drivers", "max_working_hours_per_day REAL"),
+    # --- Vehicle Maintenance Log (2026-08-14) ---------------------------
+    # `in_workshop` (above) is now DEPRECATED, same precedent as
+    # `drivers.shift_start`: the Vehicles tab's new single Active/Deactive
+    # checkbox reuses the existing `excluded_from_planning` column for
+    # both "in workshop" and "don't use tomorrow" -- both toggles are
+    # gone from the UI, and allocation_engine.build_vehicle_profiles no
+    # longer reads in_workshop. Column kept so old data isn't lost.
+    ("vehicles", "vehicle_picture BLOB"),
+    ("vehicles", "vehicle_model TEXT"),
+    ("vehicles", "vehicle_year INTEGER"),
+    ("vehicles", "vehicle_chassis TEXT"),
+    ("vehicles", "vehicle_engine TEXT"),
+    ("vehicles", "vehicle_registration TEXT"),
+    ("vehicles", "vehicle_reg_expiry TEXT"),          # ISO date
+    ("vehicles", "tyre_size TEXT"),
+    ("vehicles", "battery_type TEXT"),
+    ("vehicles", "rta_certificate TEXT"),
+    ("vehicles", "rta_certificate_expiry TEXT"),      # ISO date
+    ("vehicles", "ad_certificate TEXT"),
+    ("vehicles", "ad_certificate_expiry TEXT"),       # ISO date
 ]
 
 
@@ -226,6 +246,31 @@ def _run_migrations(conn):
         end_dt              TEXT,
         hours               REAL,
         finalized_at        TEXT NOT NULL
+    );
+
+    -- Vehicle Maintenance Log (2026-08-14): one row per service/repair/
+    -- inspection event for one vehicle. Linked by vehicle_id (not plate
+    -- text, even though the original design sketch drew the relationship
+    -- on Plate) -- vehicle_id is the stable key every other relationship
+    -- in this schema already uses. The five summary cards on the
+    -- Maintenance Log window (Vehicle Expiry, Battery/Tyre/Oil/Chiller)
+    -- are derived by finding each vehicle's most recent row per
+    -- service_type -- nothing about "last service date" is stored
+    -- redundantly here.
+    CREATE TABLE IF NOT EXISTS service_records (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        vehicle_id      INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+        start_date      TEXT,
+        end_date        TEXT,
+        service_type    TEXT,   -- e.g. "Oil/Filter Change", "Chiller Unit Service", "Tyre Change"
+        details         TEXT,
+        current_reading REAL,
+        next_reading    REAL,
+        qty             REAL,
+        person          TEXT,
+        workshop        TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
     );
     """)
 
@@ -581,11 +626,19 @@ def delete_vehicle(conn, vehicle_id):
     conn.commit()
 
 
+def get_vehicle(conn, vehicle_id):
+    return conn.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+
+
 def list_vehicles(conn, active_only=True):
     q = "SELECT * FROM vehicles"
     if active_only:
         q += " WHERE active = 1"
-    q += " ORDER BY excluded_from_planning, in_workshop, plate COLLATE NOCASE"
+    # in_workshop dropped from the sort (2026-08-14) -- deprecated, no
+    # longer surfaced in the UI; excluded_from_planning (driven by the
+    # Vehicles tab's single Active/Deactive checkbox) is now the only
+    # thing that demotes a vehicle to the bottom of the list.
+    q += " ORDER BY excluded_from_planning, plate COLLATE NOCASE"
     return conn.execute(q).fetchall()
 
 
@@ -597,12 +650,91 @@ def set_vehicle_excluded(conn, vehicle_id, excluded, reason=""):
     conn.commit()
 
 
-def set_vehicle_workshop_status(conn, vehicle_id, in_workshop):
-    conn.execute(
-        "UPDATE vehicles SET in_workshop = ?, updated_at = ? WHERE id = ?",
-        (1 if in_workshop else 0, _now(), vehicle_id),
+def update_vehicle_maintenance_fields(conn, vehicle_id, vehicle_picture=None, vehicle_model="",
+                                       vehicle_year=None, vehicle_chassis="", vehicle_engine="",
+                                       vehicle_registration="", vehicle_reg_expiry=None,
+                                       tyre_size="", battery_type="", capacity_notes="",
+                                       rta_certificate="", rta_certificate_expiry=None,
+                                       ad_certificate="", ad_certificate_expiry=None):
+    """
+    Saves the Vehicle Maintenance Log window's detail fields -- separate
+    from update_vehicle() (which the basic Vehicles-tab "Edit Selected"
+    dialog uses for just Plate/Type/Notes), so that existing dialog and
+    its caller are untouched by this addition.
+
+    vehicle_picture: raw image bytes (BLOB) or None to leave the current
+    picture unchanged -- pass b"" explicitly to clear it.
+    Date fields (vehicle_reg_expiry, rta_certificate_expiry,
+    ad_certificate_expiry): ISO 'YYYY-MM-DD' strings or None.
+    "Details" (per the original field list) reuses the vehicles table's
+    existing capacity_notes column rather than adding a duplicate
+    free-text field -- there was no meaningful difference between the two.
+    """
+    params = [
+        vehicle_model.strip(), vehicle_year, vehicle_chassis.strip(), vehicle_engine.strip(),
+        vehicle_registration.strip(), vehicle_reg_expiry, tyre_size.strip(), battery_type.strip(),
+        capacity_notes.strip(), rta_certificate.strip(), rta_certificate_expiry,
+        ad_certificate.strip(), ad_certificate_expiry, _now(),
+    ]
+    set_clause = (
+        "vehicle_model = ?, vehicle_year = ?, vehicle_chassis = ?, vehicle_engine = ?, "
+        "vehicle_registration = ?, vehicle_reg_expiry = ?, tyre_size = ?, battery_type = ?, "
+        "capacity_notes = ?, rta_certificate = ?, rta_certificate_expiry = ?, "
+        "ad_certificate = ?, ad_certificate_expiry = ?, updated_at = ?"
+    )
+    if vehicle_picture is not None:
+        set_clause += ", vehicle_picture = ?"
+        params.append(vehicle_picture)
+    params.append(vehicle_id)
+    conn.execute(f"UPDATE vehicles SET {set_clause} WHERE id = ?", params)
+    conn.commit()
+
+
+# ------------------------------------------------------ vehicle service log
+
+def add_service_record(conn, vehicle_id, start_date=None, end_date=None, service_type="",
+                        details="", current_reading=None, next_reading=None, qty=None,
+                        person="", workshop=""):
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO service_records (vehicle_id, start_date, end_date, service_type, details, "
+        "current_reading, next_reading, qty, person, workshop, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (vehicle_id, start_date, end_date, service_type, details.strip(), current_reading,
+         next_reading, qty, person.strip(), workshop.strip(), now, now),
     )
     conn.commit()
+    return cur.lastrowid
+
+
+def update_service_record(conn, record_id, start_date=None, end_date=None, service_type="",
+                           details="", current_reading=None, next_reading=None, qty=None,
+                           person="", workshop=""):
+    conn.execute(
+        "UPDATE service_records SET start_date = ?, end_date = ?, service_type = ?, details = ?, "
+        "current_reading = ?, next_reading = ?, qty = ?, person = ?, workshop = ?, updated_at = ? "
+        "WHERE id = ?",
+        (start_date, end_date, service_type, details.strip(), current_reading, next_reading,
+         qty, person.strip(), workshop.strip(), _now(), record_id),
+    )
+    conn.commit()
+
+
+def delete_service_record(conn, record_id):
+    conn.execute("DELETE FROM service_records WHERE id = ?", (record_id,))
+    conn.commit()
+
+
+def list_service_records(conn, vehicle_id):
+    """Every service record for one vehicle, oldest first -- the
+    Maintenance Log window's own table scrolls to the bottom (most
+    recent) row after populating, rather than this function guessing how
+    many rows fit the visible window."""
+    return conn.execute(
+        "SELECT * FROM service_records WHERE vehicle_id = ? ORDER BY "
+        "COALESCE(start_date, '') ASC, id ASC",
+        (vehicle_id,),
+    ).fetchall()
 
 
 # ------------------------------------------------------------- off-days

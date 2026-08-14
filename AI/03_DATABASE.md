@@ -110,12 +110,46 @@ In-house fleet roster.
 | `id` | INTEGER PK | |
 | `plate` | TEXT UNIQUE COLLATE NOCASE | |
 | `vehicle_type` | TEXT NOT NULL | Exact-match text — must match `Job.vehicle_type_required` and `drivers.license_types` character-for-character (after case/whitespace normalization) |
-| `capacity_notes` | TEXT | Free text, informational only |
-| `in_workshop` | INTEGER (0/1) | Specific "under maintenance" status, separate from the general exclusion toggle below |
+| `capacity_notes` | TEXT | Free text. Doubles as the Vehicle Maintenance Log window's "Details" field (Phase 28) — no separate column was added for that, since the two were the same kind of free-text note. |
+| `in_workshop` | INTEGER (0/1) | **DEPRECATED 2026-08-14 (Phase 28)**, same precedent as `drivers.shift_start` — the Vehicles tab's old separate "In Workshop" toggle is gone from the UI, and `allocation_engine.build_vehicle_profiles` no longer reads this column. Kept only so old data isn't lost; do not use for new work. |
 | `active` | INTEGER (0/1) | Same caveat as other `active` columns |
 | `created_at`, `updated_at` | TEXT | |
-| `excluded_from_planning` | INTEGER (0/1), migration | General "don't use tomorrow" (e.g. parked at an event site serving as temporary storage — a real scenario the user described). `allocation_engine.build_vehicle_profiles` treats `in_workshop` and `excluded_from_planning` as equivalent — a vehicle is unavailable if *either* is set. |
+| `excluded_from_planning` | INTEGER (0/1), migration | **The single Active/Deactive toggle as of Phase 28** — the Vehicles tab now has one checkbox (same visual pattern as Drivers/Suppliers), driving this column alone; it used to be paired with `in_workshop` (`build_vehicle_profiles` treated either as making a vehicle unavailable), now it's the only thing that does. Unchecked = excluded from planning, row turns orange and sorts to the bottom. |
 | `exclusion_reason` | TEXT, migration | |
+| `vehicle_picture` | BLOB, migration | Raw image bytes (PNG/JPG), Phase 28. Loaded via `QPixmap.loadFromData()` — no file path stored, no external file dependency. |
+| `vehicle_model` | TEXT, migration | e.g. "TOYOTA HIACE". Phase 28, Vehicle Maintenance Log field. |
+| `vehicle_year` | INTEGER, migration | Phase 28. |
+| `vehicle_chassis` | TEXT, migration | VIN/chassis number. Phase 28. |
+| `vehicle_engine` | TEXT, migration | Phase 28. |
+| `vehicle_registration` | TEXT, migration | Phase 28. |
+| `vehicle_reg_expiry` | TEXT, migration | ISO date (`YYYY-MM-DD`). Phase 28. Drives the Maintenance Log window's "Vehicle Expiry" summary card — shown in red if past today, same red-if-expired convention as the two certificate expiry fields below. |
+| `tyre_size` | TEXT, migration | Phase 28. Shown inline on the "Tyre Change" summary card. |
+| `battery_type` | TEXT, migration | Phase 28. Shown inline on the "Battery Change" summary card. |
+| `rta_certificate` | TEXT, migration | Phase 28. |
+| `rta_certificate_expiry` | TEXT, migration | ISO date. Phase 28. Red-if-expired in the Maintenance Log window. |
+| `ad_certificate` | TEXT, migration | Phase 28. |
+| `ad_certificate_expiry` | TEXT, migration | ISO date. Phase 28. Red-if-expired in the Maintenance Log window. |
+
+**Important:** none of the Phase 28 fields above are read by `allocation_engine.py` — they're pure master-data/UI, no scheduling behavior depends on them.
+
+### `service_records`
+**New 2026-08-14 (Phase 28).** One row per service/repair/inspection
+event for one vehicle — the Vehicle Maintenance Log window's service
+history table, opened via the Vehicles tab's wrench-icon button.
+
+| Column | Type | Business meaning |
+|---|---|---|
+| `id` | INTEGER PK | |
+| `vehicle_id` | INTEGER FK -> vehicles(id) ON DELETE CASCADE | Linked by ID, not by plate text (the project owner's original design sketch drew the relationship on `Plate`, but `vehicle_id` is the stable key every other relationship in this schema already uses, and plate text could in principle be edited). Deleting a vehicle deletes its service history — confirmed as the intended behavior, matching every other CASCADE relationship in this schema (unlike `finalized_jobs`, which is intentionally NOT cascaded, since that's cross-day historical record, not master data belonging to a live vehicle). |
+| `start_date`, `end_date` | TEXT (ISO date) | |
+| `service_type` | TEXT | One of a fixed set the UI presents as a combo box: `Quotation`, `Oil/Filter Change`, `Chiller Unit Service`, `Accident`, `Battery Change`, `Repair`, `Mechanical Work`, `Body Work`, `Tyre Change`. Not enforced at the database level (plain TEXT, no CHECK constraint) — the combo box is the only guardrail, matching this project's general preference for UI-level guidance over rigid DB constraints on free-entry-adjacent fields. |
+| `details` | TEXT | |
+| `current_reading`, `next_reading` | REAL | Odometer/meter-style readings. `next_reading` from a vehicle's most recent `"Oil/Filter Change"` or `"Chiller Unit Service"` row feeds the "Next Reading" line on those two summary cards. |
+| `qty` | REAL | |
+| `person`, `workshop` | TEXT | Who performed it / where. |
+| `created_at`, `updated_at` | TEXT | |
+
+**How the five summary cards are computed:** the Maintenance Log window fetches every `service_records` row for that vehicle (`db.list_service_records`, ordered oldest-first), then — entirely in Python, no extra queries — keeps the last-seen row per `service_type` while iterating (since the list is already chronological, "last seen" is "most recent"). Four cards (Battery/Tyre/Oil/Chiller Change) come from this; the fifth ("Vehicle Expiry") comes directly from `vehicles.vehicle_reg_expiry`, not from any service record.
 
 ### `off_day_log` and `comp_days`
 **Schema exists, but there is no CRUD/UI wired to either table.** These
@@ -244,6 +278,7 @@ suppliers (1) ----< supplier_rules (many)      ON DELETE CASCADE
 suppliers (1) ----< supplier_offerings (many)  ON DELETE CASCADE
 drivers (1) ----< off_day_log (many)           ON DELETE CASCADE  [unused]
 drivers (1) ----< comp_days (many)             ON DELETE CASCADE  [unused]
+vehicles (1) ----< service_records (many)      ON DELETE CASCADE  [Phase 28]
 
 finalized_jobs.driver_id   -- NOT a declared FK (plain INTEGER column,
 finalized_jobs.vehicle_id  -- no REFERENCES clause) -- intentionally

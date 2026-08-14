@@ -2222,3 +2222,1226 @@ this prompted about keeping changelog entries appended in one place.)*
   14/17/19). No change needed to `AI_CONTEXT.md`, `DATABASE.md`,
   `BUSINESS_RULES.md`, `NEXT_SESSION.md`, or `AI_INDEX.json` -- no
   business rule, schema, or allocation-behavior change this phase.
+
+## Phase 27 — Validated allocate_by_solver() against the bigger 81-trip file (NEXT_SESSION.md item 0, resolved), found and fixed a real Excel data issue (2026-08-14, same session as Phase 22-26)
+
+- **Trigger:** the project owner supplied `unPlanned_Full.xlsx` (81
+  trips) -- the SAME real day as `UNPLANNED.xlsx` (44 trips), but with
+  the supplier-needing trips left in rather than stripped out. This is
+  exactly the validation `NEXT_SESSION.md` item 0 had been waiting for
+  since Phase 16: a file where the solver's supplier-fallback behavior
+  and larger-scale solve time could be checked against reality, not just
+  the deliberately-supplier-free 44-trip file. Initial run:
+  `allocate()` (then still partially relevant for comparison) and
+  `allocate_by_solver()` both showed a concerning result -- 38 in-house /
+  34 supplier / **9 unresolved**, a real regression-looking gap compared
+  to the 44-trip file's clean 0 unresolved.
+- **Diagnosed step by step, not guessed, per the project owner's own
+  request (their two explicit tests):**
+  1. **Test 1 -- compare the two files' shared 44 rows field-by-field.**
+     Found all 37 of the non-blank-grouped rows showing `same_driver_key`
+     present in `UNPLANNED.xlsx` but blank in `unPlanned_Full.xlsx` --
+     every other field identical.
+  2. **Test 2 -- check supplier coverage for the 9 unresolved jobs'
+     vehicle types.** Confirmed all 5 types (`4.2 Ton Double cabin
+     Chiller Truck`, `5 Ton Open Truck`, `10 Ton Chiller Truck`, `23
+     Seater Bus`, `20 Seater Bus`) have ZERO supplier offerings and
+     exactly ONE in-house vehicle each -- a thin-margin fleet where any
+     doubled demand has no fallback.
+  3. **Verification (not part of the original two tests, added to
+     confirm causation, not just correlation):** patched the missing
+     `same_driver_key` values back in-memory (no file touched yet) and
+     re-ran -- unresolved dropped from 9 to 3, directly proving the
+     missing grouping data was the primary cause of 6 of the 9.
+- **Root cause, found precisely, not just worked around:** it wasn't 37
+  missing data values -- it was ONE blank header cell. `unPlanned_Full.xlsx`
+  column M's header (row 1) was empty instead of `"Same Driver"`.
+  `excel_import.py` matches columns by header text (`_HEADER_MAP`); an
+  unrecognized/blank header is silently ignored (a fragility already
+  flagged in `NEXT_SESSION.md` Section 4 in the abstract -- this session
+  hit a concrete, real instance of exactly that risk). The grouping text
+  was sitting in the actual cell data for all 81 rows the whole time,
+  just never read by anything, for any row, because the column was never
+  recognized at all.
+- **Fixed at the project owner's explicit direction ("you fix the file
+  ... all trips in UNPLANNED.xlsx should match exactly in
+  unPlanned_Full.xlsx"):** a single cell edit, `unPlanned_Full.xlsx` M1 =
+  `"Same Driver"`. Nothing else touched. Verified via direct
+  `openpyxl` comparison against the git-committed original: same sheet
+  name, same dimensions (`A1:N82`), identical values/fonts/fills on every
+  other cell checked -- only M1 differs, now correctly matching the other
+  header cells' styling. (This is test/reference DATA, not application
+  code -- no `app/` file was touched, and this is why this fix itself
+  doesn't get its own architecture/business-rule doc updates beyond this
+  changelog entry and the `NEXT_SESSION.md` status update.)
+- **Final validated result (re-ran the real production engine after the
+  fix): 48 in-house / 32 supplier / 1 unresolved, solver status
+  `OPTIMAL`** -- better than the in-memory verification patch predicted
+  (which only reached 3 unresolved), because restoring the real header
+  let ALL 81 rows' grouping data resolve correctly, including
+  connections among the 37 rows that weren't part of the smaller
+  44-trip file at all (and so couldn't be patched from it). This
+  directly answers every part of what `NEXT_SESSION.md` item 0 asked to
+  confirm: (a) the solver resolves everything in-house-first correctly,
+  (b) supplier use (32 of 81 rows) appears because it's genuinely needed,
+  not as a fallback-avoidance failure, (c) solve time stayed reasonable
+  at nearly double the previously-tested scale.
+- **The one remaining unresolved row, SR15, is a genuine, disclosed
+  capacity gap, not a bug:** needs `5 Ton Open Truck (with lift)`, has
+  zero supplier coverage and exactly one in-house vehicle of that type,
+  and was confirmed ungrouped in BOTH files (not a lost-grouping
+  artifact like the other 8 originally were). Same class of finding as
+  the 10-Ton-Chiller-Truck scarcity noted in `NEXT_SESSION.md` Section 5
+  -- not something to code around.
+- **Tested:** every diagnostic step above was run directly against the
+  real files/database (not synthetic data) -- the file-diff comparison,
+  the supplier/driver license-coverage check, the in-memory verification
+  patch, the post-fix full re-run, and a direct `openpyxl` structural/
+  formatting comparison against the git-committed original file to
+  confirm the fix touched nothing else.
+- **What did NOT change:** no `app/` code touched -- this phase is a data
+  fix plus validation, not an engine change. `allocate_by_solver()`,
+  `allocate()`, and every hard business rule are exactly as Phase 21-26
+  left them.
+- `NEXT_SESSION.md` (item 0 marked resolved, Section 5 new entry with the
+  header-detection lesson and the SR15 capacity note) updated to match
+  (Rule 14/17/19). No change needed to `AI_CONTEXT.md`, `ARCHITECTURE.md`,
+  `DATABASE.md`, `BUSINESS_RULES.md`, or `AI_INDEX.json` -- no code,
+  schema, or business-rule change this phase.
+
+## Phase 28 — Vehicles tab overhaul + new Vehicle Maintenance Log (2026-08-14, same session as Phase 22-27)
+
+- **Trigger:** four new UI/DB feature requests registered together this
+  session (`NEXT_SESSION.md` Section 7); this phase builds the first one
+  in the project owner's own confirmed order (Section 7.1) --
+  consolidating the Vehicles tab's exclusion toggles into one
+  Active/Deactive checkbox (matching Drivers/Suppliers), plus an
+  entirely new Vehicle Maintenance Log window. Design came from four
+  reference images the project owner supplied in a `MISC/` folder (since
+  deleted, their own cleanup, expected) -- `1.png` (current Vehicles tab
+  state), `2.png` (the wrench-button placement), `3.png` (the two-table
+  data model), `4.jpg` (the actual maintenance-log window mockup), plus
+  eight image assets (icons, a plate graphic, an example certificate
+  photo) copied into `app/ui/` for direct use.
+- **Asset-handling question asked and answered before building anything:**
+  the project owner asked whether the new images need to ship alongside
+  the code or can be embedded in it. Answered by pointing at this
+  project's own existing precedent -- `trip_clipart.png` (Summary popup,
+  Phase 19b-ish era) already sits as a plain file beside `plan_day_tab.py`,
+  loaded via `Path(__file__).with_name(...)`. Base64-embedding and Qt's
+  `.qrc` resource-compiler system were both considered and rejected:
+  base64 bloats the source and isn't how any image in this app works
+  today; `.qrc` introduces a new build-tool dependency (`pyside6-rcc`)
+  this project has never used, for a benefit (packaging convenience)
+  that doesn't matter yet since PyInstaller packaging is still explicitly
+  deferred. All eight new images follow the exact same flat,
+  `Path(__file__)`-relative pattern as `trip_clipart.png` -- confirmed
+  with the project owner (flat in `app/ui/`, not a subfolder) before
+  copying them in.
+- **Vehicles tab changes** (`app/ui/vehicles_tab.py`):
+  - Replaced the "In Workshop" and "Don't Use Tomorrow" columns and
+    their two toggle buttons with one Active/Deactive checkbox column
+    (`COL_ACTIVE`) -- same checkbox-in-table-item technique
+    (`Qt.ItemIsUserCheckable`, `itemChanged` signal) Drivers/Suppliers
+    already use in their `QListWidget`s, ported to `QTableWidget` since
+    Vehicles has always been table-based and the project owner's own
+    mockup kept it that way. Checked = active, unchecked = excluded +
+    orange + sorts to the bottom -- identical convention to Drivers/
+    Suppliers.
+  - New wrench-icon button per row (`COL_MAINTENANCE`, using the
+    project owner's own `maintenance_log_button.png`) opening
+    `VehicleMaintenanceDialog` for that vehicle.
+  - `db.set_vehicle_workshop_status()` deleted outright, not just
+    deprecated -- nothing calls it anymore, matching the exact precedent
+    set when `_parse_shift_start_time`/`_job_is_before_shift_start` were
+    fully removed from `allocation_engine.py` once `shift_period`
+    replaced `shift_start` (the DB *column* stays, since this project's
+    additive-only migration system can't drop columns; only the dead
+    *code* referencing the retired concept was removed).
+  - `allocation_engine.build_vehicle_profiles()` updated: `in_workshop`
+    dropped from the availability check entirely, `excluded_from_planning`
+    is now the sole signal. The `VehicleProfile.in_workshop` dataclass
+    field name was deliberately left unchanged (only what feeds it
+    changed) to avoid touching every candidate-filter call site across
+    `allocation_engine.py` that already reads that field name.
+- **Database changes** (`app/db.py`): 13 new columns on `vehicles`
+  (picture as BLOB, model, year, chassis, engine, registration + expiry,
+  tyre size, battery type, RTA certificate + expiry, Ad certificate +
+  expiry) added via the existing additive `_MIGRATIONS` list, applied
+  cleanly against both a fresh test database and the real committed
+  `fleetplanner.db` (22 vehicles / 14 drivers confirmed unchanged before
+  and after). One field from the original design ("Details") was
+  deliberately NOT added as a new column -- it reuses the vehicles
+  table's existing `capacity_notes` field instead, since the two were
+  the same kind of free-text note and adding a near-duplicate column
+  would have been unnecessary complexity (Rule 15). New `service_records`
+  table (via the existing `executescript` pattern already used for
+  `supplier_offerings`/`finalized_jobs`), linked to `vehicles` by
+  `vehicle_id` with `ON DELETE CASCADE` -- deliberately by ID, not by the
+  `Plate` text field the project owner's own design sketch drew the
+  relationship on, since `vehicle_id` is the stable key every other
+  relationship in this schema already uses and plate text could in
+  principle be edited. New `db.py` functions: `get_vehicle`,
+  `update_vehicle_maintenance_fields` (kept separate from the existing
+  `update_vehicle`, which the basic "Edit Selected" dialog still uses
+  unchanged, so that dialog and its caller were untouched by this
+  addition), `add_service_record`, `update_service_record`,
+  `delete_service_record`, `list_service_records`.
+- **New `VehicleMaintenanceDialog`** (`app/ui/vehicle_maintenance_dialog.py`,
+  new file) -- see `ARCHITECTURE.md` Section 3.3 for the full layout
+  writeup. Header with title icon + Active/Deactive checkbox; editable
+  Model/Year plus READ-ONLY Type/Plate (deliberately not editable here --
+  both are edited via the Vehicles tab's existing "Edit Selected" dialog,
+  so there's exactly one place that changes them, not two); a picture
+  loaded from the `vehicle_picture` BLOB, changeable via a file picker
+  and staged until "Save Vehicle Details"; detail fields (chassis/engine/
+  registration/expiry, both certificates + their expiries, tyre size,
+  battery type) saved together via `update_vehicle_maintenance_fields`;
+  certificate/registration expiry dates turn red (`#c0392b`) if past
+  today, re-evaluated on load and again right after saving; five summary
+  cards (Vehicle Expiry, Battery/Tyre/Oil/Chiller Change) computed
+  entirely in Python from one `list_service_records()` call (last-seen
+  row per `service_type` while iterating an oldest-first list -- no
+  per-card query); a service-history add/edit form (Service Type as a
+  fixed 9-value `QComboBox`) above a read-only table, auto-scrolled to
+  the bottom (most recent) row after every reload.
+- **One deliberate adaptation from the reference mockup, not a silent
+  deviation (Rule 16/20):** `4.jpg` draws the Service Type combo box
+  directly inside an editable table grid (an in-place-editable row).
+  This app has no "editable table cell" pattern anywhere else --
+  Drivers/Suppliers/Vehicles all use a separate add/edit form plus a
+  read-only display table. The service log here follows that same
+  existing pattern instead of introducing a new one: functionally
+  identical (add/edit/delete with a type dropdown), just via a UI shape
+  this codebase already uses elsewhere (Rule 1/13), rather than a novel
+  in-grid-editable-cell mechanism that would have been riskier to get
+  right and inconsistent with every other tab in the app.
+- **Tested:**
+  - Migration/CRUD sanity script (temp DB): confirmed all 13 new
+    `vehicles` columns and the full `service_records` schema exist;
+    round-tripped every new field including the picture BLOB; confirmed
+    Active/Deactive correctly drives `excluded_from_planning`; added/
+    updated/deleted service records and confirmed oldest-first ordering;
+    confirmed `ON DELETE CASCADE` correctly removes a vehicle's service
+    records when the vehicle itself is deleted.
+  - Same migration re-run directly against the real, committed
+    `fleetplanner.db` -- confirmed 22 vehicles / 14 drivers unchanged
+    before and after, new columns/table present.
+  - A full functional GUI smoke test using Qt's `offscreen` platform (no
+    physical display) actually drove the real event loop end to end:
+    `VehiclesTab` renders the Active checkbox (checked by default) and
+    maintenance button correctly; unchecking Active in the table
+    correctly excludes the vehicle; opening `VehicleMaintenanceDialog`
+    loads existing data correctly; "Save Vehicle Details" persists
+    correctly; an expired RTA certificate date renders red while a
+    non-expired Ad certificate date does not; adding a service record
+    persists and correctly updates the matching summary card's displayed
+    date; toggling Active from inside the dialog persists back to the
+    same `excluded_from_planning` column the Vehicles tab checkbox
+    drives.
+  - Full existing test suite re-run clean, zero tracebacks.
+  - **NOT performed, explicitly disclosed:** an actual visual
+    click-through with a real display (no attached display in this
+    session's environment) -- the offscreen harness validates real logic/
+    persistence/signal-wiring correctness, but the window's actual visual
+    fidelity to `4.jpg` (colors, spacing, card layout) is worth a quick
+    manual look once there's a display available.
+- **What did NOT change:** `allocate()`/`allocate_by_merit()`/
+  `allocate_by_anchor()`/`allocate_by_solver()` are untouched --
+  `build_vehicle_profiles()` was the only allocation-engine function
+  touched, and only in how it computes one boolean, not what any hard
+  rule enforces. No business rule, no scheduling behavior change.
+- `AI_CONTEXT.md`, `ARCHITECTURE.md` (new Section 3.3), `DATABASE.md`,
+  `AI_INDEX.json`, and `NEXT_SESSION.md` (Section 7.1 marked resolved)
+  all updated to match (Rule 14/17/19). No change needed to
+  `BUSINESS_RULES.md` -- no scheduling/business-rule change this phase.
+
+## Phase 28b — Vehicle Maintenance Log redesign, plus two real bugs found from an actual rendered screenshot (2026-08-14, same session as Phase 28)
+
+- **Trigger:** the project owner ran the actual app and shared a
+  screenshot of the real Phase 28 window -- it looked nothing like the
+  `4.jpg` reference. Two problems, one visual/technical and one
+  design/scope:
+  1. **Visual bug:** the whole window rendered dark-on-dark, barely
+     readable, instead of the intended white/card look.
+  2. **Design feedback, not a bug:** the project owner clarified the
+     intended split -- `EditVehicleDialog` ("Edit Selected" on the
+     Vehicles tab) should be the ONLY place any vehicle field is edited,
+     covering every field, including picture upload; the Maintenance Log
+     should show all of that read-only, "like a report." Separately, the
+     service-history section ("occupying too much space for the fields
+     to add a record") should become an MS Access-style "Continuous
+     Forms" grid: every row directly editable in place, a "+ Add a
+     Record" button appending a blank row, always opening scrolled to
+     the most recent rows -- not the separate add-form-above-a-table this
+     session had built.
+  Two smaller open questions were resolved with the project owner before
+  changing anything (Rule 16): the read-only-vs-editable split (confirmed
+  as described above) and where the Active/Deactive checkbox should live
+  now that the Maintenance Log is otherwise read-only -- confirmed to
+  stay in BOTH places (Vehicles tab table and the Maintenance Log
+  header), since it's an operational status toggle, not a "detail" field
+  like model/chassis, and the project owner explicitly said keeping it
+  functional in both was fine as long as it didn't make anything worse
+  (it doesn't -- same `excluded_from_planning` column either way).
+- **Bug 1 root-caused directly from the screenshot, not guessed:** Phase
+  28's version wrapped the dialog's content in a `QScrollArea` (to allow
+  vertical overflow scrolling). A `QScrollArea`'s viewport is a distinct
+  widget that does NOT inherit a `QDialog { background: ... }` stylesheet
+  rule the way a plain child widget does -- so the real background stayed
+  on the OS's dark theme (no app-level stylesheet exists anywhere else in
+  this codebase to override it), while the dialog's text-color rules
+  (written assuming a white background) rendered dark text on that dark
+  background. Compounding it: `QLineEdit`/`QComboBox`/plain
+  `QPushButton`/`QCheckBox` had only ever been given `padding`, no actual
+  colors, so they inherited the OS dark theme's default widget styling
+  too. Fixed by removing the `QScrollArea` entirely (content goes
+  directly on `self`, the same approach `DriverSupplierSummaryDialog` /
+  Summary popup already uses successfully -- the service table's own
+  native scrolling covers the "lots of history" case that motivated the
+  scroll area in the first place) and explicitly styling every widget
+  class actually used in the window. Verified by rendering the dialog
+  under Qt's offscreen platform and grabbing a real screenshot
+  (`dialog.grab().save(...)`) before and after -- the "before" capture
+  confirmed the bug reproduced outside the project owner's machine too
+  (ruling out a local Qt-theme-detection quirk), and the "after" capture
+  showed the correct white background, all five colored cards, and
+  properly bordered white input fields (font glyphs render as boxes
+  under this sandbox's offscreen platform specifically -- a rendering
+  environment limitation, disclosed directly, not something this fix
+  could address or needed to).
+- **Design change 1 -- `EditVehicleDialog` (`vehicles_tab.py`) expanded
+  to every vehicles column.** Was 3 fields (Plate, Type, Capacity/Notes);
+  now also Model, Year, Chassis, Engine, Registration + Expiry, Tyre
+  Size, Battery Type, both certificates + their expiries, and a picture
+  (file-picker, staged in `_pending_picture_bytes` until Save, same
+  staging pattern already used elsewhere in this project). `basic_values()`
+  feeds the existing `db.update_vehicle()` unchanged; `maintenance_field_values()`
+  feeds `db.update_vehicle_maintenance_fields()` (Phase 28, unchanged
+  signature) -- `VehiclesTab._on_edit` now calls both together, having
+  first fetched the full row via `db.get_vehicle()` instead of reading
+  three cells out of the summary table (which never had the new fields
+  to read from anyway). Date fields validated (YYYY-MM-DD or blank)
+  before the dialog accepts, matching the validation style
+  `VehicleMaintenanceDialog` already used for its own (now-removed)
+  editable fields.
+- **Design change 2 -- `VehicleMaintenanceDialog`'s vehicle-detail
+  section made fully read-only.** Every field that was a `QLineEdit` is
+  now a plain `QLabel` (`objectName="fieldValue"`). While rebuilding this
+  section, found and fixed **Bug 2**: the original two-column layout used
+  two independent side-by-side `QFormLayout`s nested inside a
+  `QGridLayout`, which is exactly what produced the overlapping-text
+  layout the project owner's first screenshot showed -- each
+  `QFormLayout` negotiates its own row heights independently, and putting
+  two of them side by side in one grid cell doesn't force them to agree,
+  so the column with more rows (the right one, with 7 fields vs. the
+  left's 4) drifted out of vertical alignment with the shorter one and
+  visually overlapped it. Fixed with a single flat `QGridLayout`
+  addressed by explicit `(row, col)` coordinates per field pair (a new
+  `_field_row()` helper) -- there's no second layout's row-height
+  negotiation left to disagree with the first. Verified via the same
+  before/after screenshot method as Bug 1: the "after" capture shows
+  clean, non-overlapping field rows.
+- **Design change 3 -- service history rebuilt as an Access-style
+  "Continuous Forms" grid,** replacing Phase 28's separate add/edit-form-
+  above-a-read-only-table entirely. This directly reverses Phase 28's own
+  "deliberate adaptation" (avoiding an editable-table-cell pattern since
+  none existed elsewhere in this codebase) -- the project owner's
+  Continuous Forms clarification explicitly asked for exactly that
+  pattern here, so it's now the one place in the app that has it, by
+  direct request rather than by drift. Every `QTableWidget` row is
+  directly editable: native cell editing for the text/number columns
+  (`setEditTriggers(DoubleClicked | EditKeyPressed | AnyKeyPressed)`), a
+  real `QComboBox` for Service Type via `setCellWidget` so it always
+  displays as a dropdown, not only when a row is selected. A row
+  auto-saves as soon as it's edited -- `itemChanged` (plain cells) or a
+  combo box's `currentIndexChanged` calls `_save_service_row(row)`,
+  which INSERTs via `db.add_service_record()` if that row's column-0
+  `Qt.UserRole` id is still `None` (a genuinely new, unsaved row) or
+  UPDATEs via `db.update_service_record()` otherwise -- verified by test
+  that editing an already-saved row updates in place rather than
+  creating a duplicate record. `"+ Add a Record"` appends one blank row
+  and scrolls to it; `self._suppress_save` guards row construction/
+  population so building a row (setting initial cell text, setting a
+  combo box's starting index) never fires a premature auto-save. Date
+  validation here is deliberately lenient -- an unparseable date in a
+  cell simply isn't auto-saved yet, no interrupting popup -- appropriate
+  for a live continuous grid, unlike `EditVehicleDialog`'s modal
+  validate-then-accept pattern for the same kind of field. The table
+  always opens scrolled to the bottom (`scrollToBottom()`), matching the
+  project owner's "always show the last rows that fit" note from the
+  original mockup, carried over unchanged from Phase 28.
+- **Tested:**
+  - New functional GUI smoke test (offscreen Qt platform, real event
+    loop): `EditVehicleDialog` persists the full expanded field set
+    correctly and rejects an invalid expiry date; `VehicleMaintenanceDialog`
+    displays the same data read-only with correct red-expired styling,
+    and no longer has ANY editable detail-field widgets (asserted
+    directly -- `hasattr(dialog, "model_input")` etc. are all `False`
+    now); adding a Continuous-Forms row and setting its Service Type via
+    the combo box auto-saves an INSERT with no explicit Save click;
+    editing that same row's End Date afterward correctly UPDATEs the
+    same record rather than creating a second one; the Oil Service
+    summary card correctly reflects a newly-added record; adding then
+    immediately deleting a still-unsaved blank row leaves no orphan
+    record in the database.
+  - Two before/after screenshots (via `dialog.grab()` under the
+    offscreen platform) directly confirmed both the theming fix and the
+    layout-overlap fix, rather than trusting the code read alone --
+    matching this project's established "test before considering it
+    done" discipline, extended here to a visual-rendering check the
+    logic tests alone couldn't have caught (the first version's
+    functional test suite had already passed cleanly despite both
+    bugs -- neither was a logic defect, both were purely visual/layout,
+    which is exactly the class of bug that only a rendered screenshot
+    surfaces).
+  - Full existing test suite re-run clean, zero tracebacks.
+  - Migration re-run not needed this phase -- no schema change, purely a
+    UI/widget-organization redesign on top of Phase 28's already-applied
+    columns/table.
+  - **NOT performed, explicitly disclosed:** an actual visual
+    click-through with a real display and real font rendering (this
+    sandbox's offscreen platform renders glyphs as boxes, a known
+    limitation disclosed directly rather than glossed over) -- the
+    project owner's own machine remains the only way to confirm final
+    text-level visual polish; structure, color, and layout were
+    confirmed here, typography was not.
+- **What did NOT change:** no database schema change this phase (all 13
+  vehicle columns and `service_records` already existed from Phase 28);
+  `allocation_engine.py` untouched; every hard business rule unaffected --
+  this phase is UI/UX only, on top of Phase 28's already-shipped data
+  model.
+- `ARCHITECTURE.md` (Section 3.3 substantially revised) and
+  `AI_INDEX.json` (both module entries) updated to match (Rule 14/17/19).
+  No change needed to `AI_CONTEXT.md`, `DATABASE.md`, `BUSINESS_RULES.md`,
+  or `NEXT_SESSION.md` beyond what Phase 28 already updated -- no schema
+  or business-rule change, and Section 7.1 already pointed at
+  `CHANGELOG_AI.md` Phase 28 generally (which this entry extends).
+
+## Phase 28c — Service-history rows not saving (real bug), plus three cosmetic cleanups (2026-08-14, same session as Phase 28/28b)
+
+- **Reported symptom:** the project owner added 2 service records for a
+  real vehicle (A 68982) and neither appeared in the list. Checked the
+  real `fleetplanner.db` directly first, not assumed: `service_records`
+  was completely empty -- zero rows for ANY vehicle, confirming this was
+  a genuine save/persistence failure, not a display/reload bug.
+- **Root-caused with a realistic interaction test, not just re-reading
+  the code.** An earlier functional test (Phase 28b) had called
+  `QTableWidgetItem.setText()`/`combo.setCurrentText()` directly, which
+  does fire `itemChanged` correctly but doesn't reproduce how a real user
+  actually interacts with the grid. A new test using `QTest.mouseDClick`
+  + `QTest.keyClicks` (genuine simulated double-click and typing) found
+  that the double-click never actually opened a cell editor at all
+  (`service_table.state()` stayed `NoState` instead of `EditingState`) --
+  meaning keystrokes went nowhere relevant, so nothing was ever written
+  back to the underlying `QTableWidgetItem` for `itemChanged` to fire on
+  in the first place. Confirmed this wasn't a save-logic bug specifically
+  by testing `service_table.editItem(item)` (an explicit, programmatic
+  "open this cell's editor now" call, bypassing trigger-detection
+  entirely) -- that opened a real editor immediately, and typing + Enter
+  saved correctly on the first try. This isolated the failure to
+  edit-trigger detection specifically, not to `_save_service_row()` or
+  the DB layer, both of which were already proven correct.
+  **Disclosed uncertainty:** this session's sandbox uses Qt's
+  `offscreen` platform, which has known flakiness synthesizing precise
+  mouse coordinates for double-click hit-testing in headless mode --
+  it's possible the exact mechanism differs slightly on the project
+  owner's real machine with a real display and real mouse. Rather than
+  guess further at a mechanism that can't be fully confirmed from this
+  environment, the fix targets the actual reported symptom directly and
+  removes the dependency on trigger-detection for the most common path.
+- **Fix 1 (the real one): `_on_add_record_row()` now calls
+  `service_table.editItem(...)` to open the new row's Start Date cell for
+  editing immediately**, rather than merely selecting it and waiting for
+  the planner to double-click (or know that typing directly also works
+  via the `AnyKeyPressed` trigger). A blank row is now ready to type into
+  the instant "+ Add a Record" is clicked -- matches real MS Access
+  continuous-form behavior (a new row is immediately live) and removes
+  the whole class of "typed but nothing happened because the cell was
+  never actually in edit mode" failure, confirmed fixed by the same
+  realistic `QTest`-based interaction test (now passing).
+- **Fix 2, a genuine but secondary correctness issue found while
+  investigating:** `id_item.setData(Qt.UserRole, new_id)` -- stamping a
+  newly-INSERTed record's id back onto the row right after creating it --
+  itself re-emits `itemChanged` in Qt (`setData()` re-triggers the signal
+  for ANY role, not just the display text), which was silently
+  re-entering `_save_service_row()` for the same row while the original
+  call was still on the stack. Not the cause of lost data (the
+  re-entrant call correctly took the UPDATE branch, since `record_id` was
+  no longer `None` by then), but a wasteful double DB write per new
+  record and a confusing thing to trace. Fixed by wrapping that one
+  `setData()` call in `blockSignals(True/False)`.
+- **Fix 3, a safety net independent of whichever exact mechanism was at
+  fault:** added a `closeEvent()` override calling a new
+  `_flush_all_rows()` (force-saves every row's current on-screen values
+  via the same `_save_service_row()` used for live auto-save, regardless
+  of whether `itemChanged`/`currentIndexChanged` already fired for it).
+  Covers every way the window can close (the Close button's `accept()`,
+  Escape, the OS title-bar X, Alt+F4 -- `QDialog.accept()`/`reject()`
+  both route through `close()`, so one override catches all of them).
+  Verified by test: typing into a cell, moving to another cell via Tab
+  (committing that cell) but never pressing a final Enter, then closing
+  the window immediately -- the record still correctly persists.
+- **Three cosmetic/content changes requested in the same message,
+  unrelated to the bug:**
+  1. Removed the vehicle picture's border/frame styling (was
+     `border: 1px solid #e1e6ef; border-radius: 8px;` on
+     `picture_label`).
+  2. Removed the "(Every field on this window is read-only...)" hint
+     label under the model/type text.
+  3. Removed Reg. Expiry, Tyre Size, Battery Type, and Details from the
+     read-only detail-fields grid -- all four are already shown on the
+     summary cards below (Vehicle Expiry, Tyre Change, Battery Change
+     cards), so repeating them in the grid above was redundant. The grid
+     is now Chassis/Engine/Registration on the left, both certificates +
+     their expiries on the right -- 7 fields instead of 11, still a flat
+     `QGridLayout` with explicit coordinates (Phase 28b's overlap fix),
+     just shorter.
+- **Tested:**
+  - The new realistic `QTest`-based interaction tests (both the one that
+    reproduced the original failure via double-click, and the follow-up
+    confirming the `editItem()` fix resolves the reported add-record
+    scenario, and the Tab-then-close-without-Enter scenario exercising
+    the `_flush_all_rows()` safety net).
+  - Full existing test suite and the Phase 28b functional GUI test
+    (auto-save INSERT/UPDATE, read-only field assertions, card refresh,
+    unsaved-row deletion) re-run clean after all of the above.
+  - A before/after screenshot confirmed the picture border is gone and
+    the detail-fields grid is now shorter with no overlap.
+  - **NOT performed, explicitly disclosed:** a real click-through with a
+    real mouse and a real double-click on the project owner's own
+    machine -- the exact trigger-detection mechanism that failed in this
+    sandbox's offscreen platform could not be independently confirmed to
+    be identical to whatever happened on a real display; the fix targets
+    the reported symptom directly (new rows are now immediately editable
+    with no double-click required, and closing the window force-saves
+    regardless) rather than resting entirely on having pinned one single
+    root cause.
+- **What did NOT change:** no database schema change; `allocation_engine.py`
+  untouched; `db.add_service_record()`/`update_service_record()` and
+  every other Phase 28 DB function are unchanged -- this phase is a
+  bug fix plus cosmetic trims inside `vehicle_maintenance_dialog.py`
+  only.
+- `ARCHITECTURE.md` Section 3.3 not further expanded this phase (the
+  fix is narrow enough to be fully captured here in `CHANGELOG_AI.md`
+  without restating the whole section) -- no other `/AI` file needed
+  updating.
+
+## Phase 28d — Service-history rows STILL not saving after Phase 28c (real bug, Phase 28c's own claim about Qt was wrong) (2026-08-14, same session as Phase 28/28b/28c)
+
+- **Reported symptom, unchanged from Phase 28c:** project owner added 4
+  service records to the same real vehicle (A 68982), closed the Vehicle
+  Maintenance Log, reopened it -- service history still empty. This meant
+  the Phase 28c fix did not actually solve the problem it was written for.
+- **Root cause, found by re-deriving Qt's actual behavior instead of
+  re-testing the same assumption:** Phase 28c's changelog entry above
+  states "`QDialog.accept()`/`reject()` both route through `close()`" --
+  **this claim was wrong.** `QDialog.accept()` and `.reject()` actually
+  route through `done()` -> `hide()`. They do **not** call `close()`.
+  Phase 28c's fix was a `closeEvent()` override alone, and the "Close"
+  button is wired as `close_btn.clicked.connect(self.accept)` -- so every
+  real click of that button called `accept()` directly, never triggering
+  `closeEvent()` at all. The Phase 28c safety net was live code that
+  never actually ran for the single most common way this window closes.
+  Phase 28c's own testing (`dialog.close()`) had given false confidence
+  because it tested a different method than the one the real button
+  calls.
+- **Fix 1: `accept()` and `reject()` are now overridden directly**, each
+  calling the existing `_flush_all_rows()` before `super().accept()`/
+  `super().reject()`. `closeEvent()` is kept as-is, for the one path that
+  genuinely is a `close()` call (the OS title-bar X / Alt+F4) --
+  `_save_service_row()` is idempotent (INSERT once an id exists becomes
+  an UPDATE), so a row flushed twice in a row (e.g. via `accept()` then
+  an incidental `closeEvent()`) is harmless.
+- **Fix 2, found while writing a rigorous test for Fix 1 (a second, real
+  bug, not just a leftover risk):** the first version of the
+  `accept()`/`reject()` test only asserted the record *count*, which
+  passed even though the actual typed value was silently lost --
+  `_flush_all_rows()` reads each cell via `QTableWidgetItem.text()`, but
+  a still-open (uncommitted) cell editor's typed text lives only in the
+  editor widget until it commits (via Tab/Enter, or losing focus, or the
+  current cell changing) -- `item.text()` still returns the OLD value
+  until then. If the planner is still mid-edit in a cell (typed but never
+  pressed Tab/Enter, and the mouse click on Close doesn't happen to move
+  focus first) when the window closes, the row would still get created
+  (since the Service Type combo always has a default value) but with the
+  in-progress field left blank -- a silent partial data loss, not just a
+  cosmetic issue. Fixed by having `_flush_all_rows()` clear the table's
+  current cell first when `service_table.state()` is `EditingState`,
+  which is what makes Qt commit and close a still-open editor (the same
+  thing that already happens when a user clicks a different cell) --
+  *before* the per-row save loop reads cell text, not after.
+- **Tested:**
+  - New test: types into a cell with **zero** commit keystrokes (no Tab,
+    no Enter, no click elsewhere) and calls `dialog.accept()` directly --
+    asserts both the record count *and* the actual saved value. Failed
+    against Fix 1 alone (record created, but `start_date` was `None` --
+    the typed value was lost); passes with Fix 2 added (`start_date`
+    correctly comes back as the exact typed text).
+  - Re-ran every Phase 28c interaction test (Tab-commit-then-close,
+    type-immediately-after-Add-then-Enter) -- all still pass, no
+    regressions.
+  - Full existing `tests/` suite (`unittest discover`) re-run clean --
+    all module-level `PASS`/`ALL ... TESTS PASSED` banners present, no
+    tracebacks.
+  - Phase 28b functional GUI test (`vehicle_maintenance_dialog.py`
+    end-to-end: auto-save INSERT/UPDATE, read-only fields, card refresh,
+    unsaved-row deletion) re-run clean.
+  - **NOT performed, explicitly disclosed:** a real click-through with a
+    real mouse on the project owner's own machine. In genuine mouse-driven
+    use, clicking a button elsewhere in the dialog typically moves focus
+    away from an open cell editor before the click's `clicked()` signal
+    even fires, which independently commits the editor's data through
+    Qt's normal focus-out handling -- meaning the exact failure mode Fix 2
+    targets (a *still-open* editor at the moment `accept()` runs) may be
+    rarer via mouse than via this session's direct programmatic
+    `dialog.accept()` calls. Fix 2 is applied regardless, since it closes
+    the gap unconditionally rather than relying on that incidental
+    ordering.
+- **What did NOT change:** no database schema change; no other dialog or
+  module touched; `_save_service_row()`, `db.add_service_record()`, and
+  `db.update_service_record()` are unchanged -- this phase is a targeted
+  fix to `accept()`/`reject()`/`_flush_all_rows()` in
+  `vehicle_maintenance_dialog.py` only.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28e — Service-history Start/End Date: default to today + DD-MM-YYYY display (2026-08-14, same session as Phase 28/28b/28c/28d)
+
+- **Requested:** the service-history grid's Start Date and End Date cells
+  should (1) default to today's date on a brand-new row, and (2) display/
+  accept `DD-MM-YYYY` instead of the previous `YYYY-MM-DD`.
+- **Step 1 (prior message in this session), default-to-today only:**
+  `_insert_service_row()` was changed so a brand-new row (`record is
+  None`) pre-fills both `SC_START`/`SC_END` with `date.today().isoformat()`
+  instead of blank text. Existing rows loaded from the DB were untouched
+  (`record["start_date"]`/`["end_date"]` used as-is). Verified: new row
+  shows today's date in both cells; accepting the default as-is (no
+  actual edit) still persists correctly via the Phase 28d
+  `_flush_all_rows()` safety net, since Qt's own `itemChanged` does not
+  fire for a no-op commit of an unchanged value -- not a new gap, the
+  same flush-on-close mechanism already covers it.
+- **Step 2 (this message), format change to DD-MM-YYYY:** the DB itself
+  still stores `service_records.start_date`/`end_date` as ISO
+  (`YYYY-MM-DD`) -- unchanged, since every other date field in this
+  dialog (RTA/Ad certificate expiry checks, summary-card dates) already
+  parses and compares that format via `_parse_iso_date`/`_display_date`.
+  Only the *editable grid cells themselves* now show/accept
+  `DD-MM-YYYY`. Two new helper functions added:
+  - `_parse_display_date(text)` -- parses `%d-%m-%Y`, mirroring
+    `_parse_iso_date`'s leniency (returns `None` on anything unparseable
+    rather than raising).
+  - `_iso_to_display(iso_text)` / `_display_to_iso(text)` -- convert
+    between the DB's ISO storage format and the grid's DD-MM-YYYY display
+    format, in each direction.
+  `_insert_service_row()` now runs `record["start_date"]`/`["end_date"]`
+  through `_iso_to_display()` before putting them in the cell (blank/
+  unparseable becomes `""`, same as before); the new-row default was
+  updated to `date.today().strftime("%d-%m-%Y")` to match. `_save_service_row()`
+  now runs the raw cell text through `_display_to_iso()` before building
+  the `db.add_service_record()`/`update_service_record()` kwargs -- the
+  lenient "don't save yet, leave it editable" check moved from
+  `_parse_iso_date(...)` to `_display_to_iso(...) is None` on the same
+  non-blank-but-unparseable condition, preserving Phase 28c's original
+  behavior (never block/pop up on typing, just don't save until it
+  parses).
+- **Tested:**
+  - New test: an existing record seeded directly in the DB with ISO
+    dates (`2026-03-05`/`2026-03-07`) displays in the grid as
+    `05-03-2026`/`07-03-2026`.
+  - New row's Start/End Date cells default to today formatted as
+    `DD-MM-YYYY`.
+  - Typing a custom date (`25-12-2026`) into a cell and committing stores
+    the correct ISO value (`2026-12-25`) in `service_records` -- confirms
+    the round-trip conversion is correct in both directions, not just
+    display.
+  - Full existing `tests/` suite re-run clean (all module-level `PASS`
+    banners present, no tracebacks).
+  - Phase 28b functional GUI test and the Phase 28d flush-on-`accept()`
+    test both required updating their typed-date literals from ISO
+    (`2026-01-16`) to DD-MM-YYYY (`16-01-2026`) to match the new input
+    contract -- this was an expected update to the tests themselves, not
+    a regression: typing an ISO-formatted date into the grid is now
+    correctly treated as unparseable input (consistent with Phase 28c's
+    existing "don't save until it parses" leniency) since the grid's
+    contract changed to DD-MM-YYYY. Both re-ran clean after the update.
+- **What did NOT change:** `service_records` DB storage format (still
+  ISO); `EditVehicleDialog`'s own date fields (Reg Expiry, RTA/Ad
+  certificate expiries) -- those are a separate area, not part of this
+  request, and still use ISO entry; the read-only summary cards and
+  RTA/Ad expiry labels elsewhere in this dialog, which already use the
+  unrelated `_display_date()` (`%d-%b-%Y`, e.g. "16-Jan-2026") format and
+  were not touched.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28f — New-row selection color, header divider line, scroll-to-last-row bug (2026-08-14, same session as Phase 28/28b/28c/28d/28e)
+
+- **Reported from a real screenshot (13 real records added):** (1) a
+  freshly-added row rendered with every cell painted solid red, unreadable
+  while typing; (2) a dark vertical line along the right edge of the
+  row-number column, inconsistent with its own grey background; (3) with
+  13 rows saved, opening the dialog showed only up to row 10 -- the last
+  3 rows required manual scrolling to see, when the dialog is meant to
+  always open scrolled to the most recent record.
+- **Root cause 1 (red row):** `service_table.setSelectionBehavior(QTableWidget.SelectRows)`
+  plus `_on_add_record_row()`'s `setCurrentCell(row, SC_START)` makes the
+  newly-added row the table's "current selected row." The dialog's
+  stylesheet never set `selection-background-color`/`QTableWidget::item:selected`,
+  so Qt fell through to the OS/Windows system highlight color for
+  selected rows -- red on this system (a Windows accent-color setting,
+  not something this code chose). Fixed by adding explicit
+  `selection-background-color: #cfe3fb` (a light blue, dark text stays
+  readable while typing) plus a matching `QTableWidget::item:selected`
+  rule, so the color is no longer at the mercy of the OS accent color.
+- **Root cause 2 (dark line by the row numbers):** the vertical header's
+  `QHeaderView::section` rule only set `border-bottom`, leaving the
+  native OS chrome for the section's right edge to show through as a
+  dark 3D-bevel line, and the very top-left corner cell (a distinct
+  `QTableCornerButton` widget, not a header section at all, so it wasn't
+  covered by the `QHeaderView::section` rule either) was unstyled.
+  Fixed by adding `border-right: 1px solid #f5f7fa` (matching the header's
+  own background, i.e. effectively invisible) to `QHeaderView::section`,
+  plus an explicit `QTableCornerButton::section { background: #f5f7fa;
+  border: none; }` rule.
+- **Root cause 3 (doesn't open on the true last row), a real timing bug:**
+  `_reload_service_records()` called `self.service_table.scrollToBottom()`
+  synchronously, which for the dialog's very first load runs *during
+  `__init__`*, before the dialog has ever been shown or laid out. Qt
+  computes a scrollbar's `maximum()` from the viewport's actual current
+  geometry -- before the first show/layout pass, that geometry isn't
+  final yet, so `scrollToBottom()` scrolls to what it currently believes
+  is the bottom, which is short of the true bottom once the dialog
+  finishes laying out at its real size. **Confirmed causally**, not just
+  theorized: a side-by-side test with 60 seeded records and a
+  height-constrained table showed the old immediate-call pattern landing
+  at scrollbar value 44 of maximum 56 (stops well short, matching the
+  reported "13 rows, only see up to 10"), while deferring the call
+  reaches the true maximum (56 of 56). Fixed by wrapping the call in
+  `QTimer.singleShot(0, self.service_table.scrollToBottom)` --
+  runs on the next event-loop pass, after the pending layout/show has
+  completed, so the scrollbar range is already correct by the time it
+  fires. The `_on_add_record_row()` call to `scrollToBottom()` (used when
+  adding a row to an already-visible, already-laid-out dialog) was left
+  as an immediate call -- no timing gap exists there, since the dialog is
+  already shown by that point.
+- **Tested:**
+  - New test seeds 60 records, forces a height-constrained viewport
+    (guaranteeing scrolling is actually required rather than trivially
+    already satisfied), and confirms the scrollbar reaches its true
+    maximum and the last row's rect is fully within the visible viewport
+    on open, with no manual scrolling.
+  - The causal side-by-side comparison described above (old immediate
+    call vs. new deferred call) confirmed the fix, not just the absence
+    of an error.
+  - Full existing `tests/` suite and both Phase 28b/28e functional GUI
+    tests re-run clean, no regressions.
+  - **NOT independently confirmed:** that the reported red color was
+    specifically this project owner's Windows accent-color setting
+    (rather than some other OS-level cause) -- the fix (explicit
+    `selection-background-color`) makes the row's color deterministic and
+    stylesheet-controlled either way, so it resolves the symptom
+    regardless of the exact underlying OS mechanism.
+- **What did NOT change:** no database schema, no scheduling/allocation
+  logic, no other dialog -- purely stylesheet additions plus one
+  scroll-timing fix, all inside `vehicle_maintenance_dialog.py`.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28g — Service Type combo box can silently change on accidental mouse-wheel scroll (2026-08-14, same session as Phase 28/28b-28f)
+
+- **Reported risk:** a plain `QComboBox` (used for the Service Type
+  column in the service-history grid) changes its selected value on any
+  mouse-wheel scroll while the cursor is over it -- including just
+  scrolling the table itself past that row, with no intent to open or
+  change the combo box at all. Left as-is, this could silently corrupt
+  an already-saved service record's type.
+- **Fix:** added `_NoScrollComboBox(QComboBox)`, overriding `wheelEvent`
+  to call `event.ignore()` instead of the default handling. `_insert_service_row()`
+  now creates this subclass instead of a plain `QComboBox` for the
+  Service Type cell. Ignoring (rather than accepting) the event is what
+  makes Qt propagate it up to the table's viewport afterward, so
+  scrolling the table with the cursor over a Service Type cell still
+  scrolls normally -- only the combo box's own value stops changing by
+  accident.
+- **Tested:**
+  - Confirmed the test methodology itself first: a plain `QComboBox` at a
+    non-boundary index genuinely does change value when a constructed
+    `QWheelEvent` is delivered to it (rules out a false-positive pass).
+  - `_NoScrollComboBox` under the identical wheel event: `currentIndex()`
+    unchanged, and `event.isAccepted()` is `False` (confirms it's left
+    for the parent to handle, not silently swallowed).
+  - Confirmed the real service-history grid's Service Type cell widget is
+    actually an instance of `_NoScrollComboBox`, not just that the class
+    works in isolation.
+  - Full existing `tests/` suite and the Phase 28b functional GUI test
+    re-run clean, no regressions.
+- **What did NOT change:** the combo box's normal behavior when actually
+  clicked open (mouse click, keyboard Up/Down/Enter) is untouched -- only
+  wheel-scroll-while-not-open is blocked; no database or other dialog
+  changed.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28h — Always-visible themed scrollbar + cards/field-info font size increase (2026-08-14, same session as Phase 28/28b-28g)
+
+- **Requested:** (1) an explicit, visible scrollbar for the service-history
+  table (in addition to the existing wheel-scroll and drag), and (2) as
+  the first step of a broader planned pass on the top portion of the
+  window ("everything is scattered around"), increase the font size of
+  the summary cards and the detail-fields grid (Chassis/Engine/
+  Registration/RTA/Ad certificate info) by 2px.
+- **Scrollbar:** `service_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)`
+  -- the scrollbar was always functionally present (Qt's default
+  `ScrollBarAsNeeded`), but this project's own convention (stated in this
+  file's module docstring) is that every widget in this dialog is styled
+  explicitly rather than left to inherit OS-native look -- the scrollbar
+  had never been styled at all up to this point. Added explicit
+  `QScrollBar:vertical`/`::handle:vertical` rules (light grey track,
+  darker grey handle, no arrow buttons) so it's a clearly visible,
+  themed, always-present manual control, not dependent on the OS style
+  rendering an easily-missed thin/auto-hide bar.
+- **Font size:** `QLabel#cardTitle` 11->13px, `QLabel#cardDate` 13->15px,
+  `QLabel#cardExtra` 11->13px, `QLabel#fieldLabel` 12->14px,
+  `QLabel#fieldValue` 13->15px -- a flat +2px on every card and
+  detail-field text style. Scoped deliberately to just the cards and the
+  Chassis/Engine/Registration/RTA/Ad-certificate field grid (what the
+  project owner named as "the cards and other information") -- the large
+  header elements (vehicle model/year title, plate, type) were left
+  untouched, since those are a distinct visual style already and weren't
+  named in the request. The rest of "the top portion... scattered
+  around" is explicitly a follow-up the project owner flagged as future
+  work, not part of this change.
+- **Tested:** confirmed `verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOn`
+  and that every one of the five updated font-size stylesheet rules is
+  present with its new value. Full existing `tests/` suite and the Phase
+  28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** no database, no scheduling logic, no other
+  dialog; the header/plate/model-year text sizes are untouched pending
+  the project owner's next instruction on the rest of the top-portion
+  layout.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28i — Vehicle Expiry card date alignment, 3-column detail-field grid, taskbar-overlap fix (2026-08-14, same session as Phase 28/28b-28h)
+
+- **Requested:** (1) the Vehicle Expiry card's date sat higher than the
+  other four cards' dates because it had no fourth ("extra") line like
+  they do -- move Registration # into that card as its bottom line
+  (unlabeled, same style as the other cards' extras) so all five cards
+  share the same structure and their dates line up; (2) reorganize the
+  Chassis/Engine/RTA/Ad-certificate detail fields from 2 columns x 4 rows
+  into 3 column-pairs x 2 rows (Chassis+Engine | RTA Cert+RTA Expiry | Ad
+  Cert+Ad Expiry) to shorten that section and free vertical space to pull
+  the cards and service table up; (3) the project owner separately
+  reported the window now extends below their taskbar.
+- **Card fix:** `_refresh_cards()`'s `"Vehicle Expiry"` card entry now
+  passes `row["vehicle_registration"]` as its `extra_text` argument
+  instead of `None` -- reuses `_make_card()`'s existing unlabeled
+  extra-line rendering (same as Battery/Tyre/Oil/Chiller's extras), no
+  new code path needed.
+- **Detail-fields grid:** `_build_detail_fields()` rebuilt from
+  `(0,0)=Chassis/(0,2)=RTA#/(1,0)=Engine/(1,2)=RTA Expiry/(2,0)=Registration/(2,2)=Ad#/(3,2)=Ad Expiry`
+  (2 cols, 4 rows) to `(0,0)=Chassis/(1,0)=Engine/(0,2)=RTA#/(1,2)=RTA Expiry/(0,4)=Ad#/(1,4)=Ad Expiry`
+  (3 column-pairs, 2 rows) -- added `grid.setColumnStretch(5, 1)` to
+  match the existing stretch on columns 1 and 3. Registration # is fully
+  removed from this grid (it's the card's job now) -- the
+  `self.registration_value` attribute and its `_load_vehicle()` line
+  (`self.registration_value.setText(...)`) were both deleted rather than
+  left dangling.
+- **Taskbar-overlap fix, a real bug in the original attempt:** first pass
+  clamped only the initial `resize()` call to `screen.availableGeometry()`
+  (which already excludes the taskbar) minus a margin, but left
+  `setMinimumSize(950, 700)` as a hard, unclamped floor -- on a screen
+  small enough that the clamped target width/height falls below 950/700,
+  that `setMinimumSize()` call would force the dialog straight back past
+  the clamp, defeating it. Caught by testing on this session's headless
+  800x800 virtual screen: dialog came back at 950x760 (width forced back
+  to the unclamped 950 floor) instead of respecting the ~760 cap. Fixed
+  by computing the SAME `avail-40` cap for both the minimum size and the
+  target size before calling either `setMinimumSize()` or `resize()` --
+  keeps `target >= minimum` by construction, so the later `resize()` call
+  can never be overridden back upward by the minimum. On a normal-sized
+  monitor (the cap exceeds 1050x950), both values are unaffected and the
+  dialog opens at its original 1050x950 size, unchanged.
+- **Tested:**
+  - `registration_value` confirmed removed from the dialog entirely.
+  - Vehicle Expiry card's extra line confirmed showing the vehicle's
+    actual registration value.
+  - Chassis/Engine/RTA/Ad certificate values confirmed still populated
+    correctly through the new 3-column-pair grid positions.
+  - Sizing: on this session's 800x800 headless screen, confirmed the
+    dialog is clamped to fit (760x760, within the 800x800 minus margin
+    cap) -- this is what caught the `setMinimumSize` bug above before it
+    reached the project owner.
+  - Full existing `tests/` suite and the Phase 28b functional GUI test
+    (which reads `chassis_value`/`rta_cert_expiry_value` but never
+    referenced `registration_value`) re-run clean, no regressions.
+  - **NOT independently confirmed:** the actual visual date alignment
+    across all five cards on a real screen (this environment can inspect
+    widget structure and text content but not pixel-perfect visual
+    alignment) -- the fix works by giving Vehicle Expiry the identical
+    icon/title/date/extra structure the other four cards already have,
+    which is what was causing the misalignment, but a real-screen visual
+    check is still worth doing.
+- **What did NOT change:** no database schema (vehicle_registration was
+  already a column, just displayed in a different place now); no
+  scheduling/allocation logic; the rest of the top-of-window layout the
+  project owner flagged as "scattered" is still open, pending their next
+  instruction.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28j — Top-of-window reorganization, attempted then reverted (2026-08-14, same session as Phase 28/28b-28i)
+
+- A reorganization of the top-of-window layout (consolidated
+  Model/Type/Chassis/Engine + RTA row, centered enlarged picture/plate,
+  separate Ad Certificate row) was implemented based on a dense,
+  multi-part instruction with several genuinely ambiguous points
+  (flagged to the project owner at the time -- interpretation of "same
+  line," which of two plate-related images to remove, exact picture
+  sizing). The project owner reviewed it and said "you messed it up,"
+  asking for it to be undone.
+- **Reverted in full**, back to the exact Phase 28i state:
+  `_build_top_info_row()`, `_build_picture_plate_row()`, and
+  `_build_ad_certificate_row()` were removed; `_build_vehicle_info()` and
+  `_build_detail_fields()` were restored verbatim (18px/13px Model/Type
+  fonts, the `plate_background.png` border-image, 150x100 picture box,
+  the Phase 28i 3-column-pair detail-fields grid). The `QFrame#plateBox`
+  stylesheet rule added for the attempt was removed. The file was never
+  committed to git, so this was a manual restoration (re-typing the
+  known-good prior code) rather than a `git checkout` -- verified by
+  re-running the Phase 28i layout test and the full existing test suite,
+  both clean, confirming the file is back to behaving exactly as it did
+  at the end of Phase 28i.
+- **What did NOT change:** everything from Phase 28i and earlier (the
+  Vehicle Expiry card's Registration-# line, the 3-column-pair detail
+  grid, the screen-size-aware dialog sizing, the no-scroll combo box, the
+  scrollbar, the card/field font-size increase) is untouched and intact.
+- The top-of-window layout is back to how Phase 28i left it, awaiting
+  a clearer or differently-scoped instruction before attempting this
+  again.
+
+## Phase 28k — Model/Type font size increase, step 1 of the top-of-window redo (2026-08-14, same session as Phase 28/28b-28j)
+
+- Project owner asked to redo the top-of-window reorganization step by
+  step this time (after Phase 28j's all-at-once attempt was reverted).
+  First step: increase the Model/Year and Type label font sizes by 2px
+  each -- `model_year_label` 18px -> 20px, `type_display` 13px -> 15px.
+  Nothing else in the dialog touched.
+- **Tested:** confirmed both stylesheet values programmatically. Full
+  existing `tests/` suite re-run clean, no regressions.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28l — Chassis/Engine/RTA pulled into one stacked column under Type, step 2 (2026-08-14, same session as Phase 28/28b-28k)
+
+- Second step of the step-by-step top-of-window redo: Chassis, Engine,
+  RTA Certificate #, and RTA Certificate Expiry moved out of the
+  separate detail-fields grid and into the left info column, directly
+  under Type -- Model, Type, Chassis, Engine, RTA #, RTA Expiry are now
+  one single vertical stack (not spread across a row), with equal
+  spacing throughout matching the existing 6px Chassis-Engine gap
+  (`left.setSpacing(6)` on the outer column plus
+  `fields_grid.setVerticalSpacing(6)` on the inner Chassis/Engine/RTA/RTA
+  Expiry grid -- both 6px, so every gap in the stack, including
+  Model-Type and Type-Chassis, comes out equal). `_build_detail_fields()`
+  now only contains Ad. Certificate #/Expiry (everything else moved out
+  of it across Phase 28i and this phase).
+- **Tested:** new test confirms Chassis/Engine/RTA/RTA-Expiry value
+  labels share the same x-position (one column, not spread across the
+  row) in top-to-bottom order, and that every consecutive gap in the
+  stack measures exactly 6px -- including the Chassis-Engine gap, which
+  was required to stay unchanged. Full existing `tests/` suite and the
+  Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** Ad. Certificate #/Expiry position (still its
+  own row below, untouched this step); the picture/plate row; the cards;
+  the service table. `_load_vehicle()` needed no changes -- same
+  attribute names as before, only their layout position changed.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28m — Ad Certificate moved beside RTA, detail-fields row removed, cards/table pulled up (2026-08-14, same session as Phase 28/28b-28m)
+
+- Project owner clarified Phase 28l never touched Ad. Certificate's
+  position (it had always been its own stacked row/pair, unchanged) --
+  noted as a misunderstanding, no action needed there. The actual
+  request: place Ad. Certificate #/Expiry directly beside RTA
+  Certificate #/Expiry (same two rows, not below), then let the cards
+  and service table move up into the freed space.
+- Ad. Certificate #/Expiry moved out of the now-fully-empty
+  `_build_detail_fields()` and into the same `fields_grid` used for
+  Chassis/Engine/RTA inside `_build_vehicle_info()`'s left column --
+  added at columns 2/3, rows 2/3 (the same rows RTA #/Expiry occupy at
+  columns 0/1), with `fields_grid.setColumnStretch(3, 1)` added to match.
+  `_build_detail_fields()` had nothing left in it afterward, so it was
+  deleted entirely (not left as unused dead code) along with its
+  `root.addLayout(...)` call in `__init__`.
+- Removing that whole layout row is what pulls the cards row up and
+  gives the service table more room -- no separate sizing code was
+  needed: `root.addWidget(self.service_table, 1)` already had a stretch
+  factor of 1 (the only stretchy item in the dialog's main layout), so
+  with one fewer fixed-height row above it, Qt's layout automatically
+  gives that freed vertical space to the table.
+- **Tested:** new test confirms `_build_detail_fields` no longer exists
+  on the dialog, all four certificate values still populate correctly,
+  and Ad Cert #/Expiry share the exact same row (same y) as RTA
+  #/Expiry respectively while sitting to their right (same x-ordering
+  check as Phase 28l's stack test, applied here for a same-row instead
+  of same-column relationship). Full existing `tests/` suite and the
+  Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** the Model/Type/Chassis/Engine/RTA vertical
+  stack from Phase 28l (Ad Certificate was added beside RTA, not
+  restacked into that same column); the picture/plate row; the cards'
+  own layout; `_load_vehicle()` (same attribute names, only positions
+  changed).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28n — Plate field moved and resized, then removed entirely at the project owner's request (2026-08-14, same session as Phase 28/28b-28m)
+
+- First attempt moved the plate between Engine and RTA and narrowed it,
+  based on reading "on top of the tyre card" vs. "on top of the Ad
+  certificate" as the second clause correcting the first (disclosed as
+  an interpretation at the time). The project owner corrected this: the
+  actual ask was only to resize the plate to a card's width and
+  position it above Ad Certificate -- not to insert it between Engine
+  and RTA -- and asked to undo the step rather than have it re-guessed,
+  removing the plate and `plate_background.png` reference from the
+  dialog entirely so it can be re-added fresh next.
+- **Reverted:** `top_fields`/`bottom_fields` (the two grids split apart
+  in the first attempt to make room for the plate) were merged back into
+  a single `fields_grid`, identical to the Phase 28m state (same row/
+  column indices: Chassis/Engine at rows 0/1 col 0, RTA/Ad Certificate
+  at rows 2/3 cols 0 and 2). The entire `plate_box`/`plate_display`
+  block was deleted, not just moved back -- `self.plate_display` no
+  longer exists on the dialog at all. The matching
+  `self.plate_display.setText(row["plate"] or "")` line in
+  `_load_vehicle()` was removed too, since leaving it would throw an
+  `AttributeError` against a widget that no longer exists.
+- **Tested:** confirmed `plate_display` doesn't exist on the dialog.
+  Full existing `tests/` suite and the Phase 28b functional GUI test
+  re-run clean, no regressions.
+- **What did NOT change:** everything from Phase 28m (Chassis/Engine/RTA/
+  Ad Certificate stack and positions, the cards, the service table) is
+  back to exactly that state; the picture (`picture_label`) is
+  untouched, still in its original position/size beside `left`.
+  `plate_background.png` itself was not deleted from disk, consistent
+  with this project's rule against removing assets without an explicit
+  instruction to do so.
+- The plate is intentionally absent from the dialog right now, awaiting
+  the project owner's next, more specific instruction for reintroducing
+  it.
+
+## Phase 28o — Plate and picture sized/positioned from a supplied before/after reference image (2026-08-14, same session as Phase 28/28b-28n)
+
+- **Requested:** the project owner supplied two reference images
+  (`MISC/Image_1.png` = current state, `MISC/Image_2.png` = target) and
+  asked to measure them and reproduce the target's plate/picture sizing
+  and positioning exactly, rather than re-guess in words. Both PNGs are
+  1303x966.
+- **Measurement approach, using PySide6's own `QImage` (no PIL available
+  in this environment) to read real pixel data:**
+  - Established a mockup-to-actual-pixel scale factor two independent
+    ways, both agreeing closely: (1) the header icon's rendered height is
+    a fixed 48px in code (`scaledToHeight(48)`); measured 60px in the
+    mockup -> 0.80. (2) Built a real dialog with sample data matching the
+    mockup's own displayed values (same chassis/engine/RTA/Ad
+    certificate/tyre/battery text, same service records) so the five
+    summary cards' auto-sized widths would be a fair comparison, not
+    skewed by different text lengths -- measured cards averaged 0.80x
+    their mockup widths. Cross-validation on two unrelated fixed-size
+    reference elements landing on the same factor gave confidence in
+    0.80 over a less-verified single measurement.
+  - Diffed Image_1 vs Image_2 pixel-by-pixel to isolate exactly what
+    changed (rather than eyeballing), then precisely bounded the plate
+    (193x90 in the mockup, dead-center horizontally -- 0.5px off dialog
+    center out of 1303, effectively exact) and the picture (393x181)
+    regions. Scaled by 0.80: plate -> 154x72, picture -> 314x145.
+- **Plate re-added** (previously deleted entirely in Phase 28n at the
+  project owner's request) at 154x72, `QFrame.NoFrame`, only
+  `border-image` in its stylesheet (no separate border) -- same
+  no-border requirement as before. **Picture enlarged** from 150x100 to
+  314x145; `KeepAspectRatio` in `_load_vehicle()` (unchanged) still keeps
+  the actual photo undistorted inside the larger box.
+- **Centering, a real bug caught by testing before it reached the
+  project owner:** `_build_vehicle_info()`'s row was rebuilt as a
+  3-column `QGridLayout` (`left` | plate | picture) with equal stretch
+  (1) on the two outer columns, on the assumption that equal stretch
+  forces equal column width. It doesn't -- stretch only distributes
+  *extra* space evenly; it does nothing to reconcile *unequal minimum*
+  column widths, and `left`'s field-grid content is substantially wider
+  than the picture's fixed 314px. Measured: 96px off-center at the
+  default dialog width. Fixed with `_sync_vehicle_info_columns()`, a
+  method deferred via `QTimer.singleShot(0, ...)` (same reasoning as the
+  Phase 28i `scrollToBottom()` fix -- needs real post-layout geometry)
+  that reads `left`'s own `sizeHint().width()` (not the grid cell's
+  current, possibly-already-skewed rendered width, which would create a
+  feedback loop) and sets the picture's column to the same minimum
+  width, forcing both sides truly equal. Verified centered exactly
+  (0px difference) at three different dialog widths (1050, 1200, 1000),
+  confirming it holds dynamically across resizes, not just at one
+  specific size.
+- **Plate text overlap, a second real bug found via a rendered
+  screenshot, not just geometry checks:** `plate_background.png` itself
+  has "DUBAI" pre-printed into its upper-left area (measured: occupies
+  roughly the top 36% of the image's height) -- simply center-aligning
+  `plate_display` in the whole box put the plate-number text right on
+  top of the printed "DUBAI", overlapping. Fixed by adding a top spacing
+  of 26px (36% of the 72px box height) before the label, with stretches
+  on both sides of it to center it within the remaining lower area
+  instead of the whole box. Confirmed visually via a 3x-scaled crop of
+  just the plate widget -- "DUBAI" and the plate number no longer
+  overlap.
+- **Tested:** exact centering confirmed via widget geometry at multiple
+  widths (see above); plate size/frame/style confirmed (154x72,
+  NoFrame, border-image-only stylesheet); picture size confirmed
+  (314x145); a full-dialog screenshot with mockup-matching sample data
+  was rendered and inspected for gross layout problems -- structure
+  reads as intact and closely matching the reference image's
+  proportions, modulo this environment's known `offscreen`-platform text
+  rendering limitation (boxes instead of glyphs). Full existing
+  `tests/` suite and the Phase 28b functional GUI test re-run clean, no
+  regressions.
+- **What did NOT change:** Chassis/Engine/RTA/Ad Certificate stack and
+  positions (Phase 28l/28m, untouched); the cards; the service table;
+  `plate_background.png` and the vehicle picture data itself -- only
+  sizing/positioning of the widgets displaying them.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28p — Vehicle-info section converted to a Qt Designer .ui file (real architecture change, explicit approval given) (2026-08-14, same session as Phase 28/28b-28o)
+
+- **Requested:** after several rounds of the project owner reporting
+  visual results ("picture still small," "plate still distorted") that
+  didn't match what this session's headless/`offscreen` Qt platform could
+  verify, the project owner asked for a free mouse-driven tool instead of
+  continued text-described code changes. Recommended Qt Designer
+  (`designer.exe`, already bundled with the project's installed PySide6
+  package -- no download needed) via `AskUserQuestion`, since this
+  dialog's layout is hand-written Python, not a `.ui` file Designer can
+  open directly. The project owner chose to have this section converted
+  to a `.ui` file, explicitly asking that it not require converting back
+  to Python afterward -- confirmed `QUiLoader` (runtime XML loading, no
+  compile step) as the approach, as opposed to `pyside6-uic`
+  (compile-to-Python, which would need re-running after every Designer
+  edit). This is a real architecture change to this one file, called out
+  per this project's rule requiring explicit approval before such
+  changes -- approval was given in the same exchange.
+- **Scope:** only the vehicle-info section (Model/Year, Type, Chassis,
+  Engine, RTA Certificate #/Expiry, Ad. Certificate #/Expiry, plate,
+  picture -- i.e. `_build_vehicle_info()`'s previous contents) was
+  converted. The header, summary cards, and service-history table were
+  deliberately left as hand-written Python -- those are populated/rebuilt
+  dynamically at runtime (`_refresh_cards()`, `_reload_service_records()`)
+  rather than being static layouts, which isn't what a `.ui` file is
+  suited for.
+- **New file:** `app/ui/vehicle_info_section.ui`, generated once via
+  `QFormBuilder` (not hand-typed XML) from the exact widget tree
+  `_build_vehicle_info()` used to build -- same object names, sizes,
+  spacing, and Phase 28o measurements. `_build_vehicle_info()` now loads
+  this file at runtime via `QUiLoader` and pulls out the named children
+  (`model_year_label`, `chassis_value`, `plate_display`,
+  `picture_label`, etc.) the rest of the class already references by
+  those exact attribute names -- `_load_vehicle()` and every other method
+  needed **no changes** beyond one styling fix (below).
+- **Three real bugs found and fixed before this reached the project
+  owner, each caught by actually testing the loaded result rather than
+  assuming the conversion was mechanical:**
+  1. **Everything invisible.** `QFormBuilder` serializes each widget's
+     `visible` property as its literal state at save time; since the
+     generator script never called `.show()`, every widget (not just the
+     root) saved as `visible=false`, and `QUiLoader` applies that
+     literally on load -- a parent becoming visible does not override an
+     explicit child `visible=false`. Fixed at the source: the generator
+     now calls `root_widget.show()` before saving, so the file itself
+     carries `visible=true` throughout, matching what Designer would
+     normally produce for a form built visually.
+  2. **Custom property-based styling silently dead.** The first version
+     used `setProperty("_fleetplanner_role", "fieldLabel")` plus a
+     dialog-level `QLabel[_fleetplanner_role="fieldLabel"]` stylesheet
+     rule, mirroring how the pre-.ui code matched by `objectName`.
+     Confirmed by testing that `QFormBuilder` does not serialize
+     arbitrary dynamic properties by default -- the property silently
+     came back `None` after a load round-trip, meaning the rule matched
+     nothing. Fixed by baking the field label/value colors and font
+     sizes directly into each widget's own `styleSheet` property inside
+     the generator (a plain `setStyleSheet()` call, confirmed to survive
+     the round-trip, unlike the dynamic property) -- removed the dead
+     attribute-selector rules from the dialog's stylesheet.
+  3. **Expired-date styling would have silently lost its font-size.**
+     `_load_vehicle()`'s expired-RTA/Ad-Certificate branch calls
+     `value_label.setStyleSheet(f"color: {_EXPIRED_COLOR}; font-weight:
+     700;")` -- since the *baseline* font-size now lives on the widget's
+     own stylesheet (per fix 2 above) rather than a separate
+     dialog-level rule, this call would have fully replaced it, silently
+     shrinking the text back to the default font size only for whichever
+     field happened to be expired. Fixed by including `font-size: 15px`
+     in that override string too. Caught before the project owner ever
+     saw it, by specifically testing an expired-vs-not-expired pair
+     side by side rather than just checking the base state.
+  4. **`setColumnStretch()` doesn't survive the round-trip either** (not
+     a Qt property, a method call) -- re-applied in Python after
+     loading, same as the styling fix. Discovered while investigating
+     this, and disclosed rather than silently patched over: the Phase
+     28o "pixel-perfect plate centering" mechanism
+     (`_sync_vehicle_info_columns()`, which forced the picture's column
+     to match the left column's measured width) turned out to only have
+     ever worked with short placeholder text -- tested with the
+     project owner's actual-length sample values (real chassis/engine/
+     certificate numbers), the left column's natural width (870px)
+     alone exceeded what a normal dialog width has room to mirror on
+     both sides, so the "exact center" result was never reliably
+     achievable for realistic data even before this phase. Rather than
+     keep re-engineering a fragile pixel-perfect solution in Python --
+     which would also work against the entire point of this conversion
+     -- `_sync_vehicle_info_columns()` was removed. Equal stretch (1, 1)
+     on the two outer columns remains as a reasonable default; getting
+     it pixel-perfect for their own real data is now something the
+     project owner can do directly in Designer.
+- **Tested:** widget visibility confirmed true; all data-bound labels
+  confirmed populating correctly through the loaded structure; baseline
+  and expired field-value styles confirmed (including the font-size
+  fix, checked with an actual expired-vs-not-expired pair); Phase
+  28l/28m's exact grid positions re-verified unchanged (same x/y
+  relationships as before this conversion); Phase 28k's Model/Type
+  font-size increases confirmed preserved. Full existing `tests/` suite
+  and the Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** header, cards, service table -- still
+  hand-written Python, unchanged; `_load_vehicle()`'s data-population
+  logic, unchanged (only its one expired-style string, per fix 3
+  above); the database.
+- **How to use this going forward:** open
+  `app/ui/vehicle_info_section.ui` directly in
+  `designer.exe` (bundled with the project's PySide6 install, no
+  separate download) or via `pyside6-designer`. Resize/reposition the
+  plate, picture, or any other element by mouse, then save the file.
+  The app picks up the change automatically the next time it runs --
+  `QUiLoader` reads the raw `.ui` XML at runtime every launch; there is
+  no compile/generate/convert-back-to-Python step, matching what the
+  project owner explicitly asked for. Widget object names must not be
+  renamed in Designer without also updating the matching
+  `findChild(...)` calls in `_build_vehicle_info()`.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28q — Startup console warnings from vehicle_info_section.ui, harmless but fixed (2026-08-14, same session as Phase 28/28b-28p)
+
+- **Reported:** running the app printed 7 repeated lines --
+  `Designer: The enumeration-value '' is invalid. The default value
+  'Thin' will be used instead.` -- on every launch.
+- **Explained and root-caused:** harmless (the app functions and looks
+  identical either way), coming from `app/ui/vehicle_info_section.ui`
+  (Phase 28p). `QFormBuilder` serialized an empty
+  `<fontweight></fontweight>` element for every widget whose stylesheet
+  sets a numeric CSS `font-weight` (e.g. `font-weight: 650;`) -- Qt6's
+  `QFont::Weight` enum has no entry matching an arbitrary numeric CSS
+  weight, so the serializer wrote an empty string instead of a valid
+  enum name. `QUiLoader` then warns once per occurrence on every load
+  and falls back to `Thin` for that separate `QFont` property. The
+  actual bold/weight rendering seen on screen was never affected by
+  this -- it's driven by each widget's own `styleSheet` property (plain
+  CSS), which is a completely different mechanism from the `<font>`
+  property block these empty elements lived in.
+- **Fixed:** stripped all 7 empty `<fontweight></fontweight>` lines
+  directly from `vehicle_info_section.ui`. Also patched the (throwaway,
+  not committed to the repo) generator script used to produce that file,
+  so regenerating it in the future won't reintroduce the same warnings.
+- **Tested:** confirmed every affected widget's `styleSheet()` still
+  contains its correct `font-weight` value after the fix (unaffected, as
+  expected, since that's a separate property from the one that was
+  edited); confirmed no warning output when constructing the dialog.
+  Full existing `tests/` suite and the Phase 28b functional GUI test
+  re-run clean, no regressions.
+- **What did NOT change:** no visible rendering change at all -- this
+  was a console-noise-only fix.
+- No other `/AI` file needed updating this phase.
