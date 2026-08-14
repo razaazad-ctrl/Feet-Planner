@@ -1067,10 +1067,16 @@ and CHANGELOG_AI.md Phases 15/16):**
   unchanged and fully available in `allocation_engine.py`.
 
 **Explicitly NOT yet built** (see `NEXT_SESSION.md` for prioritization):
-- PDF export (Excel export is done and preserves formatting; PDF likely
-  needs Excel COM automation via `pywin32` since the target machine is
-  Windows and very likely has Excel installed — this was flagged but not
-  implemented)
+- App-wide/Plan-a-Day-schedule PDF export (Excel export is done and
+  preserves formatting; this specific export was flagged as likely
+  needing Excel COM automation via `pywin32`, still unbuilt). **Note:**
+  a *different*, narrower PDF export -- scoped to just the Vehicle
+  Maintenance Log window (vehicle info + picture + summary cards +
+  date-range-filtered service table) -- WAS built 2026-08-15 (Phases
+  28hh/28ii), using `QPainter`/`QPdfWriter` directly (pure PySide6, no
+  `pywin32`/Excel dependency needed). If this Plan-a-Day PDF export is
+  ever picked up, that same dependency-free approach is proven to work
+  and should be considered before defaulting back to Excel COM.
 - The HR-005 daily-minimum-hours repair pass (added 2026-08-03, widened
   2026-08-06) has now been validated against a real day's full job volume
   (`UNPLANNED.xlsx` + `fleetplanner.db`, see item 13 above) -- it's no

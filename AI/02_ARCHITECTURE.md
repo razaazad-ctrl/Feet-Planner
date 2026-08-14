@@ -497,6 +497,32 @@ the code.
   reasonable default; exact centering for their own real data is now
   the project owner's to adjust in Designer.
 
+**PDF export (Phase 28hh).** A PDF-icon button (`pdf_icon.png`, flat
+asset copied from `MISC/pdf.png`) sits at the right of the
+service-history header row (the pre-existing "+ Add a Record"/"Delete
+Selected Row" buttons moved left, next to the label, to make room for
+it -- nothing else in the row/table/cards/vehicle-info layout changed).
+It opens `_ExportPdfDialog`, a small `QDialog` in the same file: two
+centered From/Till date fields (default to today, DD-MM-YYYY, same
+convention as the service-table cells), and a "Create PDF" button that
+prompts a standard Save-As file dialog, then calls
+`_generate_maintenance_pdf()`. That function reads the vehicle +
+service records straight from the database (never from
+`self.service_table`, so the live on-screen table is provably
+unaffected/unfiltered) and draws the report with `QPainter` directly
+onto a `QPdfWriter` (A4 portrait, 150 DPI) -- `QPdfWriter` ships with
+the project's existing PySide6 install, so no new dependency was added,
+per the dependency-minimization rule. Drawing from data rather than
+grabbing the live widgets keeps the exported page's proportions fixed
+to A4 regardless of the exporting machine's screen/DPI. The service
+table is filtered to records where `start_date >= From` and `end_date
+<= Till` (confirmed with the project owner); the filtered table
+auto-paginates (`writer.newPage()` + repeated headers) if it doesn't
+fit one page. The 5 cards' data-selection logic (previously inline in
+`_refresh_cards()`) was extracted into a shared module function,
+`_cards_data_for(row, records)`, so the on-screen cards and the PDF's
+cards can never drift apart -- both call the same function.
+
 **What does NOT depend on any of this:** `allocation_engine.py` reads
 none of the new vehicle fields or `service_records` at all -- this is
 pure master-data/UI, same as every other Vehicles-tab field before it.

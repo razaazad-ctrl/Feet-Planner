@@ -660,7 +660,7 @@
         <bool>false</bool>
        </property>
        <property name="styleSheet">
-        <string notr="true">font-size: 15px; color: #444444;</string>
+        <string notr="true">font-size: 15px; color: #161616;</string>
        </property>
        <property name="locale">
         <locale language="English" country="UnitedArabEmirates"/>
@@ -4608,21 +4608,21 @@
      <property name="geometry">
       <rect>
        <x>1065</x>
-       <y>11</y>
-       <width>314</width>
-       <height>145</height>
+       <y>2</y>
+       <width>286</width>
+       <height>132</height>
       </rect>
      </property>
      <property name="pos" stdset="0">
       <point>
        <x>1065</x>
-       <y>11</y>
+       <y>2</y>
       </point>
      </property>
      <property name="size" stdset="0">
       <size>
-       <width>314</width>
-       <height>145</height>
+       <width>286</width>
+       <height>132</height>
       </size>
      </property>
      <property name="sizePolicy">
@@ -4633,27 +4633,27 @@
      </property>
      <property name="minimumSize">
       <size>
-       <width>314</width>
-       <height>145</height>
+       <width>286</width>
+       <height>132</height>
       </size>
      </property>
      <property name="maximumSize">
       <size>
-       <width>314</width>
-       <height>145</height>
+       <width>286</width>
+       <height>132</height>
       </size>
      </property>
      <property name="minimumWidth">
-      <number>314</number>
+      <number>286</number>
      </property>
      <property name="minimumHeight">
-      <number>145</number>
+      <number>132</number>
      </property>
      <property name="maximumWidth">
-      <number>314</number>
+      <number>286</number>
      </property>
      <property name="maximumHeight">
-      <number>145</number>
+      <number>132</number>
      </property>
      <property name="sizeIncrement">
       <size>
@@ -4768,8 +4768,8 @@
       <rect>
        <x>0</x>
        <y>0</y>
-       <width>314</width>
-       <height>145</height>
+       <width>286</width>
+       <height>132</height>
       </rect>
      </property>
      <property name="text">

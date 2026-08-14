@@ -4046,3 +4046,433 @@ this prompted about keeping changelog entries appended in one place.)*
   Chassis/Engine/RTA/Ad Certificate's positions and width caps; the
   dialog's minimum size.
 - No other `/AI` file needed updating this phase.
+
+## Phase 28bb — Picture enlarged 40% (a calculated, verified middle ground) (2026-08-14, same session as Phase 28/28b-28bb)
+
+- **Requested:** after Phase 28aa's revert, try a smaller, more
+  moderate increase -- 30-40%, or whatever's achievable without
+  disturbing anything else; explicitly agreed to accept more than 40%
+  if that's what a clean fit allowed.
+- **Computed before implementing, not guessed:** at 40% (314x145 ->
+  440x203, aspect ratio preserved), the picture's right edge would land
+  at 1529px (needing ~1553px+ dialog width, a ~150px increase from
+  1450 -- far more modest than Phase 28z's jump to 1800) and its bottom
+  edge would land 33px past the cards row's prior position (vs. Phase
+  28z's ~120px overlap at 2x). Both numbers were judged small enough to
+  implement directly.
+- **Applied:** `picture_label` 314x145 -> 440x203 in
+  `vehicle_info_section.ui` (all six size-related properties, matching
+  the pair Phase 28z found needed updating together). Dialog default
+  width 1450 -> 1600. Phase 28z's `section.setMinimumHeight()` fix
+  (removed in the Phase 28aa revert, since it wasn't needed at the
+  original 314x145) reintroduced, now reserving the smaller amount this
+  size actually needs.
+- **Tested, with real measurements, not just the file edit:** confirmed
+  `picture_label` reports 440x203; confirmed its right edge (1529) sits
+  71px inside the widened 1600px dialog (no overflow); confirmed a 24px
+  clear gap between its bottom edge and the cards row (which correctly
+  shifted from y=261 to y=318 to make room -- not an overlap); confirmed
+  Chassis/Engine/RTA/Ad Certificate's rightmost extent is still exactly
+  1045px, unaffected. A full-dialog screenshot with a synthetic photo
+  and a full 14-row service history confirms the enlarged picture, no
+  overlap, and -- importantly, given Phase 28z's problem -- all 14 rows
+  still visible without scrolling, unlike the 2x attempt. Full existing
+  `tests/` suite and the Phase 28b functional GUI test re-run clean, no
+  regressions.
+- **What did NOT change:** the pixmap-scaling fix (Phase 28z, kept
+  through the Phase 28aa revert and still in effect); the plate;
+  Chassis/Engine/RTA/Ad Certificate's positions and width caps; the
+  dialog's minimum size (still 950x700).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28cc — Cards/table pushed up as far as safely possible (2026-08-14, same session as Phase 28/28b-28cc)
+
+- **Requested:** push the cards row up as much as it can go, and grow
+  the service-history table's visible height accordingly.
+- **What the +10 in Phase 28bb's height-reservation fix actually was:**
+  a small arbitrary safety buffer added on top of the picture's real
+  bottom edge, so the picture wouldn't visually touch the divider line
+  right below it. Reduced to +2 -- the practical minimum before that
+  touching would actually happen. `root.setSpacing(14)`, the same
+  spacing already used between every item in this dialog (header, info
+  section, cards, divider, table), still applies on top of this
+  regardless -- not something to special-case remove for just this one
+  gap, since that would inconsistently tighten spacing throughout the
+  whole window, not just here.
+- **Measured, not assumed, since "as much as it can go" needs a real
+  ceiling, not a guess:** a direct before/after comparison (same dialog,
+  same data, only the reserved height changed) showed the cards row
+  moving up by exactly 8px and the service table gaining exactly 8px of
+  height -- matching the buffer reduction exactly (10 -> 2). This is the
+  genuine maximum available within "push up without the picture
+  touching the divider," not an arbitrarily chosen number.
+- **Tested:** confirmed the 8px shift via the controlled before/after
+  measurement described above (not a single one-off reading). Full
+  existing `tests/` suite and the Phase 28b functional GUI test re-run
+  clean, no regressions.
+- **What did NOT change:** the picture's own size (440x203, Phase 28bb);
+  the dialog's own width/height; `root.setSpacing(14)` (left alone
+  deliberately, applies uniformly to the whole dialog).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28dd — Picture moved further up; the real cause of the empty space explained, not fixable by repositioning alone (2026-08-14, same session as Phase 28/28b-28dd)
+
+- **Reported:** empty space between the last text row (RTA/Ad.
+  Certificate Expiry) and the cards row; asked what occupies it, for it
+  to match the spacing between the other text fields, and for the
+  service table to actually gain visible rows (Phase 28cc's 8px gain
+  produced no visible change -- still 6 rows). Asked to move the picture
+  (and the Active checkbox) further up if the picture is what's
+  occupying that space.
+- **Picture moved up:** `picture_label`'s local y position (in
+  `vehicle_info_section.ui`) reduced from 11 to 2 -- both `geometry.y`
+  and `pos.y` updated together (the Phase 28w lesson). Measured effect:
+  cards row moved up 9px (301, was 310), table height grew 9px (425,
+  was 416) -- consistent with the 9px offset reduction, not a
+  coincidence.
+- **The Active checkbox: investigated, no actionable fix found.** It
+  lives in `_build_header()`, a separate `QHBoxLayout` entirely outside
+  `vehicleInfoSection` -- its row height is set by the header icon's
+  fixed 48px (`scaledToHeight(48)`), and the checkbox itself has no
+  extra padding/margin of its own to remove without shrinking that icon,
+  which wasn't asked for and isn't related to the picture/text gap.
+- **The real, measured cause of the empty space, explained rather than
+  chased further:** even after moving the picture up, there is still an
+  **87px gap** between the last text row's bottom edge (214) and the
+  cards row (301) -- because the picture is 203px tall and the six lines
+  of text beside it (Model/Year through RTA/Ad. Certificate Expiry) only
+  need roughly 130px total. That size difference is the actual "empty
+  space," and it cannot be closed by repositioning the picture --
+  moving it up only shifts *where* the excess sits, not *how much*
+  excess there is. The only way to make the gap match the spacing
+  between the other text fields, or to meaningfully grow the table's
+  visible row count, is to reduce the picture's own height -- which
+  directly conflicts with the earlier request to make the picture
+  bigger. This tradeoff was reported back rather than picking one side
+  of it unilaterally.
+- **Tested:** confirmed the 9px shift via measured cards-row/table-height
+  values (matching the y-offset change exactly); confirmed the 87px
+  residual gap is a real, measured value (last text row's bottom edge
+  vs. cards row top), not a guess. Full existing `tests/` suite and the
+  Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** the picture's own height (203px, Phase
+  28bb) -- only its vertical position; the Active checkbox and header
+  row; `root.setSpacing(14)`.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28ee — Picture traded back to 286x132, computed as "just enough" not guessed (2026-08-14, same session as Phase 28/28b-28ee)
+
+- **Requested:** trade the picture's size back down, but only as much
+  as genuinely required to close the gap -- not further than that --
+  and grow the table's visible height as a result.
+- **Computed the target size two independent ways before touching
+  anything, and both converged on ~130px:** (1) matching the picture's
+  height to the text content's own measured natural bottom edge (134px
+  local), and (2) separately, reducing the previously-measured 87px
+  excess gap down to roughly this dialog's normal ~15px inter-section
+  spacing. Landed on 286x132 (aspect ratio preserved from the original
+  314x145) -- both `.ui` size properties updated together as usual.
+  Dialog default width also right-sized back down, 1600 -> 1450 (at
+  286px wide the picture no longer needs the extra room reserved for
+  its larger predecessors; leaving it at 1600 would have meant ~225px
+  of pure dead space on the right, which "as much as required, not
+  more" applies to as much as the picture's own size does).
+- **Result, measured, not assumed:** the picture's bottom edge now
+  matches the text content's bottom edge *exactly* (0px difference).
+  The service table's height is now **489px** -- taller than it has
+  been at any point in this entire session, including before the
+  picture was ever enlarged (416px pre-Phase-28bb). This works out
+  because Phase 28dd's "move the picture further up" fix (y=2, down
+  from the original y=11) is still in effect and stacks with this
+  phase's height reduction -- both factors independently freed up
+  table space, and together they overshoot the original baseline.
+  Confirmed `chassis_value`/`ad_cert_value` etc. are still exactly
+  1045px rightmost, completely unaffected, as in every phase since
+  Phase 28x's width caps were introduced.
+- **Tested:** confirmed picture size (286x132), the 0px text/picture
+  gap, the 489px table height, and column 0's unaffected rightmost
+  extent, all via direct widget measurement. A full-dialog screenshot
+  with a synthetic photo and a full 14-row service history confirms all
+  14 rows visible with genuine spare room below them (not just barely
+  fitting, as Phase 28bb's 40% size did). Full existing `tests/` suite
+  and the Phase 28b functional GUI test re-run clean, no regressions.
+- **What did NOT change:** the dynamic pixmap-scaling fix (Phase 28z,
+  still in effect); the plate; Chassis/Engine/RTA/Ad Certificate's
+  positions and width caps; the dialog's minimum size (950x700).
+- No other `/AI` file needed updating this phase.
+
+## Phase 28ff — Service table number formatting/alignment, card font sizes, type_display color (2026-08-15, same session as Phase 28/28b-28ff)
+
+- **Requested:** drop the decimal point from Qty/Current Reading/Next
+  Reading in the service-history table when the value is a whole
+  number; center Start Date/End Date/Qty in that table; increase the
+  summary cards' title and bottom-line text by 1pt (not the date line);
+  recolor `type_display` (the vehicle type text under the model/year
+  line) to black, since it's a data value, not a label.
+- **Number formatting:** new `_format_number(value)` helper --
+  `current_reading`/`next_reading`/`qty` are stored as `REAL` in
+  `service_records`, so a whole-number value like `1.0` or `357565.0`
+  previously displayed with a trailing `.0` via a plain `str(value)`.
+  The helper drops it only when the value truly is a whole number
+  (`float.is_integer()`) -- a genuine decimal like `2.5` still displays
+  as `2.5`, not silently rounded away. Applied in `_insert_service_row()`
+  for the `SC_CURRENT`/`SC_NEXT`/`SC_QTY` columns only. Confirmed the
+  save/reload round-trip still works correctly with integer-looking
+  text (`"1"` still parses to `1.0` via the existing
+  `_parse_float_or_none()`, unchanged) -- this is a display-only
+  change, the DB still stores real floats exactly as before.
+- **Alignment:** `SC_START`/`SC_END`/`SC_QTY` cells now get
+  `item.setTextAlignment(Qt.AlignCenter)` when created. Details/Person/
+  Workshop/Service Type were left at their existing (left-aligned/combo)
+  presentation -- not requested, and left/right-aligned free text reads
+  more naturally left-aligned than centered.
+- **Cards:** `QLabel#cardTitle` and `QLabel#cardExtra` 13px -> 14px;
+  `QLabel#cardDate` deliberately left at 15px, matching "except the date
+  text."
+- **type_display:** `vehicle_info_section.ui`'s stylesheet color
+  changed from `#444444` (grey, the same shade used for secondary/
+  label-style text elsewhere) to `#161616` (the same black already used
+  for every other data VALUE in this dialog, e.g. `fieldValue`,
+  `chassis_value`) -- font-size left at 15px, only the color changed,
+  matching the project owner's own framing ("it's not a label").
+- **Tested:** confirmed whole-number values display with no decimal
+  point while a genuine decimal (`100.5`, `2.5`) is preserved exactly,
+  not rounded; confirmed Start/End/Qty cells report `Qt.AlignHCenter`
+  in their text alignment flags; confirmed the DB round-trip still
+  saves `1.0` (a real float) when the cell shows `"1"`; confirmed the
+  card and `type_display` stylesheet values directly. Full existing
+  `tests/` suite and the Phase 28b functional GUI test re-run clean, no
+  regressions.
+- **What did NOT change:** the cards' own "Next reading: X" text in
+  `_refresh_cards()`/`_make_card()` (Vehicle Expiry/Battery/Tyre/Oil/
+  Chiller cards) -- the project owner scoped the decimal-removal request
+  to "in service table" specifically, so that separate display path
+  (which also stringifies a float) was left untouched; the database
+  schema and storage format for these three columns (still `REAL`);
+  Details/Person/Workshop/Service Type's existing alignment.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28gg — Oil/Chiller card decimals removed; a real table-scroll bug found and fixed (2026-08-15, same session as Phase 28/28b-28gg)
+
+- **Reported:** the Oil Service/Chiller Service cards' "Next reading: X"
+  text still shows decimal points (the Phase 28ff fix was scoped to the
+  service table only, as disclosed at the time); separately, editing a
+  cell in a scrolled-down row (e.g. row 14) and pressing Tab snaps the
+  whole table's scroll back up, forcing a manual re-scroll to find the
+  row again.
+- **Card decimals:** both `"Next reading: ..."` f-strings in
+  `_refresh_cards()` now go through the same `_format_number()` helper
+  from Phase 28ff, instead of stringifying the raw float directly.
+- **The scroll bug, root-caused by testing rather than guessed:**
+  `_save_service_row()` calls `_refresh_cards()` after every single
+  save -- i.e. after every cell edit, not just when adding/removing a
+  record. The previous `_refresh_cards()` destroyed all 5 card widgets
+  (`takeAt()` + `deleteLater()`) and rebuilt them from scratch on every
+  call. Confirmed via a controlled scrollbar-value test (table scrolled
+  to its max, current cell genuinely set to a late row, then only
+  `_refresh_cards()` invoked in isolation) that this widget churn in
+  `cards_row` -- directly above the service table in the same outer
+  `QVBoxLayout` -- was enough to reset the table's scroll position on
+  every edit, even though the scrollbar's own range never changed.
+- **Fixed by building the 5 cards once and updating them in place:** new
+  `_build_cards()` (called once from `__init__`, before the first
+  `_refresh_cards()` call) creates the 5 `QFrame` cards and stores
+  references to each one's icon/title/date/extra `QLabel`s in
+  `self._card_widgets`. `_refresh_cards()` no longer touches the layout
+  at all -- it just updates each existing label's text/style/visibility
+  in place. Confirmed this doesn't reintroduce the "no extra_text ->
+  narrower card" edge case (e.g. a new vehicle with no service history
+  yet, so Oil/Chiller have no "Next reading" data): `extra_label` is
+  always created now, just hidden via `setVisible(bool(extra_text))`
+  instead of never being added to the layout -- Qt excludes hidden
+  widgets from layout sizing the same way an absent widget would be.
+  Also confirmed the expired-date red styling correctly *clears* when a
+  date stops being expired between refreshes -- a genuinely new
+  scenario this in-place approach introduces (the old destroy/recreate
+  approach could never have stale styling, since every card was always
+  built fresh) -- handled with an explicit `else ""` reset rather than
+  only ever setting the red style and never clearing it.
+- **Tested:** confirmed both cards' extra text shows no decimal point;
+  confirmed, via the same controlled before/after scrollbar-value
+  method used to find the bug, that the table's scroll position is now
+  byte-identical before and after editing/saving a row (was previously
+  provably different); confirmed the expired-style reset works
+  correctly on an in-place refresh. Full existing `tests/` suite and
+  the Phase 28b functional GUI test (including its existing "Oil
+  Service card correctly reflects the new record" assertion, which
+  exercises this exact code path) re-run clean, no regressions.
+- **What did NOT change:** the service table's own number formatting/
+  alignment (Phase 28ff, untouched); which 5 cards exist or their
+  data-selection logic (still last-matching-service-record per type);
+  the database.
+- No other `/AI` file needed updating this phase.
+
+## Phase 28hh — PDF export added: From/Till-filtered Maintenance Log report (2026-08-15, same session as Phase 28/28b-28hh)
+
+- **Requested:** "last addition in this vehicle maintenance log window" --
+  move "+ Add a Record"/"Delete Selected Row" to the left of the
+  service-history header row, add exactly one new button (icon from
+  `MISC/pdf.png`) on the right that opens a small dialog with From/Till
+  date fields (centered, defaulting to today), and a PDF button in that
+  dialog that exports the vehicle info + picture + all 5 summary cards +
+  the service history table -- filtered to the chosen date range -- as a
+  single A4-portrait PDF file. The live Maintenance Log window and its
+  table must stay completely unfiltered/unaffected; this is a genuine
+  file **export**, not printing to a printer.
+- **Dependency check (CLAUDE.md Section 14):** `PySide6.QtGui.QPdfWriter`
+  (paired with `QPainter`) ships with the project's existing PySide6
+  install and writes a `.pdf` file directly -- confirmed working in this
+  environment before writing any code. No new third-party dependency
+  (e.g. reportlab/fpdf) was needed or added.
+- **Header row change:** `add_record_btn`/`delete_record_btn` stay in
+  their original position (right after the stretch that follows the
+  "Service history..." label) -- the project owner clarified they
+  should only shift left as far as needed to fit the new button
+  alongside them, not all the way over next to the label. The new
+  icon-only `pdf_export_btn` (34x34, `pdf_icon.png` -- copied flat from
+  `MISC/pdf.png` into `app/ui/`, following this project's established
+  flat-asset convention, same as every other icon in this dialog) is
+  simply appended right after Delete Selected Row, with a small
+  (10px) gap. Nothing else in the
+  row/table/cards/vehicle-info layout was touched.
+- **`_ExportPdfDialog`** (new small `QDialog`, `app/ui/vehicle_maintenance_dialog.py`):
+  two centered `QLineEdit` fields ("From Date"/"Till Date"), both
+  defaulting to today in this dialog's existing DD-MM-YYYY display
+  convention (reuses `_parse_display_date`), plus Cancel and a
+  PDF-icon "Create PDF" button. On click: validates both dates parse
+  and From <= Till, then opens a standard "Save As" file dialog
+  (`QFileDialog.getSaveFileName`, default filename
+  `<plate>_MaintenanceLog_<from>_to_<till>.pdf`) so the planner picks
+  the destination -- confirmed with the project owner rather than
+  guessed (auto-saving to a fixed folder was the other option offered
+  and explicitly not chosen).
+- **Date-range filter rule (confirmed with the project owner, not
+  guessed):** a service record is included in the PDF only if its own
+  **Start Date >= From** AND its own **End Date <= Till** (new
+  `_record_in_range()`); a record with no parseable start/end date
+  never matches and is excluded. This filtering happens only inside
+  `_generate_maintenance_pdf()`, which reads straight from the database
+  (`db.list_service_records`) -- it never touches
+  `self.service_table`, so the on-screen table is provably unaffected
+  (explicitly tested: row count identical before and after exporting).
+- **PDF rendering (`_generate_maintenance_pdf` + `_pdf_draw_*` helpers):**
+  draws directly with `QPainter` onto a `QPdfWriter` set to A4 portrait
+  (10mm margins, 150 DPI) rather than grabbing live on-screen widgets --
+  this keeps the exported page's proportions independent of whatever
+  size/DPI the window happens to be at on the exporting machine, so it
+  reliably fits a fixed A4 page every run instead of varying with the
+  live window. Every value drawn reuses the exact same helpers/logic the
+  live window itself uses (`_display_date`, `_format_number`,
+  `_is_expired`, and a newly extracted `_cards_data_for(row, records)` --
+  pulled out of `_refresh_cards()`, which now just calls it, so there is
+  only one place the 5 cards' data-selection logic lives) so the PDF's
+  numbers/dates/card contents are guaranteed to match the live window
+  for the same data. The service table paginates automatically
+  (`writer.newPage()` + repeated column headers) if the filtered rows
+  don't fit one page.
+- **Tested:** new scratchpad script builds a real vehicle (with a
+  picture BLOB) and 4 service records spanning several months, then:
+  confirms the live dialog's header has the reordered buttons and the
+  new PDF button/handler exist; confirms the live table still shows all
+  4 records both before and after exporting (never filtered); confirms
+  `_record_in_range()` selects exactly the 2 in-range records for a
+  narrow date window; generates a real PDF and confirms it exists, has
+  a valid `%PDF-` header, and a non-trivial size; generates a PDF for a
+  date range matching zero records (no crash); adds 80 more same-day
+  records and confirms multi-page pagination produces a larger,
+  non-crashing PDF. Additionally rendered the generated PDF's first
+  page to a PNG via `PySide6.QtPdf.QPdfDocument` and visually confirmed
+  the header title, two-column vehicle-info block, vehicle picture
+  (top-right), all 5 cards with their correct distinct background
+  colors, the divider, and a correctly-filtered 2-row service table all
+  appear in the right positions on one A4 page. Full existing `tests/`
+  suite (35/35) and the Phase 28b functional GUI test (all 8 assertions)
+  re-run clean, no regressions.
+- **What did NOT change:** any existing scheduling/business logic;
+  the database schema; the live service table's editing, auto-save,
+  scroll behavior (Phase 28gg), or number formatting/alignment (Phase
+  28ff); the 5 cards' on-screen appearance or data-selection logic
+  (only its computation was extracted into a shared, reused function);
+  the vehicle-info section or `vehicle_info_section.ui`; the Close
+  button/footer.
+- No other `/AI` file needed updating this phase -- this is a
+  self-contained UI/export addition to one existing dialog, not a
+  change to `/AI`-documented architecture, business rules, or the
+  database.
+
+## Phase 28ii — PDF export refined: header row nudged not moved, layout matched to the project owner's own reference PDF (2026-08-15, same session as Phase 28/28b-28ii)
+
+- **Requested (two corrections to Phase 28hh):** (1) "+ Add a Record"/
+  "Delete Selected Row" shouldn't be pushed all the way to the label --
+  only shifted left as far as needed to fit the new PDF button beside
+  them. (2) The project owner supplied `MISC/pdf_sample.pdf`, a PDF they
+  hand-laid-out themselves, and asked for the exported PDF's format to
+  match it exactly.
+- **Header row fix:** restored `history_header.addStretch(1)` before
+  `add_record_btn` (so the two buttons sit back in their original
+  right-side position), and the new `pdf_export_btn` is now simply
+  appended right after `delete_record_btn` with a 10px
+  `addSpacing()` gap -- no longer pulled next to the label.
+- **PDF layout rewritten to match `MISC/pdf_sample.pdf`, point by
+  point:**
+  - Header: title only ("VEHICLE MAINTENANCE LOG"), no registration
+    number on the right (removed).
+  - Vehicle info: rebuilt as two plain label/value column-pairs on flat
+    text lines (no card/box styling) -- left pair is Model/Year, Type,
+    Plate, Chasis #, Engine # (Model/Year and Plate bold, matching the
+    sample; everything else regular weight); right pair is RTA Cert.,
+    RTA Cert Expiry, Ad Cert., Ad Cert. Expiry, on the same row grid.
+    The plate is plain text here, not the plate-image graphic (the
+    sample doesn't show it) -- that graphic stays a screen-only
+    affordance. Picture enlarged to 200x100 and kept top-right.
+  - Cards: borderless (previously had a `#e2e8f1` outline), title
+    changed from grey to bold near-black, background pastel colors and
+    the `_is_expired()`-driven red date rule unchanged (still shared
+    with the live window via `_cards_data_for`).
+  - The "Service history: X to Y" caption line and the divider line
+    below the cards were both removed -- neither appears in the sample.
+  - Service table rebuilt as a fully ruled grid (vertical AND
+    horizontal border lines on every cell, not just row separators),
+    header background changed to a light gray-blue with bold two-line
+    wrapped column titles ("Start\nDate", "Service\nType", etc. --
+    `\n` in a `QPainter.drawText(rect, flags, text)` call renders as a
+    real line break, no `QTextDocument` needed), and every data row
+    (real or padding) uniformly tinted light blue instead of the
+    previous alternating white/tint banding. Column alignment changed
+    to match the sample: Start/End/Qty centered, Service Type/Details/
+    Person/Workshop left, Current/Next Reading right. Column weights
+    adjusted so Details is the dominant column (0.36 of page width),
+    matching the sample's proportions.
+  - New `_PDF_MIN_TABLE_ROWS = 10`: the sample always shows a minimum
+    number of ruled rows, padding with blank (but still shaded/
+    bordered) rows when there are fewer real records in range -- a
+    printed-log convention (rows ready to hand-fill later). Real
+    records beyond 10 are never truncated; pagination (unchanged from
+    Phase 28hh) still applies once padded/real rows exceed one page.
+  - All font-size-to-row-height pairings were verified against
+    `QFontMetricsF` measured on a real `QPdfWriter` at this export's
+    actual 150 DPI (e.g. 8pt = 17 device px tall, 15pt = 31px) rather
+    than guessed -- an earlier draft of this same rewrite used tighter
+    row/header/card heights that would have clipped text; caught before
+    reporting done by rendering the actual generated PDF to a PNG (via
+    `PySide6.QtPdf.QPdfDocument`) and inspecting it, not by reasoning
+    about the numbers alone.
+- **Tested:** re-ran the full Phase 28hh scratchpad script (live-table-
+  unaffected, date-range filter, valid `%PDF-` output, empty-range, and
+  80-row pagination checks) unchanged and all still pass; rendered the
+  new layout to PNG twice (once before, once after the font-metrics
+  fix) and visually confirmed no header/card/table text is clipped or
+  overlapping in the corrected version, and that the structure
+  (title -> vehicle info + picture -> 5 cards -> fully-gridded,
+  minimum-10-row table) matches the project owner's reference PDF.
+  Full `tests/` suite (35/35) and the Phase 28b functional GUI test
+  (all 8 assertions) re-run clean, no regressions.
+- **What did NOT change:** the date-range filter rule itself
+  (`_record_in_range`, Phase 28hh, untouched); the live on-screen
+  window (cards, table, vehicle info, buttons all still exactly as
+  Phase 28hh/28gg/28ff left them -- only the PDF's own drawing code and
+  the header row's button spacing changed); the database.
+- No other `/AI` file needed updating this phase -- Section 3.3 and
+  `AI_INDEX.json`'s Phase 28hh entries already describe this as
+  "PDF export via QPainter/QPdfWriter, filtered by date range," which
+  remains accurate; only the exported page's visual layout changed.

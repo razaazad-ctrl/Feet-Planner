@@ -335,10 +335,20 @@ Section 3 below).
   (`allocate(..., allowed_driver_ids=..., allowed_supplier_ids=...)`)
   but no UI control to set those parameters.** Backend-ready, no
   frontend.
-- **No PDF export.** Only Excel export exists. PDF was discussed as
-  likely needing Excel COM automation (`pywin32`) since the target
-  machine is Windows and almost certainly has Excel installed — this
-  was a plan, not an implementation.
+- **PARTIALLY RESOLVED 2026-08-15 (Phase 28hh/28ii).** The Vehicle
+  Maintenance Log window now has a PDF export button: vehicle info +
+  picture + the 5 summary cards + a date-range-filtered service table,
+  written directly with `QPainter` onto a `QPdfWriter` (already part of
+  PySide6 -- **no `pywin32`/Excel-COM dependency was needed**, contrary
+  to what this section previously assumed). This is scoped to that one
+  window only. **Still true, unchanged:** there is no PDF export
+  anywhere else in the app -- the Plan a Day schedule/results table is
+  still Excel-export only. If a future request asks for that, consider
+  reusing the same `QPdfWriter`/`QPainter` approach (now proven working)
+  before defaulting back to the `pywin32` idea. See `CHANGELOG_AI.md`
+  Phases 28hh/28ii for the full implementation writeup, including the
+  project owner's own hand-laid-out reference PDF that the final layout
+  was matched against.
 - **Driver shift rotation (e.g. "15 days morning, then 15 days
   afternoon") was considered and explicitly rejected, 2026-08-03.** An
   earlier version of this document described this as "not implemented
@@ -677,11 +687,15 @@ about production-readiness or which algorithmic direction to pursue.
    already supports it — comparatively low effort for real planner
    value (handling "these specific drivers are off tomorrow" days more
    conveniently than the per-entity exclusion toggle alone).
-9. **PDF export**, once the user is ready to prioritize it — needs a
-   design conversation about the `pywin32`/Excel-COM approach first,
-   since it's a different technical approach than everything else built
-   so far (everything else is pure Python; this would shell out to a
-   real Excel install).
+9. ~~PDF export~~ **PARTIALLY RESOLVED 2026-08-15, Phases 28hh/28ii** --
+   scoped to the Vehicle Maintenance Log window only (vehicle info +
+   picture + cards + date-range-filtered service table), built with
+   `QPainter`/`QPdfWriter` (pure PySide6, no `pywin32`/Excel-COM needed
+   after all -- the assumed technical approach in this item turned out
+   to be unnecessary). **Still open if ever requested:** PDF export for
+   the Plan a Day schedule/results table itself, which this item
+   originally had in mind too -- reuse the same `QPdfWriter` approach
+   rather than reopening the Excel-COM question.
 10. **One small, well-scoped follow-up from the Phase 10 rework:**
     reporting each driver's actual first-job time back to them once a
     day is finalized (spec SS-003 -- data exists, not surfaced yet). The
@@ -718,13 +732,22 @@ with the project owner yet beyond what's captured here -- treat those as
 
 ### 7.1 (do first) Vehicles tab overhaul + new Vehicle Maintenance Log
 
-**BUILT 2026-08-14, Phase 28.** See `CHANGELOG_AI.md` Phase 28,
-`ARCHITECTURE.md` Section 3.3, and `DATABASE.md`'s `vehicles`/
-`service_records` entries for the full implementation writeup. The
-`MISC/` reference images this section originally pointed to were deleted
-by the project owner after the feature was built (their own cleanup,
-expected) -- the rest of this subsection is kept as the historical spec
-record, not a pointer to files that still exist.
+**BUILT 2026-08-14, Phase 28; iterated on and finished 2026-08-15,
+Phases 28b-28ii.** See `CHANGELOG_AI.md` Phase 28 (and Phases 28b
+through 28ii for the extended iteration -- read-only detail fields, the
+Continuous Forms service-history grid, the .ui-file conversion for
+visual editing in Designer, number formatting/alignment fixes, a real
+table-scroll bug found and fixed, and finally a PDF export feature added
+as a follow-up request within this same window), `ARCHITECTURE.md`
+Section 3.3, and `DATABASE.md`'s `vehicles`/`service_records` entries
+for the full implementation writeup. The `MISC/` reference images this
+section originally pointed to were deleted by the project owner after
+the feature was built (their own cleanup, expected) -- the rest of this
+subsection is kept as the historical spec record, not a pointer to files
+that still exist. **This item (the project owner's original request #4,
+built first per the recommended 4 -> 2 -> 1 -> 3 order below) is now
+considered fully complete, PDF export included -- the next session
+should move on to request #2 (Section 7.2 below).**
 
 **Vehicles tab changes:**
 - Add an Active/Deactive checkbox column, identical in behavior to the
@@ -801,6 +824,23 @@ it now doesn't create rework once the app-wide theme (7.3) happens
 later; if anything it's a preview of that direction.
 
 ### 7.2 (do second) Plan a Day: full columns, inline driver/vehicle editing, event filter
+
+**START HERE next session.** Item 4 (Section 7.1 above) is now fully
+done, PDF export included -- this is next in the recommended 4 -> 2 -> 1
+-> 3 order. Before writing any code for the inline driver/vehicle combo
+boxes specifically, ask the project owner these two scoping questions
+directly (they were about to be asked at the end of the 2026-08-15
+session but the session ended first -- don't rediscover this from
+scratch, just ask):
+1. **Save timing:** does a manual reassignment from the new combo boxes
+   save to the database immediately, or only when the existing
+   "Finalize Day" button is clicked (matching how every other edit to
+   the in-memory plan currently works)?
+2. **Rule checking:** does a manual reassignment get re-checked against
+   hard rules (hours, license, off-day), or is manual override allowed
+   to violate them outright (Rule 3, `PROJECT_RULES.md`: the planner is
+   always the final decision-maker)? If checked, should a violation
+   just warn (not block), or actually block the combo box selection?
 
 - **Show every Excel column**, not just the current curated 8 (SR, Time,
   Event, Vehicle Type Required, Pick Up, Driver/Supplier, Vehicle/Unit,
