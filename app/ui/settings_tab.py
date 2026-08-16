@@ -24,6 +24,8 @@ from app.ai_review import AIReviewError
 
 ANTHROPIC_KEY_SETTING = "anthropic_api_key"
 GOOGLE_MAPS_KEY_SETTING = "google_maps_api_key"
+GEMINI_TEST_KEY_SETTING = "gemini_test_api_key"
+ORS_TEST_KEY_SETTING = "openrouteservice_api_key"
 PIN_HASH_SETTING = "settings_pin_hash"
 
 
@@ -96,6 +98,66 @@ class SettingsTab(QWidget):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        layout.addWidget(QLabel(" "))
+        layout.addWidget(QLabel("Free/Testing AI Provider (optional)"))
+        gemini_note = QLabel(
+            "Only used for AI Review when NO Anthropic key above is set -- Anthropic is always "
+            "preferred if both are configured. Google Gemini's free tier (no credit card, generous "
+            "daily limit) lets you try the AI Review flow without spending anything, but its "
+            "suggestions won't be as strong as Claude's. Get a free key at aistudio.google.com, "
+            "then paste it below. Needs the 'google-genai' Python package installed."
+        )
+        gemini_note.setWordWrap(True)
+        gemini_note.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(gemini_note)
+
+        gemini_form = QFormLayout()
+        self.gemini_input = QLineEdit()
+        self.gemini_input.setEchoMode(QLineEdit.Password)
+        self.gemini_input.setPlaceholderText("AIza... (free tier)")
+        gemini_row = QHBoxLayout()
+        gemini_row.addWidget(self.gemini_input)
+        gemini_test_btn = QPushButton("Test")
+        gemini_test_btn.clicked.connect(self._on_test_gemini)
+        gemini_row.addWidget(gemini_test_btn)
+        gemini_form.addRow("Google Gemini API Key (free tier):", gemini_row)
+        layout.addLayout(gemini_form)
+
+        gemini_save_btn = QPushButton("Save")
+        gemini_save_btn.clicked.connect(self._on_save)
+        layout.addWidget(gemini_save_btn)
+
+        layout.addWidget(QLabel(" "))
+        layout.addWidget(QLabel("Free/Testing Maps Provider (optional)"))
+        ors_note = QLabel(
+            "Only used for map/travel-time lookups when NO Google Maps key above is set -- Google "
+            "is always preferred if both are configured. OpenRouteService's free tier (2,500 "
+            "requests/day, no credit card ever) covers both address lookup and routing. "
+            "IMPORTANT: its travel times are NOT traffic-aware -- they're average road-speed "
+            "estimates -- so a tight rush-hour connection will look more optimistic than it really "
+            "is. Fine for a rough picture, not equal to Google. Get a free key at "
+            "openrouteservice.org/dev."
+        )
+        ors_note.setWordWrap(True)
+        ors_note.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(ors_note)
+
+        ors_form = QFormLayout()
+        self.ors_input = QLineEdit()
+        self.ors_input.setEchoMode(QLineEdit.Password)
+        self.ors_input.setPlaceholderText("5b3ce... (free tier)")
+        ors_row = QHBoxLayout()
+        ors_row.addWidget(self.ors_input)
+        ors_test_btn = QPushButton("Test")
+        ors_test_btn.clicked.connect(self._on_test_ors)
+        ors_row.addWidget(ors_test_btn)
+        ors_form.addRow("OpenRouteService API Key (free tier):", ors_row)
+        layout.addLayout(ors_form)
+
+        ors_save_btn = QPushButton("Save")
+        ors_save_btn.clicked.connect(self._on_save)
+        layout.addWidget(ors_save_btn)
 
         layout.addWidget(QLabel(" "))
         layout.addWidget(QLabel("Planner Preferences Digest"))
@@ -191,14 +253,22 @@ class SettingsTab(QWidget):
     def _load_existing(self):
         existing_anthropic = db.get_setting(self.conn, ANTHROPIC_KEY_SETTING)
         existing_maps = db.get_setting(self.conn, GOOGLE_MAPS_KEY_SETTING)
+        existing_gemini = db.get_setting(self.conn, GEMINI_TEST_KEY_SETTING)
+        existing_ors = db.get_setting(self.conn, ORS_TEST_KEY_SETTING)
         if existing_anthropic:
             self.anthropic_input.setText(existing_anthropic)
         if existing_maps:
             self.maps_input.setText(existing_maps)
+        if existing_gemini:
+            self.gemini_input.setText(existing_gemini)
+        if existing_ors:
+            self.ors_input.setText(existing_ors)
 
     def _on_save(self):
         db.set_setting(self.conn, ANTHROPIC_KEY_SETTING, self.anthropic_input.text().strip())
         db.set_setting(self.conn, GOOGLE_MAPS_KEY_SETTING, self.maps_input.text().strip())
+        db.set_setting(self.conn, GEMINI_TEST_KEY_SETTING, self.gemini_input.text().strip())
+        db.set_setting(self.conn, ORS_TEST_KEY_SETTING, self.ors_input.text().strip())
         self.status_label.setText("Saved.")
         self.status_label.setStyleSheet("color: #2a7a2a;")
 
@@ -219,6 +289,45 @@ class SettingsTab(QWidget):
             self.status_label.setStyleSheet("color: #2a7a2a;")
         except Exception as e:
             self.status_label.setText(f"Anthropic key test failed: {e}")
+            self.status_label.setStyleSheet("color: #a03030;")
+
+    def _on_test_gemini(self):
+        key = self.gemini_input.text().strip()
+        if not key:
+            QMessageBox.information(self, "No key", "Enter a key first.")
+            return
+        try:
+            from google import genai
+        except ImportError as e:
+            self.status_label.setText(f"'google-genai' package not installed: {e}")
+            self.status_label.setStyleSheet("color: #a03030;")
+            return
+        try:
+            from app.ai_review import GEMINI_MODEL
+            client = genai.Client(api_key=key)
+            client.models.generate_content(model=GEMINI_MODEL, contents="Say OK")
+            self.status_label.setText("Gemini key works.")
+            self.status_label.setStyleSheet("color: #2a7a2a;")
+        except Exception as e:
+            self.status_label.setText(f"Gemini key test failed: {e}")
+            self.status_label.setStyleSheet("color: #a03030;")
+
+    def _on_test_ors(self):
+        key = self.ors_input.text().strip()
+        if not key:
+            QMessageBox.information(self, "No key", "Enter a key first.")
+            return
+        try:
+            # Geocode is the cheapest real round-trip that proves the key
+            # works -- same spirit as the Google Maps test below.
+            result = maps_client.geocode_address_ors(key, "Dubai World Trade Centre")
+            self.status_label.setText(
+                f"OpenRouteService key works. Test lookup resolved to "
+                f"{result['lat']:.4f}, {result['lon']:.4f}."
+            )
+            self.status_label.setStyleSheet("color: #2a7a2a;")
+        except maps_client.MapsClientError as e:
+            self.status_label.setText(f"OpenRouteService key test failed: {e}")
             self.status_label.setStyleSheet("color: #a03030;")
 
     def _on_test_maps(self):

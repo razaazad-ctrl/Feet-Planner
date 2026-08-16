@@ -34,9 +34,11 @@
     "app/ui/drivers_tab.py": "structured driver hard rules + AI notes",
     "app/ui/suppliers_tab.py": "structured supplier offerings + AI notes",
     "app/ui/vehicles_tab.py": "vehicle roster, workshop/exclusion toggle, edit dialog",
-    "app/ui/locations_tab.py": "short-code to address mapping",
+    "app/ui/locations_tab.py": "LEGACY as of Phase 32 (2026-08-16), superseded by app/ui/map_tab.py; no longer imported by main_window.py",
     "app/ui/settings_tab.py": "API keys, PIN, digest refresh control",
-    "app/ui/entity_rules_widget.py": "LEGACY, not imported by main_window.py as of last known state, superseded by drivers_tab.py/suppliers_tab.py"
+    "app/ui/schedules_tab.py": "Phase 31 (2026-08-16): view/edit already-finalized days (finalized_jobs) to correct them against what actually happened, tab named 'Schedules'",
+    "app/ui/entity_rules_widget.py": "LEGACY, not imported by main_window.py as of last known state, superseded by drivers_tab.py/suppliers_tab.py",
+    "app/ui/map_tab.py": "Phase 32 (2026-08-16): the Locations tab -- 3-panel screen (locations editor | MapLibre/OpenFreeMap map (English labels forced) | per-trip + per-driver-chain travel times). Google or OpenRouteService for routing; everything cached in db.geocode_cache/travel_time_cache."
   },
   "modules": [
     {
@@ -428,7 +430,8 @@
             "already_used (bool)"
           ],
           "computed_property": "label -- supplier_name if instance_number==1 else f'{supplier_name} {instance_number-1}'",
-          "note": "RUNTIME ONLY, created dynamically during allocate(), never stored directly in the database -- only the resulting label text and supplier_id get persisted via finalized_jobs on Finalize"
+          "note": "RUNTIME ONLY, created dynamically during allocate(), never stored directly in the database -- only the resulting label text and supplier_id get persisted via finalized_jobs on Finalize",
+          "instance_number_bug_fixed_phase_29d": "instance_number for a NEW hire is computed from a hires_by_supplier registry keyed by supplier_id ALONE (tracks every hire of that supplier across every vehicle type today) -- NOT from the separate hires_by_key registry, which stays keyed by (supplier_id, vehicle_type) and is used only for reuse-matching (a hire tied to one vehicle type must never be reused for a different type). Before this fix, instance_number was computed from hires_by_key too, so hiring the same supplier for two different vehicle types on the same day gave both hires the identical, unnumbered label (each was the '1st' hire within its own type-scoped bucket) -- two genuinely different physical units displayed identically. Duplicated identically across all four allocation strategies (allocate(), _allocate_shift(), allocate_by_anchor(), allocate_by_solver()). See tests/test_supplier_hire_numbering.py and CHANGELOG_AI.md Phase 29d."
         }
       ],
       "key_functions": [
@@ -670,6 +673,13 @@
           "returns": "list[suggestion dict] with keys: type, affected_jobs, reasoning",
           "raises": "AIReviewError",
           "note": "defensively strips markdown code fences from the response before JSON parsing, since the model sometimes wraps output despite instructions not to"
+        },
+        {
+          "name": "review_plan_gemini",
+          "signature": "review_plan_gemini(api_key, context)",
+          "added": "Phase 30, 2026-08-15",
+          "returns": "same contract as review_plan() -- list[suggestion dict], raises AIReviewError",
+          "note": "TESTING/FREE-TIER ONLY, not a production alternative. Same SYSTEM_PROMPT and context, called against Google Gemini's free tier (model 'gemini-flash-latest', GEMINI_MODEL constant) via the 'google-genai' package (lazy-imported, same pattern as ortools in allocation_engine.py). plan_day_tab.py's _on_ai_review() only calls this when no Anthropic key is configured -- Anthropic is always preferred when both keys are set. Key stored under settings_tab.GEMINI_TEST_KEY_SETTING ('gemini_test_api_key'). Picked after a web search of current (2026) free-tier LLM API offerings -- see CHANGELOG_AI.md Phase 30."
         }
       ],
       "system_prompt_responsibilities": [
@@ -735,9 +745,10 @@
         "Suppliers (SuppliersTab)",
         "Vehicles (VehiclesTab)",
         "Locations (LocationsTab)",
+        "Schedules (SchedulesTab, added Phase 31, 2026-08-16)",
         "Settings (SettingsTab)"
       ],
-      "pin_gating_mechanism": "settings tab is disabled via setTabEnabled(False) while a PIN is set and not yet unlocked this session; a corner widget QPushButton '\ud83d\udd12 Unlock Settings' is the only way in; correct PIN calls setTabEnabled(True) and switches to it; this replaced an earlier switch-then-revert approach that could flash tab contents",
+      "pin_gating_mechanism": "settings tab is disabled via setTabEnabled(False) while a PIN is set and not yet unlocked this session; a corner widget QPushButton '🔒 Unlock Settings' is the only way in; correct PIN calls setTabEnabled(True) and switches to it; this replaced an earlier switch-then-revert approach that could flash tab contents",
       "signal_connections": "settings_widget.pin_changed connects back to _apply_lock_state so removing/changing the PIN from within Settings updates the lock state live"
     },
     {
@@ -747,7 +758,9 @@
       "state_held": [
         "self.jobs (list[Job], in-memory only until Finalize/Export)",
         "self.uploaded_path",
-        "self.last_drivers (DriverProfile list from the last Run Planning, used for AI Review's hours summary)"
+        "self.last_drivers (DriverProfile list from the last Run Planning, used for AI Review's hours summary and ReCheck's hour-rule checks)",
+        "self._recheck_issues (dict[sr, list[str]] from the last ReCheck run, reset on Upload/Run Planning; Phase 29)",
+        "self._driver_rows/_supplier_rows/_vehicle_rows + name/plate->id lookup dicts (Phase 29, refreshed each _render_results, used to populate the reassignment combo boxes)"
       ],
       "buttons_and_handlers": [
         {
@@ -768,8 +781,15 @@
         {
           "button": "AI Review (event chains + day notes)",
           "handler": "_on_ai_review",
-          "calls": "excel_import.group_jobs_by_event, db.resolve_location, maps_client.get_travel_time, db.get_digest, ai_review.build_review_context, ai_review.review_plan",
-          "renders": "one QFrame per suggestion with Accept/Reject buttons via _add_suggestion_widget"
+          "calls": "excel_import.group_jobs_by_event, db.resolve_location, maps_client.get_travel_time, db.get_digest, ai_review.build_review_context, ai_review.review_plan OR ai_review.review_plan_gemini (Phase 30: calls review_plan_gemini as a free-tier fallback only when no Anthropic key is configured; Anthropic always preferred)",
+          "renders": "one QFrame per suggestion with Accept/Reject buttons via _add_suggestion_widget",
+          "phase_30_2026_08_15": "self.suggestions_section (the AI Suggestions label + scroll area, wrapped in one QWidget) now starts hidden (setVisible(False) in _build_ui) to give the results table more default row space, and is revealed (setVisible(True)) the moment this handler runs -- an amber note is shown above the suggestions when the Gemini fallback was used, so it's never ambiguous which provider produced them."
+        },
+        {
+          "button": "ReCheck (Phase 29, 2026-08-15)",
+          "handler": "_on_recheck",
+          "calls": "_compute_recheck_issues(self.jobs, self.last_drivers, self._vehicle_type_by_id) -- module-level, Qt-free, never mutates a Job",
+          "note": "Advisory-only re-scan of the CURRENT in-memory sheet (including manual driver/vehicle reassignments) for driver/vehicle double-booking, hard-rule hour violations (duty-span, reuses allocation_engine._day_span_hours), and wrong-vehicle-type assignments. Same-Driver-grouped rows are exempt from the double-booking checks (mirrors allocation_engine._group_key_of's own overlap exemption). Results shown in bold red in the Note column (self._recheck_issues, by SR lookup); job.assignment_note itself is never touched. Re-runnable any number of times. Enabled together with ai_review_btn/finalize_btn/export_btn/summary_btn after Run Planning. Phase 29b (2026-08-15): a Same-Driver-group-mismatch check was REMOVED after it produced 47 false positives on a fresh, untouched, optimal plan -- 'Same Driver' is a documented SOFT preference (AI/04_BUSINESS_RULES.md), not a hard rule the engine always keeps intact; a group legitimately splitting across drivers when one can't cover it all is correct, expected behavior, not a rule break."
         },
         {
           "button": "Finalize Day (save to history)",
@@ -793,11 +813,20 @@
           "Pick Up",
           "Driver / Supplier",
           "Vehicle / Unit",
+          "Order# (Phase 29, hidden by default)",
+          "Contact Person (Phase 29, hidden by default)",
+          "Order Location (Phase 29, hidden by default)",
+          "Additional Info (Phase 29, hidden by default)",
+          "Charge Code (Phase 29, hidden by default)",
+          "Same Driver (Phase 29, hidden by default)",
           "Note"
         ],
-        "sorting": "setSortingEnabled(True), but MUST be toggled False during population and True after -- Qt scrambles rows if sorting is on while inserting",
-        "filtering": "dropdown above table, filters by Driver/Supplier column, strips 'SAME ' prefix so a reused truck's entries group with its base label",
-        "row_coloring": "UNRESOLVED_COLOR (dark red) for unresolved jobs, SUPPLIER_COLOR (dark yellow) for supplier-assigned jobs"
+        "column_visibility": "Phase 29: 'Columns' menu button toggles any column via QMenu checkable actions + table.setColumnHidden -- not persisted across app restarts, resets to the documented defaults each launch",
+        "resizing": "Phase 29: every column is the default Interactive (manually drag-resizable) -- Event and Note used to be pinned to QHeaderView.Stretch, which silently blocks resize; both fixed. header.setStretchLastSection(True) keeps the rightmost visible column filling leftover width without losing manual resizability",
+        "sorting": "setSortingEnabled(True), but MUST be toggled False during population and True after -- Qt scrambles rows if sorting is on while inserting. Phase 29: cell widgets (the Driver/Vehicle combo boxes) don't follow Qt's built-in sort automatically -- header.sortIndicatorChanged is connected to _rebind_row_widgets(), which re-attaches each row's combo boxes by SR lookup after every header-click sort. Phase 29c real bug fix: _rebind_row_widgets() MUST also toggle setSortingEnabled(False)/(True) around its own loop for the exact same reason as _render_results() -- without it, each setItem() call inside the loop could trigger Qt to re-sort again mid-loop, corrupting row/job association (a row's SR cell showing one job while its other cells belonged to a different job). SR column also uses a new _NumericTableWidgetItem (float-aware __lt__) since QTableWidgetItem's default sort compared SR as plain text (1,10,11,...,2 instead of 1,2,...,11).",
+        "filtering": "two dropdowns above the table, combined with AND (_apply_filters, Phase 29 -- replaced the old single-filter _apply_filter): by Driver/Supplier column (strips 'SAME ' prefix so a reused truck's entries group with its base label) and by Event (new, Phase 29)",
+        "row_coloring": "UNRESOLVED_COLOR (dark red) for unresolved jobs, SUPPLIER_COLOR (dark yellow) for supplier-assigned jobs -- Phase 29: also applied as a QComboBox stylesheet background on the Driver/Vehicle cell widgets, since setBackground on a QTableWidgetItem has no effect on a cell that's been replaced with setCellWidget",
+        "inline_reassignment": "Phase 29: Driver/Supplier and Vehicle/Unit columns are setCellWidget combo boxes (_NoScrollComboBox, duplicated locally from vehicle_maintenance_dialog.py's class of the same name/purpose), editable with a QCompleter (PopupCompletion, MatchStartsWith, case-insensitive) for type-ahead narrowing and free-text entry (e.g. a hand-typed supplier hired-unit label). Populated from db.list_drivers/list_suppliers/list_vehicles (active_only=True default -- confirmed this only filters each table's own 'active' roster flag, NOT excluded_from_planning, so off-day drivers/excluded vehicles/suppliers are deliberately still selectable, confirmed directly with the project owner). Picking a supplier in Driver/Supplier auto-fills Vehicle/Unit with the same label (still editable after). On change, updates the Job's clean assigned_driver_id/assigned_driver_name/assigned_vehicle_id/assigned_vehicle_plate/assigned_supplier_id/assigned_supplier_unit/unresolved fields in memory only (unchanged until Finalize Day -- confirmed via export.py/_on_finalize that both already key off these exact clean fields, never assignment_note), and overwrites assignment_note to 'Manually reassigned by planner' (confirmed safe: export.py's own comment says this field is display-only, never parsed)."
       },
       "known_gap": "Accept on an AI suggestion logs the decision via db.log_decision but does NOT automatically mutate the corresponding Job or re-render the table -- planner must manually edit the table row if acting on a suggestion"
     },
@@ -878,6 +907,62 @@
       ]
     },
     {
+      "file": "app/ui/map_tab.py",
+      "class": "MapTab(QWidget)",
+      "added": "Phase 32, 2026-08-16 (map engine swapped to MapLibre/OpenFreeMap in Phase 32b, same day)",
+      "responsibility": "The Locations tab, rebuilt as a 3-panel operations screen: locations editor (left) | interactive Leaflet/OpenStreetMap map (center) | per-trip travel times + per-driver day-chain feasibility (right). Display + AI-Review support only -- does NOT feed the deterministic allocation engine (Rule 10).",
+      "panels": {
+        "left": "The original short-code -> address editor, preserved in full, plus Lat/Lon columns and a 'Geocode Missing Locations' button.",
+        "center": "QWebEngineView rendering MapLibre GL + OpenFreeMap vector tiles (free: no key, no usage limits, no registration, commercial use permitted -- CARTO's tiles are enterprise-only and Esri's have restrictive terms, both ruled out). Phase 32b: switched from Leaflet + OSM raster tiles because those render labels in each region's LOCAL language (the map came out in Arabic in the UAE) with no language switch available. Every label layer's text-field is rewritten on style load to ['coalesce', name:en, name:latin, name] so labels are English-first. Python drives it one-way via runJavaScript(draw(points, lines, hint)); draw() queues calls arriving before the style finishes loading. Needs WebGL -- a failure shows an explanatory banner rather than a blank rectangle, and travel times still work without it. NOTE: MapLibre uses [lon, lat] order, the reverse of the rest of this app; that flip is contained to the JS.",
+        "right": "Trips table (SR/time/from/to/travel/dist, click draws that route) + Driver Day Chains tree: each driver's consecutive connections with gap vs. real drive time. RED = drive exceeds gap (IMPOSSIBLE), AMBER = under TIGHT_MARGIN_MINUTES (15) slack. Footer shows total travel time/distance."
+      },
+      "nothing_runs_automatically": "Explicit project-owner requirement -- opening the tab performs ZERO lookups. All fetching happens only on the 'Run Locations' button (or 'Geocode Missing Locations'), and is verified by test.",
+      "cost_design": "Every lookup checks db.travel_time_cache / db.geocode_cache first. _plan_lookups() computes only what genuinely still needs fetching; a re-run of an already-looked-up day makes ZERO API calls (asserted in the headless verification script). Same-place pairs (origin == destination) are skipped entirely and reported as a real 0 min rather than '--'.",
+      "providers": "_active_provider() prefers Google (traffic-aware) when GOOGLE_MAPS_KEY_SETTING is set, else falls back to OpenRouteService (ORS_TEST_KEY_SETTING, free, NOT traffic-aware). Same primary/free-fallback shape as ai_review.py's Anthropic/Gemini split. The active provider is always shown in provider_label with a tooltip explaining the difference.",
+      "threading": "_LookupWorker(QObject) on a QThread -- same pattern as plan_day_tab.py's _SolverWorker/_AIReviewWorker. Receives plain pre-resolved data and RETURNS results; never touches self.conn (sqlite3 connections cannot cross threads). All cache reads happen on the main thread before start, all cache writes in the finished slot. CRITICAL (Phase 32c, fixed a real segfault): NEVER set self._worker = None when a run finishes. _LookupWorker has no Qt parent (moveToThread requires that), so Python owns its lifetime, and `finished` is also connected to worker.deleteLater -- dropping the last Python reference makes Python destroy the C++ object while Qt still has a deleteLater queued for it, a DOUBLE FREE that hard-crashes the app with no traceback (reproduced: SIGSEGV/exit 139). References are kept until the next _start_worker() replaces them; use the self._lookup_running boolean to ask whether a run is in flight. _start_worker() also refuses to start while _lookup_running is True, since reassigning the worker mid-flight is the same bug by another route.",
+      "cross_tab": "main_window.py passes the PlanDayTab instance in as plan_day_tab=. READ-ONLY -- MapTab only ever reads .jobs from it, never mutates the plan.",
+      "console_noise": "Phase 32c: the map QWebEngineView uses a small _QuietPage(QWebEnginePage) subclass that filters ONE known-benign JS warning ('Expected value to be of type number, but found null instead.') emitted by the upstream OpenFreeMap Liberty style itself -- verified by loading the same style with all of this app's own JS removed and getting identical warnings. Every other console message still prints, so real map errors are never hidden.",
+      "coordinates_entry": "Phase 32d: coordinates can be PASTED directly -- _parse_latlon() recognizes the exact string Google Maps copies on right-click ('25.223732, 55.288312'), plus space/semicolon variants, and is range-strict so a real address containing two numbers is never misread. The Lat/Lon columns are editable and pasting the whole pair into either cell fills both. _backfill_coords_from_addresses() runs on tab open and recovers coordinates that were typed into the ADDRESS field (which is what happened for all 13 real locations, because Lat/Lon were read-only in the first version) -- no re-entry, no API calls, never overwrites existing coordinates. _resolve_point() also reads a coordinate-style address as a fallback. Pasting is preferred over geocoding: exact, and free.",
+      "geocode_button": "'Geocode Missing Locations' sends the ADDRESS TEXT of any location lacking coordinates to the active provider and stores the returned lat/lon. Needs an API key, costs one call per location. It is only the automatic alternative to pasting coordinates by hand.",
+      "geocode_quality_safeguards": "Phase 32e, added after automatic geocoding was found resolving raw Excel strings to the WRONG CONTINENT (ON SITE - COCA COLA ARENA -> Atlanta; 13 of 22 cached entries were >500km off, and those wrong coordinates silently poisoned every travel time derived from them). Three defences: (1) maps_client._clean_place_text() strips 'ON SITE -'/'ONSITE -' noise and reorders 'Dubai - X' to 'X, Dubai'; (2) every lookup is biased to MapTab._operating_focus() -- the average of the predefined locations' own coordinates, so it self-configures -- and hard-restricted to OPERATING_COUNTRY='AE'; (3) maps_client.geocode() REJECTS any result further than MAX_GEOCODE_DISTANCE_KM (500) from that centre rather than caching it. Plus _PlaceSearchDialog ('Search Place...'), which shows real candidates with their distance from the operating area (>500km in red) and lets the planner pick -- the only reliable answer for a name that exists in several countries.",
+      "driver_day_drawing": "Phase 32f: selecting a driver calls _draw_driver_day(), which draws the FULL day -- each trip (pickup->destination) as a solid blue routed line, each repositioning leg between trips as a dashed amber line, and every stop numbered in running order. Before this it drew only the connections BETWEEN trips, so a 4-trip driver whose connections were all same-place (finish at CPK, next job starts at CPK -> zero drive, no polyline) rendered as bare dots with no lines at all. _route_line() additionally falls back to a DASHED straight line when a pair has no cached polyline, so the day always reads as a connected path; same-place pairs still draw nothing. NOTE for the JS: line-dasharray cannot be data-driven in MapLibre, so dashed lines are a separate layer filtered on a 'dashed' feature property, not an expression."
+    },
+    {
+      "file": "app/ui/schedules_tab.py",
+      "class": "SchedulesTab(QWidget)",
+      "added": "Phase 31, 2026-08-16 (columns reordered + 6 fields added, Phase 31b, same day)",
+      "responsibility": "View/edit already-finalized days (finalized_jobs) to correct them against what actually happened -- the only place that table is ever corrected after Finalize Day writes it once. Tab named 'Schedules'.",
+      "load_controls": "From/Till QLineEdit date range, DD-MM-YYYY display/input (Phase 31c -- storage stays ISO, same parse-display/format-for-storage split as vehicle_maintenance_dialog.py's service history grid; converted via _display_to_iso before calling db.list_finalized_jobs), both default to today's date on tab open. The Date column (per-row) uses the same DD-MM-YYYY convention.",
+      "table_columns_18_total": [
+        "Cancelled (checkbox)",
+        "SR",
+        "Order# (hidden by default)",
+        "Date",
+        "Actual Start",
+        "Actual End",
+        "Hours",
+        "Pick Up",
+        "Contact Person (hidden by default)",
+        "Order Location (hidden by default)",
+        "Event",
+        "Vehicle Type Required",
+        "Additional Info (hidden by default)",
+        "Driver / Supplier (combo)",
+        "Vehicle / Unit (combo)",
+        "Same Driver (hidden by default)",
+        "Charge Code (hidden by default)",
+        "(Save/Discard, draft rows only)"
+      ],
+      "column_order_note": "Phase 31b (2026-08-16): reordered to match the real Excel file's left-to-right header order (excel_import.py's _HEADER_MAP), per the project owner's explicit request ('place them in same order as excel file as the eyes are used to that order') -- Cancelled/Date/Actual Start/Actual End/Hours are the deliberate exceptions (Schedules-tab-specific, no single Excel-column equivalent), kept near SR at the front. A 'Columns ▾' button (same QMenu-of-checkable-actions pattern as Plan a Day) hides/shows any column; the 6 marked above start hidden, matching Plan a Day's own precedent exactly.",
+      "new_fields_phase_31b": "order_no/contact_person/order_location/additional_info/charge_code/same_driver_key -- caught as a real gap same-day ('these fields are not being saved in database.. it should be for complete reference of past'): Phase 31's first pass only captured event_text/pickup_location/vehicle_type_required/driver_name/vehicle_plate, missing these 6 despite them being the same already-populated Job fields Plan a Day already shows as optional columns (Phase 29).",
+      "every_column_editable": "confirmed explicitly by the project owner, correcting an earlier narrower draft -- not just assignment/time fields",
+      "confirm_before_save": "every edit to an already-saved row (combo change, itemChanged, Cancelled checkbox) shows QMessageBox.question with the SPECIFIC before/after value ('Change {field} for SR {sr} ({event}) from X to Y?') before calling db.update_finalized_job -- Cancel reverts the widget to its stored value, never calls the database",
+      "add_row_flow": "'+ Add Row' inserts a local draft row (its own Save/Discard buttons in the last column) with ZERO database interaction until Save is clicked (db.insert_finalized_job); Discard just removes the table row, no DB call ever -- resolves 'what if the planner changes their mind about a new row'",
+      "cancelled_flag": "soft delete -- checkbox, not a row delete, matching drivers/suppliers/vehicles' excluded_from_planning convention; excluded from every hours/overtime/fairness read in db.py",
+      "filter_and_sort": "clicking a column header opens a QMenu (Sort Ascending/Descending + a live search box (QWidgetAction+QLineEdit, Phase 31d) + a checkable list of that column's current distinct values + Select All/Clear All) via header.sectionClicked -- deliberately NOT Qt's built-in setSortingEnabled click-to-sort, since one header click can't mean both sort and filter at once. The search box narrows the checklist by hiding non-matching QActions -- added so a high-cardinality column (Date over a year of history, Event, Driver/Supplier) doesn't turn into a scroll-forever list; same pattern Excel/Sheets/Tableau/Airtable use. Menu-building is split into _build_filter_menu() (testable, no blocking call) from _on_header_clicked() (calls .exec() and dispatches the result). Manual sortItems() + _rebind_row_widgets() afterward (cell widgets don't follow a manual sort automatically, same Qt limitation as Phase 29c in plan_day_tab.py) keeps driver/vehicle combos correctly paired with their row's real SR post-sort.",
+      "reused_patterns": "_NoScrollComboBox and _NumericTableWidgetItem duplicated locally (same as plan_day_tab.py's classes of the same name); driver/vehicle/supplier reassignment-combo population unfiltered by excluded_from_planning (same as Plan a Day); Continuous-Forms auto-save-on-itemChanged pattern (same as vehicle_maintenance_dialog.py's service-history grid)"
+    },
+    {
       "file": "app/ui/settings_tab.py",
       "class": "SettingsTab(QWidget)",
       "signal": "pin_changed = Signal()",
@@ -901,6 +986,8 @@
       "constants": [
         "ANTHROPIC_KEY_SETTING = 'anthropic_api_key'",
         "GOOGLE_MAPS_KEY_SETTING = 'google_maps_api_key'",
+        "GEMINI_TEST_KEY_SETTING = 'gemini_test_api_key' (Phase 30, 2026-08-15 -- free/testing AI Review provider, see ai_review.review_plan_gemini)",
+        "ORS_TEST_KEY_SETTING = 'openrouteservice_api_key' (Phase 32, 2026-08-16 -- free/testing maps provider, used only when no Google Maps key is set; NOT traffic-aware, and the UI says so)",
         "PIN_HASH_SETTING = 'settings_pin_hash'"
       ],
       "test_buttons": "each API key field has a 'Test' button making one minimal real request (Anthropic: 10-token message; Google Maps: one real get_travel_time call between two Dubai landmarks)",
@@ -1255,7 +1342,17 @@
           "person, workshop",
           "created_at, updated_at"
         ],
-        "service_type_values": ["Quotation", "Oil/Filter Change", "Chiller Unit Service", "Accident", "Battery Change", "Repair", "Mechanical Work", "Body Work", "Tyre Change"],
+        "service_type_values": [
+          "Quotation",
+          "Oil/Filter Change",
+          "Chiller Unit Service",
+          "Accident",
+          "Battery Change",
+          "Repair",
+          "Mechanical Work",
+          "Body Work",
+          "Tyre Change"
+        ],
         "note": "Linked by vehicle_id, not plate text, even though the project owner's original design sketch drew the relationship on Plate -- vehicle_id is the stable key every other relationship in this schema uses. The five summary cards are derived entirely in Python from one list_service_records() call (last-seen row per service_type while iterating an oldest-first list), not five separate queries."
       },
       {
@@ -1326,13 +1423,16 @@
           "short_code PK COLLATE NOCASE",
           "full_address NOT NULL",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "latitude REAL (Phase 32 -- planner-visible and manually correctable; held here rather than only in geocode_cache so a correction survives a cache clear)",
+          "longitude REAL (Phase 32)",
+          "geocoded_at TEXT (Phase 32)"
         ]
       },
       {
         "name": "finalized_jobs",
         "added_via": "migration executescript",
-        "purpose": "permanent record of what was actually finalized each day. Basis for monthly overtime enforcement and cross-day supplier fairness.",
+        "purpose": "permanent record of what was actually finalized each day. Basis for monthly overtime enforcement and cross-day supplier fairness. Corrected after the fact by the Schedules tab (Phase 31, 2026-08-16) to match what actually happened during the day.",
         "columns": [
           "id PK",
           "plan_date",
@@ -1344,11 +1444,58 @@
           "start_dt",
           "end_dt",
           "hours",
-          "finalized_at"
+          "finalized_at",
+          "event_text (nullable, Phase 31 -- context snapshot captured at Finalize time, blank on pre-Phase-31 rows)",
+          "pickup_location (nullable, Phase 31 -- same)",
+          "vehicle_type_required (nullable, Phase 31 -- same)",
+          "driver_name (nullable, Phase 31 -- readable-name snapshot alongside driver_id, deliberately NOT re-derived by joining drivers)",
+          "vehicle_plate (nullable, Phase 31 -- same, alongside vehicle_id)",
+          "order_no (nullable, Phase 31b -- context snapshot, caught as a gap the same day as Phase 31 -- 'for complete reference of past')",
+          "contact_person (nullable, Phase 31b -- same)",
+          "order_location (nullable, Phase 31b -- same)",
+          "additional_info (nullable, Phase 31b -- same)",
+          "charge_code (nullable, Phase 31b -- same)",
+          "same_driver_key (nullable, Phase 31b -- same)",
+          "cancelled (INTEGER NOT NULL DEFAULT 0, Phase 31 -- soft 'didn't happen' flag, excluded from every hours/overtime/fairness read; see db.get_driver_month_to_date_hours/_driver_month_daily_span_hours/get_supplier_cumulative_hours)"
         ],
-        "write_behavior": "save_finalized_jobs DELETEs existing rows for plan_date first -- overwrite not duplicate",
+        "indexes": [
+          "idx_finalized_jobs_plan_date on plan_date (Phase 31)"
+        ],
+        "write_behavior": "save_finalized_jobs DELETEs existing rows for plan_date first -- overwrite not duplicate (used ONLY by Finalize Day). db.update_finalized_job(conn, row_id, **fields) -- Phase 31, Schedules tab -- updates only the passed columns of ONE existing row by id, never a whole-day rewrite. db.insert_finalized_job(conn, plan_date, **fields) -- Phase 31 -- adds one new row (Schedules tab's '+ Add Row'). db.list_finalized_jobs(conn, date_from, date_to) -- Phase 31 -- range read.",
         "note": "unresolved jobs are never written here -- explicitly skipped by the UI handler",
-        "fk_design_note": "driver_id/vehicle_id/supplier_id are intentionally loose (no REFERENCES clause) so historical records survive deletion of the referenced entity"
+        "fk_design_note": "driver_id/vehicle_id/supplier_id are intentionally loose (no REFERENCES clause) so historical records survive deletion of the referenced entity -- driver_name/vehicle_plate (Phase 31) follow the same philosophy: readable snapshots, not re-derived joins"
+      },
+      {
+        "name": "geocode_cache",
+        "added": "Phase 32, 2026-08-16",
+        "purpose": "PURE CACHE of paid geocoding responses -- no business data, safe to delete at any time (only cost is re-fetching). Holds the long tail of raw Excel area names ('ON SITE - PALM JUMEIRAH') that aren't predefined location codes.",
+        "columns": [
+          "query_text TEXT PRIMARY KEY COLLATE NOCASE",
+          "latitude REAL",
+          "longitude REAL",
+          "cached_at TEXT NOT NULL"
+        ],
+        "note": "COLLATE NOCASE + trimmed on read/write so the same place spelled differently isn't geocoded (and charged) twice. Addresses don't move, so entries are kept permanently -- db.clear_travel_time_cache() deliberately does NOT touch this table.",
+        "helpers": "db.get_geocode / db.save_geocode"
+      },
+      {
+        "name": "travel_time_cache",
+        "added": "Phase 32, 2026-08-16",
+        "purpose": "PURE CACHE of paid routing responses -- the main cost lever for the map screen. Without it, an 81-trip day re-run a few times would be hundreds of billed calls; with it, recurring pairs (CPK -> Zabeel runs constantly) are fetched once and reused, keeping normal use inside the free monthly allowance.",
+        "columns": [
+          "origin TEXT NOT NULL",
+          "destination TEXT NOT NULL",
+          "hour_bucket INTEGER NOT NULL",
+          "duration_minutes REAL",
+          "distance_km REAL",
+          "polyline TEXT",
+          "cached_at TEXT NOT NULL",
+          "PRIMARY KEY (origin, destination, hour_bucket)"
+        ],
+        "hour_bucket_rationale": "Preserves traffic-awareness: the same road at 08:00 and 23:00 is genuinely a different duration, so they are separate entries -- while every trip sharing that route within the same hour band still collapses to ONE call. Direction also matters (B->A is a separate entry from A->B; one-way systems are real).",
+        "polyline_note": "Stores Google's ENCODED polyline string (far smaller than an expanded point list), decoded on demand by maps_client.decode_polyline() -- which also handles OpenRouteService geometry, since ORS uses the same encoding.",
+        "helpers": "db.get_cached_travel_time / db.save_travel_time / db.clear_travel_time_cache / db.travel_cache_stats",
+        "shared_by": "Both app/ui/map_tab.py and plan_day_tab.py's AI Review read/write this table, so the two features never pay twice for the same route."
       }
     ]
   },

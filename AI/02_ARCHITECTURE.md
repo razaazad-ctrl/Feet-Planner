@@ -30,12 +30,16 @@ FleetPlanner/
 │   └── ui/
 │       ├── __init__.py
 │       ├── main_window.py         # QMainWindow, tab container, PIN gating
-│       ├── plan_day_tab.py        # Daily workflow screen, result table, filters, summary popup (largest UI file)
+│       ├── plan_day_tab.py        # Daily workflow screen, result table (all Excel columns, hide/unhide,
+│       │                          #   driver/vehicle inline reassignment), driver/supplier + event filters,
+│       │                          #   ReCheck clash/rule-break scan, summary popup (largest UI file)
 │       ├── drivers_tab.py         # Structured driver hard rules + AI notes
 │       ├── suppliers_tab.py       # Structured supplier offerings + AI notes
 │       ├── vehicles_tab.py        # Vehicle roster + Active/Deactive toggle (Phase 28)
 │       ├── vehicle_maintenance_dialog.py  # Vehicle Maintenance Log window (Phase 28, new)
-│       ├── locations_tab.py       # Short-code -> address mapping
+│       ├── map_tab.py             # Locations tab: 3-panel map + travel times (Phase 32)
+│       ├── locations_tab.py       # LEGACY, superseded by map_tab.py (Phase 32)
+│       ├── schedules_tab.py       # View/edit finalized_jobs to match what actually happened (Phase 31)
 │       ├── settings_tab.py        # API keys, PIN, digest refresh control
 │       ├── entity_rules_widget.py # LEGACY/unused generic widget (see below)
 │       ├── trip_clipart.png       # Summary popup trip-card icon
@@ -308,6 +312,130 @@ invariant.
 no cancellation support, and no explicit handling if the tab/window is
 closed while a run is in flight. Out of scope for what was asked (a busy
 indicator so Run Planning doesn't feel frozen), not a silent gap.
+
+## 3.2b Background-threaded AI Review + retry-on-transient-failure
+
+New 2026-08-15 (Phase 30c), same reasoning as 3.2 above: `_on_ai_review`
+used to call `ai_review.review_plan()`/`review_plan_gemini()` directly on
+the GUI thread, freezing the window for the whole network round trip --
+made worse once `ai_review.py` gained its own retry loop (Phase 30c, same
+session), since a single overloaded/rate-limited response could now mean
+up to 3 attempts, several seconds apart, all on the GUI thread.
+
+```
+_AIReviewWorker(QObject)                    # app/ui/plan_day_tab.py
+├── finished = Signal(list)                 # suggestion dicts on success
+├── failed = Signal(str)                    # AIReviewError or any other exception
+└── run()                                   # calls review_plan() or
+                                               review_plan_gemini(), executed
+                                               on the QThread, never the GUI thread
+```
+
+`PlanDayTab._on_ai_review`:
+1. Runs the key check, event-chain grouping, and the travel-time lookup
+   loop synchronously on the GUI thread -- **deliberately not
+   backgrounded**, unlike step 1 of Run Planning above: the lookup loop
+   calls `db.resolve_location(self.conn, ...)`, and a `sqlite3` connection
+   can only safely be used from the thread that created it. Moving this
+   loop to the worker thread would risk a real cross-thread sqlite crash
+   for no real benefit, since the AI API call itself (now potentially 3
+   attempts) is the actual source of the reported freeze, not this loop.
+2. Builds the review `context` (pure computation, no I/O).
+3. Same immediate-feedback pattern as Run Planning: disables
+   `ai_review_btn` (relabeled "Reviewing..."), also disables `run_btn`/
+   `upload_btn` (prevents a concurrent Run Planning or new Upload from
+   mutating `self.jobs` while the review reads it), shows the same
+   `self.run_progress` indeterminate bar Run Planning uses (not a second
+   bar -- the two operations can never overlap, since starting one
+   disables the other's own trigger button).
+4. Constructs an `_AIReviewWorker(use_gemini, api_key, context)`, moves it
+   to a new `QThread`, connects `finished`/`failed` to
+   `_on_ai_review_finished`/`_on_ai_review_failed`, starts the thread.
+   `self._ai_review_thread`/`self._ai_review_worker` held as instance
+   attributes for the same GC-safety reason as `_run_thread`/`_run_worker`.
+5. `self._pending_ai_review_state` (a small dict: `anthropic_key`,
+   `maps_warning`) holds what the finished/failed handlers need, the same
+   stash-across-the-async-call pattern as `self._pending_drivers`.
+
+On completion, `_reset_ai_review_controls()` (mirrors `_reset_run_controls()`)
+restores the button/progress-bar state; `_on_ai_review_finished` then does
+what `_on_ai_review` used to do synchronously after the old direct call:
+set the provider badge + warning-triangle tooltip on the AI Suggestions
+header, clear/rebuild the suggestion cards.
+
+**Retry logic lives in `ai_review.py`, not the worker** --
+`_call_with_retry()`/`_is_transient_error()`, shared by both
+`review_plan()` and `review_plan_gemini()`, wraps just the actual API
+call. Up to 3 total attempts, 3 seconds apart, only when the failure text
+looks transient (`"503"`, `"overloaded"`, `"unavailable"`, `"rate
+limit"`/`"429"`, `"timeout"`, `"temporarily"`, `"connection"`); a
+non-transient failure (bad key, invalid request) raises immediately on
+the first attempt. This keeps the retry behavior available to any caller
+of `ai_review.py`, not just the threaded UI path.
+
+## 3.2c Map / travel-time screen and its caches (Phase 32)
+
+New 2026-08-16. The Locations tab became `map_tab.py` -- a three-panel
+screen (locations editor | MapLibre/OpenFreeMap map | trips + driver-chain lists),
+modeled on a voyage-planning UI the project owner supplied as reference.
+
+**Cost is the architecture here.** Routing/geocoding APIs bill per call,
+and this screen wants a travel time for every trip on an 81-trip day,
+re-run whenever the planner adjusts something. Two SQLite caches make
+that affordable:
+
+```
+db.geocode_cache        query_text (PK) -> lat/lon
+                        The long tail of raw Excel area names
+                        ("ON SITE - PALM JUMEIRAH"). Addresses don't
+                        move, so these are cached permanently.
+
+db.travel_time_cache    (origin, destination, hour_bucket) PK
+                        -> duration, distance, encoded polyline
+                        The hour bucket is what preserves traffic-
+                        awareness (08:00 and 23:00 are genuinely
+                        different durations) while still collapsing
+                        every trip sharing a route in that time band
+                        into ONE call.
+```
+
+Predefined location codes keep their coordinates on `locations` itself
+(`latitude`/`longitude`/`geocoded_at`) rather than only in
+`geocode_cache` -- deliberately, because those are planner-visible and
+manually correctable, and a correction must survive a cache clear.
+
+**Two providers, always labeled.** `maps_client.py` gained a second
+backend: Google (traffic-aware, paid, preferred) and OpenRouteService
+(free, no credit card, **not** traffic-aware). `MapTab._active_provider()`
+picks Google when a key exists, else ORS -- the same
+primary-vs-free-fallback shape as `ai_review.py`'s Anthropic/Gemini
+split. Since the two produce meaningfully different numbers, the UI
+always shows which one produced the current figures.
+
+**Nothing runs automatically.** Opening the tab costs nothing; lookups
+happen only on an explicit "Run Locations" click (the project owner's
+requirement -- running on every tab open would be pure waste).
+
+**Threading**: `_LookupWorker` on a `QThread`, same pattern as
+`_SolverWorker`/`_AIReviewWorker`. It receives plain pre-resolved data
+and returns results -- it never touches `self.conn`, because a sqlite3
+connection can't be used from another thread. All cache reads happen on
+the main thread before the worker starts; all cache writes happen on the
+main thread in the `finished` slot.
+
+**AI Review shares the same cache** (`plan_day_tab._on_ai_review` reads
+`db.get_cached_travel_time` before fetching, and writes what it does
+fetch), so the two features never pay twice for the same route.
+`_build_driver_chain_gaps()` additionally feeds per-driver connection
+feasibility into the AI context -- built from *already-cached* routes
+only, so it adds zero API cost and simply gets richer as the map screen
+fills the cache.
+
+**Still display-only (Rule 10).** None of this touches
+`allocation_engine.py`. Real drive time does NOT feed the deterministic
+solver -- `DEFAULT_TRAVEL_BUFFER_MINUTES` remains `0` and the standing
+code comment about wiring live travel times into gap checks remains an
+open future item, explicitly deferred with the project owner.
 
 ## 3.3 Vehicle Maintenance Log
 
@@ -1088,7 +1216,7 @@ main.py
 ui.main_window
   -> db
   -> ui.drivers_tab, ui.suppliers_tab, ui.vehicles_tab,
-     ui.plan_day_tab, ui.settings_tab, ui.locations_tab
+     ui.plan_day_tab, ui.settings_tab, ui.map_tab, ui.schedules_tab
 
 ui.plan_day_tab
   -> db
@@ -1100,8 +1228,15 @@ ui.plan_day_tab
   -> ui.settings_tab (imports ANTHROPIC_KEY_SETTING, GOOGLE_MAPS_KEY_SETTING
      constants only -- not a circular UI dependency, just shared constants)
 
-ui.drivers_tab, ui.suppliers_tab, ui.vehicles_tab, ui.locations_tab
+ui.drivers_tab, ui.suppliers_tab, ui.vehicles_tab, ui.schedules_tab
   -> db  (only)
+
+ui.map_tab                          # Phase 32
+  -> db
+  -> maps_client
+  -> ui.settings_tab (key constants only)
+  -> ui.plan_day_tab (READ-ONLY reference, passed in by main_window, to read
+     the currently-loaded .jobs; never mutates it)
 
 ui.settings_tab
   -> db

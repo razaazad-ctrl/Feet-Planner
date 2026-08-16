@@ -6,7 +6,8 @@ from app.ui.suppliers_tab import SuppliersTab
 from app.ui.vehicles_tab import VehiclesTab
 from app.ui.plan_day_tab import PlanDayTab
 from app.ui.settings_tab import SettingsTab, pin_is_set, verify_pin
-from app.ui.locations_tab import LocationsTab
+from app.ui.map_tab import MapTab
+from app.ui.schedules_tab import SchedulesTab
 
 
 class MainWindow(QMainWindow):
@@ -31,8 +32,16 @@ class MainWindow(QMainWindow):
         vehicles_tab = VehiclesTab(conn)
         self.tabs.addTab(vehicles_tab, "Vehicles")
 
-        locations_tab = LocationsTab(conn)
+        # MapTab takes a read-only reference to the Plan a Day tab so its
+        # "Run Locations" button can pull whatever plan is currently loaded
+        # there. It never mutates plan_day_tab -- see map_tab.py. Cross-tab
+        # wiring has precedent here already (settings_widget.pin_changed
+        # below; plan_day_tab importing settings_tab's key constants).
+        locations_tab = MapTab(conn, plan_day_tab=plan_day_tab)
         self.tabs.addTab(locations_tab, "Locations")
+
+        schedules_tab = SchedulesTab(conn)
+        self.tabs.addTab(schedules_tab, "Schedules")
 
         settings_tab = SettingsTab(conn)
         self.settings_tab_index = self.tabs.addTab(settings_tab, "Settings")

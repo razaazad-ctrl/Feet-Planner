@@ -3,3 +3,4 @@ openpyxl==3.1.5
 anthropic==0.120.0
 requests
 ortools==9.15.6755
+google-genai  # optional -- only needed for the free/testing AI Review provider (Settings tab), see ai_review.py

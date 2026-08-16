@@ -695,8 +695,8 @@ class VehicleMaintenanceDialog(QDialog):
         records = db.list_service_records(self.conn, self.vehicle_id)  # oldest first
         cards_data = _cards_data_for(row, records)
 
-        for (card, icon_label, title_label, date_label, extra_label), (title, icon_file, date_iso, extra_text, bg_color) \
-                in zip(self._card_widgets, cards_data):
+        for i, ((card, icon_label, title_label, date_label, extra_label), (title, icon_file, date_iso, extra_text, bg_color)) \
+                in enumerate(zip(self._card_widgets, cards_data)):
             card.setStyleSheet(f"QFrame#card {{ background: {bg_color}; border: 1px solid #e2e8f1; border-radius: 12px; }}")
 
             icon_path = _ASSETS / icon_file
@@ -706,8 +706,12 @@ class VehicleMaintenanceDialog(QDialog):
             title_label.setText(title)
 
             date_label.setText(_display_date(date_iso))
+            # Only the Vehicle Expiry card (index 0, vehicle_reg_expiry) is an
+            # actual expiry date -- the other cards show the last service
+            # date, which is informational and always in the past, so it
+            # must not turn red just because _is_expired() is true.
             date_label.setStyleSheet(
-                f"color: {_EXPIRED_COLOR}; font-weight: 700;" if _is_expired(date_iso) else ""
+                f"color: {_EXPIRED_COLOR}; font-weight: 700;" if i == 0 and _is_expired(date_iso) else ""
             )
 
             extra_label.setText(str(extra_text) if extra_text else "")
@@ -1182,7 +1186,7 @@ def _pdf_draw_cards(painter, page_w, y, cards_data):
     card_h = 66
 
     x = 0.0
-    for title, icon_file, date_iso, extra_text, bg_color in cards_data:
+    for i, (title, icon_file, date_iso, extra_text, bg_color) in enumerate(cards_data):
         rect = QRectF(x, y, card_w, card_h)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(bg_color))
@@ -1199,7 +1203,9 @@ def _pdf_draw_cards(painter, page_w, y, cards_data):
         date_font.setPointSize(8)
         date_font.setBold(True)
         painter.setFont(date_font)
-        painter.setPen(QColor(_EXPIRED_COLOR) if _is_expired(date_iso) else QColor("#1a1f29"))
+        # Only card 0 (Vehicle Expiry) is a real expiry date -- see the
+        # matching note on _refresh_cards().
+        painter.setPen(QColor(_EXPIRED_COLOR) if i == 0 and _is_expired(date_iso) else QColor("#1a1f29"))
         painter.drawText(QRectF(x + 3, y + 21, card_w - 6, 18), Qt.AlignCenter, _display_date(date_iso))
 
         if extra_text:

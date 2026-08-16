@@ -238,12 +238,49 @@ Short-code → real-address lookup for accurate Maps queries.
 | `short_code` | TEXT PK COLLATE NOCASE | Exactly as it appears in the Excel file's pickup/order location columns, e.g. `"CPK"`, `"BQT STORE"` |
 | `full_address` | TEXT NOT NULL | A real address Google Maps can resolve precisely |
 | `created_at`, `updated_at` | TEXT | |
+| `latitude`, `longitude` | REAL, nullable | **New 2026-08-16 (Phase 32).** Map coordinates, so the code can be pinned. Held here rather than only in `geocode_cache` on purpose: these are planner-visible in the Locations panel and manually correctable (a geocoder puts `"CPK"` in roughly the right industrial area; the planner knows the exact gate), and that correction must survive a cache clear. `db.set_location_coords()` writes them. |
+| `geocoded_at` | TEXT, nullable | **New 2026-08-16.** When the coordinates were last set. |
 
 `db.resolve_location(conn, raw_text)` returns `{"address": str, "exact":
 bool}` — `exact=True` only if a matching `short_code` row exists;
 otherwise the raw text is used as-is with `exact=False`, and the AI
 review layer is instructed to be more conservative with suggestions
 based on `"approximate (area-level)"` confidence data.
+
+### `geocode_cache` and `travel_time_cache` (new 2026-08-16, Phase 32)
+
+**Both are PURE CACHES of paid API responses — no business data.** Safe
+to delete wholesale at any time; the only cost is re-fetching. They exist
+for one reason: Google/OpenRouteService bill per call, and the map screen
+wants a travel time for every trip on an 81-trip day, re-run whenever the
+planner adjusts something. Without caching that is hundreds of paid calls
+a day; with it, recurring pairs (CPK → Zabeel runs constantly, day after
+day) are fetched once and reused, which realistically keeps normal use
+inside the free monthly allowance.
+
+| Table | Key | Holds |
+|---|---|---|
+| `geocode_cache` | `query_text` (PK, COLLATE NOCASE) | `latitude`, `longitude`, `cached_at`. The long tail of raw Excel area names (`"ON SITE - PALM JUMEIRAH"`) that aren't predefined codes. Addresses don't move → cached permanently. Case/whitespace-insensitive so the same place spelled differently isn't re-charged. |
+| `travel_time_cache` | `(origin, destination, hour_bucket)` (composite PK) | `duration_minutes`, `distance_km`, `polyline`, `cached_at`. |
+
+**Why `hour_bucket`:** it preserves traffic-awareness. The same road at
+08:00 and at 23:00 is a genuinely different duration, so those are cached
+separately — while every trip sharing a route *within* that time band
+still collapses to a single call. Direction matters too (`B→A` is a
+separate entry from `A→B`; one-way systems are real).
+
+`polyline` stores Google's *encoded* polyline string for the actual road
+path (far smaller than an expanded point list), decoded on demand by
+`maps_client.decode_polyline()` — which handles OpenRouteService's
+geometry too, since ORS uses the same encoding.
+
+Helpers: `db.get_geocode`/`save_geocode`,
+`db.get_cached_travel_time`/`save_travel_time`,
+`db.clear_travel_time_cache()` (manual refresh escape hatch — drops
+travel entries only, **geocodes survive**, since addresses don't move),
+and `db.travel_cache_stats()` (surfaced in the UI so the planner can see
+the cache working). Both the map screen and AI Review read/write these
+same tables, so the two features never pay twice for the same route.
 
 ### `finalized_jobs`
 The permanent historical record of what was actually finalized each day.
@@ -265,10 +302,35 @@ rather than duplicates.
 | `start_dt`, `end_dt` | TEXT (ISO datetime) | |
 | `hours` | REAL | Precomputed job duration in hours |
 | `finalized_at` | TEXT | When the Finalize button was clicked (not `plan_date`) |
+| `event_text`, `pickup_location`, `vehicle_type_required`, `order_no`, `contact_person`, `order_location`, `additional_info`, `charge_code`, `same_driver_key` | TEXT, nullable | **New 2026-08-16 (Phase 31/31b, Schedules tab).** Context snapshots captured once at Finalize time, straight off the already-populated `Job` object (no extra query) — so a finalized day's record stays self-contained and readable in the Schedules tab even years later ("for complete reference of past," the project owner's own framing for why the second batch of 6 was added same-day after the first batch missed them). Blank on any row finalized before these columns existed. |
+| `driver_name`, `vehicle_plate` | TEXT, nullable | **New 2026-08-16.** Readable-name snapshots alongside `driver_id`/`vehicle_id` — deliberately NOT re-derived by joining the current `drivers`/`vehicles` tables, since (like the loose ID coupling below) a driver/vehicle can be renamed or deleted later and the historical record should still show what was true at the time. |
+| `cancelled` | INTEGER NOT NULL DEFAULT 0 | **New 2026-08-16.** Soft "this planned trip didn't actually happen" flag, set from the Schedules tab — deliberately NOT a row delete, matching this project's existing exclude-don't-delete convention (`drivers`/`suppliers`/`vehicles`' `excluded_from_planning`). **Excluded from every hours/overtime/fairness read** (see the four queries below, each now filters `WHERE ... AND (cancelled IS NULL OR cancelled = 0)`). |
 
 Unresolved jobs (no assignment found) are **not** written to
 `finalized_jobs` at all — `PlanDayTab._on_finalize` explicitly skips
 `j.unresolved` jobs when building the rows to save.
+
+An index, `idx_finalized_jobs_plan_date`, exists on `plan_date` (added
+2026-08-16 alongside the columns above) — keeps the Schedules tab's
+date-range query fast regardless of how many years of history accumulate;
+negligible cost to create/maintain at this table's realistic row volume.
+
+**The Schedules tab** (`app/ui/schedules_tab.py`, new 2026-08-16) is the
+only place `finalized_jobs` rows are ever corrected after the fact —
+Finalize Day only ever writes once. See `AI/06_NEXT_SESSION.md` Section
+7.4 and `AI/07_CHANGELOG_AI.md` Phase 31 for the full design writeup
+(why a Cancelled checkbox instead of a hard delete, why corrections
+overwrite in place with no separate audit-trail columns, why every edit
+to an already-saved row requires a specific "Change X for SR N from A to
+B?" confirmation first). Three new functions support it:
+- `db.list_finalized_jobs(conn, date_from, date_to)` — every row (any
+  driver/supplier, cancelled or not) in an inclusive `plan_date` range.
+- `db.insert_finalized_job(conn, plan_date, **fields)` — one new row (the
+  tab's "+ Add Row", for a genuinely unplanned trip that happened anyway).
+- `db.update_finalized_job(conn, row_id, **fields)` — updates only the
+  explicitly-passed columns of one existing row by `id`. Never a whole-day
+  rewrite like `save_finalized_jobs` (which deletes/reinserts the entire
+  day) — only the fields the planner actually changed are touched.
 
 ## Relationships (foreign keys)
 
@@ -302,6 +364,7 @@ checks — see `allocation_engine.py`'s `DriverProfile.month_overtime_so_far`):
 -- db.get_driver_month_overtime_hours(conn, driver_id, year, month, working_hours_per_day)
 SELECT plan_date, MIN(start_dt) AS day_start, MAX(end_dt) AS day_end FROM finalized_jobs
 WHERE driver_id = ? AND plan_date LIKE ?   -- e.g. '2026-03%'
+  AND (cancelled IS NULL OR cancelled = 0)  -- added 2026-08-16, Phase 31
 GROUP BY plan_date
 -- then in Python: sum(max(0, span_hours - working_hours_per_day) for each day,
 -- where span_hours = (day_end - day_start) in hours)
@@ -352,7 +415,8 @@ total).
 **Cross-day supplier fairness tiebreak:**
 ```sql
 -- db.get_supplier_cumulative_hours(conn, supplier_id, since_date=None)
-SELECT COALESCE(SUM(hours), 0) FROM finalized_jobs WHERE supplier_id = ?
+SELECT COALESCE(SUM(hours), 0) FROM finalized_jobs
+WHERE supplier_id = ? AND (cancelled IS NULL OR cancelled = 0)  -- filter added 2026-08-16, Phase 31
 [AND plan_date >= ?]
 ```
 Used to prefer hiring from whichever supplier has received the least

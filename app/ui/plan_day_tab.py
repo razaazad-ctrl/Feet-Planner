@@ -15,24 +15,159 @@ The daily workflow screen:
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTextEdit,
     QTableWidget, QTableWidgetItem, QFileDialog, QMessageBox, QHeaderView,
-    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout, QProgressBar
+    QScrollArea, QFrame, QComboBox, QDialog, QGridLayout, QProgressBar, QMenu, QCompleter
 )
-from PySide6.QtGui import QColor, QPixmap, QPainter, QPen, QBrush
-from PySide6.QtCore import Qt, QThread, QObject, Signal
+from PySide6.QtGui import QColor, QPixmap, QPainter, QPen, QBrush, QPolygonF, QIcon
+from PySide6.QtCore import Qt, QThread, QObject, Signal, QPointF, QSize
 from pathlib import Path
+from collections import defaultdict
+from itertools import combinations
 
 from app import db
 from app.excel_import import load_jobs_from_excel, group_jobs_by_event
 from app.allocation_engine import (
-    allocate_by_solver, build_driver_profiles, build_vehicle_profiles, build_supplier_offerings
+    allocate_by_solver, build_driver_profiles, build_vehicle_profiles, build_supplier_offerings,
+    _group_key_of, _day_span_hours, _type_matches,
 )
 from app import maps_client
 from app import ai_review
 from app import export
-from app.ui.settings_tab import ANTHROPIC_KEY_SETTING, GOOGLE_MAPS_KEY_SETTING
+from app.ui.settings_tab import ANTHROPIC_KEY_SETTING, GOOGLE_MAPS_KEY_SETTING, GEMINI_TEST_KEY_SETTING
 
 UNRESOLVED_COLOR = QColor("#5a2020")
 SUPPLIER_COLOR = QColor("#3a3a20")
+RECHECK_WARNING_COLOR = QColor("#ff6b6b")
+UNASSIGNED_LABEL = "-- Unassigned --"
+
+# Table column layout. The original 8 stay first/visible by default; the 6
+# extra "show every Excel column" columns (request #2, /AI/06_NEXT_SESSION.md
+# Section 7.2) are appended before Note so Note (which now also carries
+# ReCheck warnings) stays the rightmost column.
+COL_SR, COL_TIME, COL_EVENT, COL_VEHICLE_TYPE, COL_PICKUP, COL_DRIVER, COL_VEHICLE = range(7)
+COL_ORDER_NO, COL_CONTACT, COL_ORDER_LOCATION, COL_ADDITIONAL_INFO, COL_CHARGE_CODE, COL_SAME_DRIVER = range(7, 13)
+COL_NOTE = 13
+_COLUMN_HEADERS = [
+    "SR", "Time", "Event", "Vehicle Type Required", "Pick Up", "Driver / Supplier", "Vehicle / Unit",
+    "Order#", "Contact Person", "Order Location", "Additional Info", "Charge Code", "Same Driver", "Note",
+]
+_DEFAULT_HIDDEN_COLUMNS = {
+    COL_ORDER_NO, COL_CONTACT, COL_ORDER_LOCATION, COL_ADDITIONAL_INFO, COL_CHARGE_CODE, COL_SAME_DRIVER,
+}
+# Default pixel widths so the table looks the same, balanced way on every
+# launch instead of Qt's auto-size-from-header-text default (which doesn't
+# reflect how much room each column's actual content needs). Note isn't
+# listed -- it stretches to fill leftover width via setStretchLastSection.
+# SR/Time are deliberately NOT listed here -- their default width is
+# computed from real font metrics in _build_ui() instead of a fixed guess,
+# so their text is guaranteed to never clip regardless of font/DPI (the
+# project owner's explicit requirement -- every other column here is
+# allowed to truncate when narrowed, SR/Time are not). Event/Vehicle Type/
+# Pick Up narrowed at the project owner's request -- truncation is fine
+# for those.
+_DEFAULT_COLUMN_WIDTHS = {
+    COL_EVENT: 220, COL_VEHICLE_TYPE: 140,
+    COL_PICKUP: 160, COL_DRIVER: 210, COL_VEHICLE: 140,
+    COL_ORDER_NO: 90, COL_CONTACT: 150, COL_ORDER_LOCATION: 170,
+    COL_ADDITIONAL_INFO: 220, COL_CHARGE_CODE: 110, COL_SAME_DRIVER: 220,
+}
+_CENTERED_COLUMNS = {COL_SR, COL_TIME, COL_PICKUP, COL_ORDER_LOCATION}
+
+
+def _draw_badge_icon(letter, bg_color, size=18):
+    """Small colored circle + single bold letter -- a generic provider
+    badge (not a reproduction of any real logo), used on the AI Suggestions
+    header to show which backend produced the current suggestions ("A" for
+    Anthropic, "G" for Google Gemini) without spelling it out in a full
+    text sentence."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor(bg_color))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(0, 0, size, size)
+    painter.setPen(QColor("#ffffff"))
+    font = painter.font()
+    font.setBold(True)
+    font.setPointSize(max(7, int(size * 0.5)))
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, letter)
+    painter.end()
+    return pixmap
+
+
+def _draw_warning_triangle_icon(size=18):
+    """Small amber warning triangle -- replaces a full-sentence warning
+    label on the AI Suggestions header; hover (QToolTip) carries the actual
+    text instead, so the warning is still fully readable without
+    permanently eating vertical space."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor("#e8b93a"))
+    painter.setPen(Qt.NoPen)
+    triangle = QPolygonF([QPointF(size / 2, 1), QPointF(size - 1, size - 2), QPointF(1, size - 2)])
+    painter.drawPolygon(triangle)
+    painter.setPen(QColor("#1a1a1a"))
+    font = painter.font()
+    font.setBold(True)
+    font.setPointSize(max(7, int(size * 0.4)))
+    painter.setFont(font)
+    painter.drawText(pixmap.rect().adjusted(0, 2, 0, 0), Qt.AlignCenter, "!")
+    painter.end()
+    return pixmap
+
+
+def _draw_wrap_text_icon(size=20):
+    """Three horizontal bars (last one shorter) -- a generic "wrapped
+    paragraph" glyph, the same idea as Excel's Wrap Text button icon.
+    Toggled state (checked/unchecked) is shown by the button itself
+    (setCheckable), not by redrawing this icon. Near-white + thicker
+    strokes (not the original muted grey) so it's actually visible against
+    this app's dark button chrome -- too faint to spot in the first pass."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor("#f2f4f8"), 2.4)
+    pen.setCapStyle(Qt.RoundCap)
+    painter.setPen(pen)
+    y1, y2, y3 = size * 0.26, size * 0.52, size * 0.78
+    painter.drawLine(QPointF(2, y1), QPointF(size - 2, y1))
+    painter.drawLine(QPointF(2, y2), QPointF(size - 2, y2))
+    painter.drawLine(QPointF(2, y3), QPointF(size * 0.6, y3))
+    painter.end()
+    return pixmap
+
+
+class _NumericTableWidgetItem(QTableWidgetItem):
+    """Sorts numerically when both items' text parse as a number, otherwise
+    falls back to the normal string comparison. Used for the SR column --
+    QTableWidgetItem's default sort compares displayed text as a plain
+    string, so ascending SR order came out "1", "10", "11", "12", "2", ...
+    instead of 1, 2, 10, 11, 12. Only changes sort order, never the
+    displayed text."""
+
+    def __lt__(self, other):
+        try:
+            return float(self.text()) < float(other.text())
+        except (ValueError, TypeError):
+            return super().__lt__(other)
+
+
+class _NoScrollComboBox(QComboBox):
+    """A QComboBox that ignores mouse-wheel events -- same fix as
+    vehicle_maintenance_dialog.py's _NoScrollComboBox (duplicated locally
+    rather than shared, to avoid new cross-file coupling for one small
+    class): a plain QComboBox changes its selection on any wheel scroll
+    while the cursor happens to be over it, including just scrolling the
+    results table past that row -- which could silently reassign a job to
+    the wrong driver/vehicle. Ignoring the event lets Qt propagate it up to
+    the table's viewport instead, so table scrolling still works normally."""
+
+    def wheelEvent(self, event):
+        event.ignore()
 
 
 class _SolverWorker(QObject):
@@ -73,6 +208,42 @@ class _SolverWorker(QObject):
         self.finished.emit(solver_status)
 
 
+class _AIReviewWorker(QObject):
+    """Runs the actual AI Review API call (Anthropic or the free Gemini
+    testing provider) on a background thread -- same reasoning as
+    _SolverWorker above: this is a blocking network call, now made worse
+    by ai_review.py's own retry-on-transient-failure loop (up to 3
+    attempts with a few seconds' delay between them), so it could
+    previously freeze the whole window for well over 10 seconds on a
+    single overloaded/rate-limited response. Only the API call itself
+    runs here -- the maps_client travel-time lookups that happen before
+    it stay on the main thread, since they need self.conn (a sqlite3
+    connection, which -- unlike this call -- cannot safely be used from a
+    different thread than it was created on)."""
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, use_gemini, api_key, context):
+        super().__init__()
+        self.use_gemini = use_gemini
+        self.api_key = api_key
+        self.context = context
+
+    def run(self):
+        try:
+            if self.use_gemini:
+                suggestions = ai_review.review_plan_gemini(self.api_key, self.context)
+            else:
+                suggestions = ai_review.review_plan(self.api_key, self.context)
+        except ai_review.AIReviewError as e:
+            self.failed.emit(str(e))
+            return
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.finished.emit(suggestions)
+
+
 class PlanDayTab(QWidget):
     def __init__(self, conn, parent=None):
         super().__init__(parent)
@@ -83,6 +254,12 @@ class PlanDayTab(QWidget):
         self._run_thread = None
         self._run_worker = None
         self._pending_drivers = None
+        self._recheck_issues = {}  # job.sr -> list[str], from the last ReCheck run
+        self._ai_review_thread = None
+        self._ai_review_worker = None
+        # Stashed across the AI Review background call so _on_ai_review_finished/
+        # _on_ai_review_failed can get back to them (same pattern as _pending_drivers).
+        self._pending_ai_review_state = None
         self._build_ui()
 
     def _build_ui(self):
@@ -96,14 +273,16 @@ class PlanDayTab(QWidget):
         upload_row.addWidget(self.file_label, stretch=1)
         layout.addLayout(upload_row)
 
-        layout.addWidget(QLabel(
-            "Day notes (optional) -- anything about tomorrow the planner wants considered, "
+        day_notes_label = QLabel(
+            "Day notes (optional)"
+            "<span style=\"color: #888888;\"> -- anything about tomorrow the planner wants considered, "
             "e.g. \"VIP event at Zabeel today, expect longer waits\" or "
-            "\"Deepak can go over his usual hours today if needed\":"
-        ))
+            "\"Deepak can go over his usual hours today if needed\":</span>"
+        )
+        layout.addWidget(day_notes_label)
         self.notes_input = QTextEdit()
         self.notes_input.setPlaceholderText("Type any notes for this planning day here...")
-        self.notes_input.setMaximumHeight(80)
+        self.notes_input.setMaximumHeight(48)
         layout.addWidget(self.notes_input)
 
         run_row = QHBoxLayout()
@@ -113,6 +292,15 @@ class PlanDayTab(QWidget):
         self.ai_review_btn = QPushButton("AI Review (event chains + day notes)")
         self.ai_review_btn.clicked.connect(self._on_ai_review)
         self.ai_review_btn.setEnabled(False)
+        self.recheck_btn = QPushButton("ReCheck")
+        self.recheck_btn.setToolTip(
+            "Re-scans the current sheet (including any manual driver/vehicle reassignments) for "
+            "clashes and rule breaks -- driver/vehicle double-booking, hours over the hard limits, "
+            "and wrong vehicle type -- and flags them in red in the Note column. Never changes any "
+            "assignment. Safe to run again after every further edit."
+        )
+        self.recheck_btn.clicked.connect(self._on_recheck)
+        self.recheck_btn.setEnabled(False)
         self.finalize_btn = QPushButton("Finalize Day (save to history)")
         self.finalize_btn.clicked.connect(self._on_finalize)
         self.finalize_btn.setEnabled(False)
@@ -125,6 +313,7 @@ class PlanDayTab(QWidget):
         self.summary_label = QLabel("")
         run_row.addWidget(self.run_btn)
         run_row.addWidget(self.ai_review_btn)
+        run_row.addWidget(self.recheck_btn)
         run_row.addWidget(self.finalize_btn)
         run_row.addWidget(self.export_btn)
         run_row.addWidget(self.summary_btn)
@@ -146,32 +335,104 @@ class PlanDayTab(QWidget):
         filter_row.addWidget(QLabel("Filter by driver/supplier:"))
         self.filter_combo = QComboBox()
         self.filter_combo.addItem("All")
-        self.filter_combo.currentTextChanged.connect(self._apply_filter)
-        filter_row.addWidget(self.filter_combo, stretch=1)
+        self.filter_combo.currentTextChanged.connect(self._apply_filters)
+        self.filter_combo.setMaximumWidth(220)
+        filter_row.addWidget(self.filter_combo)
+        filter_row.addWidget(QLabel("Filter by event:"))
+        self.event_filter_combo = QComboBox()
+        self.event_filter_combo.addItem("All")
+        self.event_filter_combo.currentTextChanged.connect(self._apply_filters)
+        self.event_filter_combo.setMaximumWidth(220)
+        filter_row.addWidget(self.event_filter_combo)
+        filter_row.addStretch(1)
+        self.wrap_text_btn = QPushButton()
+        self.wrap_text_btn.setIcon(QIcon(_draw_wrap_text_icon()))
+        self.wrap_text_btn.setIconSize(QSize(20, 20))
+        self.wrap_text_btn.setToolTip("Wrap text -- toggle row text between single-line and 2-line wrapped")
+        self.wrap_text_btn.setCheckable(True)
+        self.wrap_text_btn.setFixedWidth(34)
+        self.wrap_text_btn.toggled.connect(self._on_wrap_text_toggled)
+        filter_row.addWidget(self.wrap_text_btn)
+        self.columns_btn = QPushButton("Columns ▾")
+        self.columns_btn.clicked.connect(self._show_columns_menu)
+        filter_row.addWidget(self.columns_btn)
         layout.addLayout(filter_row)
 
-        self.table = QTableWidget(0, 8)
-        self.table.setHorizontalHeaderLabels(
-            ["SR", "Time", "Event", "Vehicle Type Required", "Pick Up", "Driver / Supplier", "Vehicle / Unit", "Note"]
-        )
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        self.table = QTableWidget(0, len(_COLUMN_HEADERS))
+        self.table.setHorizontalHeaderLabels(_COLUMN_HEADERS)
+        # Every column is manually resizable (Interactive, the default) --
+        # the Event/Note columns used to be pinned to Stretch, which blocks
+        # drag-resize entirely; stretchLastSection keeps the rightmost
+        # visible column filling any leftover width without losing that.
+        self.table.horizontalHeader().setStretchLastSection(True)
+        # Explicit default widths so the table looks the same, balanced way
+        # every time the app launches -- without this, Qt falls back to
+        # auto-sizing from header text alone, which doesn't match how much
+        # content each column actually needs (approximated from a real
+        # 81-row sheet, not guessed from header text length).
+        for col, width in _DEFAULT_COLUMN_WIDTHS.items():
+            self.table.horizontalHeader().resizeSection(col, width)
+        # SR and Time must always show their full text (the project owner's
+        # explicit requirement, unlike the other columns above) -- computed
+        # from the table's real font metrics rather than a fixed guess, so
+        # it stays correct regardless of font/DPI. "999" covers any
+        # realistic SR; the time range is always the fixed "HH:MM - HH:MM"
+        # shape, so its widest real value is exactly this length.
+        fm = self.table.fontMetrics()
+        self.table.horizontalHeader().resizeSection(COL_SR, fm.horizontalAdvance("999") + 26)
+        self.table.horizontalHeader().resizeSection(COL_TIME, fm.horizontalAdvance("23:59 - 23:59") + 20)
+        for col in _DEFAULT_HIDDEN_COLUMNS:
+            self.table.setColumnHidden(col, True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(self._rebind_row_widgets)
+        self._wrap_text_enabled = False
+        self._default_row_height = self.table.verticalHeader().defaultSectionSize()
         layout.addWidget(self.table)
 
-        layout.addWidget(QLabel("AI Suggestions (accept or reject each one):"))
+        # Wrapped in its own widget (rather than adding the label/scroll area
+        # directly to `layout`) so the whole section can be shown/hidden as
+        # one unit -- starts hidden to give the results table more row
+        # space, and only reveals itself once AI Review is actually used
+        # (see _on_ai_review). A hidden QWidget takes no layout space, so
+        # hiding this doesn't leave a gap.
+        self.suggestions_section = QWidget()
+        suggestions_section_layout = QVBoxLayout(self.suggestions_section)
+        suggestions_section_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Header row: label on the left, then (only when relevant) a small
+        # warning-triangle icon and a provider badge on the far right --
+        # replaces what used to be full-sentence warning labels eating a
+        # whole row each; the same information is now a hover tooltip.
+        suggestions_header_row = QHBoxLayout()
+        suggestions_header_row.addWidget(QLabel("AI Suggestions (accept or reject each one):"))
+        suggestions_header_row.addStretch(1)
+        self.suggestions_warning_icon = QLabel()
+        self.suggestions_warning_icon.setPixmap(_draw_warning_triangle_icon())
+        self.suggestions_warning_icon.setVisible(False)
+        suggestions_header_row.addWidget(self.suggestions_warning_icon)
+        self.suggestions_provider_icon = QLabel()
+        self.suggestions_provider_icon.setVisible(False)
+        suggestions_header_row.addWidget(self.suggestions_provider_icon)
+        suggestions_section_layout.addLayout(suggestions_header_row)
+
         self.suggestions_container = QVBoxLayout()
+        self.suggestions_container.setSpacing(6)
         suggestions_scroll_widget = QWidget()
         suggestions_scroll_widget.setLayout(self.suggestions_container)
         self.suggestions_scroll = QScrollArea()
         self.suggestions_scroll.setWidgetResizable(True)
         self.suggestions_scroll.setWidget(suggestions_scroll_widget)
-        self.suggestions_scroll.setMaximumHeight(180)
-        layout.addWidget(self.suggestions_scroll)
+        # Tall enough for ~3 compact suggestion cards at once (see the
+        # tightened margins/spacing in _add_suggestion_widget) instead of
+        # the ~1 that fit before.
+        self.suggestions_scroll.setMaximumHeight(300)
+        suggestions_section_layout.addWidget(self.suggestions_scroll)
         self.no_suggestions_label = QLabel("Run planning, then click \"AI Review\" to see suggestions here.")
         self.no_suggestions_label.setStyleSheet("color: #888888;")
         self.suggestions_container.addWidget(self.no_suggestions_label)
+        self.suggestions_section.setVisible(False)
+        layout.addWidget(self.suggestions_section)
 
     def _on_upload(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select Requests Excel File", "", "Excel Files (*.xlsx)")
@@ -191,6 +452,7 @@ class PlanDayTab(QWidget):
         self.file_label.setText(f"{path.split('/')[-1].split(chr(92))[-1]}  —  {len(jobs)} jobs loaded")
         self.run_btn.setEnabled(True)
         self.summary_label.setText("")
+        self._recheck_issues = {}
         self.table.setRowCount(0)
 
     def _on_run(self):
@@ -242,8 +504,10 @@ class PlanDayTab(QWidget):
         self._pending_drivers = None
         self._reset_run_controls()
 
+        self._recheck_issues = {}
         self._render_results()
         self.ai_review_btn.setEnabled(True)
+        self.recheck_btn.setEnabled(True)
         self.finalize_btn.setEnabled(True)
         self.export_btn.setEnabled(True)
         self.summary_btn.setEnabled(True)
@@ -292,16 +556,33 @@ class PlanDayTab(QWidget):
 
     def _on_ai_review(self):
         anthropic_key = db.get_setting(self.conn, ANTHROPIC_KEY_SETTING)
+        gemini_key = db.get_setting(self.conn, GEMINI_TEST_KEY_SETTING)
         maps_key = db.get_setting(self.conn, GOOGLE_MAPS_KEY_SETTING)
 
-        if not anthropic_key:
-            QMessageBox.information(self, "No Anthropic key",
-                                     "Add your Anthropic API key in the Settings tab first.")
+        if not anthropic_key and not gemini_key:
+            QMessageBox.information(
+                self, "No AI key configured",
+                "Add your Anthropic API key in the Settings tab first -- or, for free testing, "
+                "a Google Gemini key in the same tab's \"Free/Testing AI Provider\" section."
+            )
             return
+
+        # AI Suggestions starts hidden (more row space for the results
+        # table) and only reveals itself once AI Review is actually used.
+        self.suggestions_section.setVisible(True)
 
         event_groups = group_jobs_by_event(self.jobs)
         multi_stage_groups = {eid: g for eid, g in event_groups.items() if len(g) >= 2}
 
+        # Travel-time lookups stay on the main thread (below, synchronous):
+        # they need self.conn (a sqlite3 connection, which can only safely
+        # be used from the thread it was created on) via db.resolve_location.
+        #
+        # Every lookup goes through db.travel_time_cache FIRST (2026-08-16) --
+        # the same cache the Locations/map screen fills. So if the planner
+        # already ran that screen for this day, AI Review costs zero extra
+        # API calls, and vice versa: the two features share one cache
+        # instead of each paying separately for identical routes.
         travel_lookups = {}
         maps_warning = ""
         if maps_key:
@@ -315,9 +596,24 @@ class PlanDayTab(QWidget):
                     destination = db.resolve_location(self.conn, destination_raw)
                     key = f"SR{prev_job.sr} -> SR{next_job.sr}"
                     confidence = "exact" if (origin["exact"] and destination["exact"]) else "approximate (area-level)"
+                    hour = prev_job.end_dt.hour
+                    cached = db.get_cached_travel_time(
+                        self.conn, origin["address"], destination["address"], hour
+                    )
+                    if cached is not None:
+                        travel_lookups[key] = {
+                            "duration_minutes": cached["duration_minutes"],
+                            "confidence": confidence,
+                        }
+                        continue
                     try:
                         result = maps_client.get_travel_time(
                             maps_key, origin["address"], destination["address"], prev_job.end_dt
+                        )
+                        db.save_travel_time(
+                            self.conn, origin["address"], destination["address"], hour,
+                            result["duration_minutes"], result.get("distance_km"),
+                            result.get("polyline"),
                         )
                         travel_lookups[key] = {
                             "duration_minutes": result["duration_minutes"],
@@ -328,6 +624,13 @@ class PlanDayTab(QWidget):
         else:
             maps_warning = "(No Google Maps key set — proceeding without real travel-time data.)\n"
 
+        # Per-driver connection feasibility, built purely from what's ALREADY
+        # cached -- never triggers a fetch of its own, so enabling this cost
+        # nothing. Gives the AI real geography across each driver's whole day
+        # (not just within event chains): where a driver physically cannot
+        # make the next pickup in the gap available.
+        driver_chain_gaps = self._build_driver_chain_gaps()
+
         driver_hours_summary = {d.name: round(d.occupied_seconds / 3600.0, 1) for d in self.last_drivers}
         day_notes = self.notes_input.toPlainText().strip()
 
@@ -337,19 +640,127 @@ class PlanDayTab(QWidget):
         context = ai_review.build_review_context(
             self.jobs, multi_stage_groups, driver_hours_summary, travel_lookups, day_notes,
             preferences_digest=preferences_digest,
+            driver_chain_gaps=driver_chain_gaps,
         )
 
-        try:
-            suggestions = ai_review.review_plan(anthropic_key, context)
-        except ai_review.AIReviewError as e:
-            QMessageBox.warning(self, "AI Review failed", str(e))
-            return
+        # The actual AI API call (the slow, blocking part -- now with up to
+        # 3 retries on a transient failure, several seconds apart) runs on
+        # a background thread via _AIReviewWorker, same reasoning and same
+        # pattern as Run Planning's _SolverWorker: without this, a single
+        # overloaded/rate-limited response could freeze the whole window
+        # for 10+ seconds.
+        self._pending_ai_review_state = {
+            "anthropic_key": anthropic_key,
+            "maps_warning": maps_warning,
+        }
+        self.ai_review_btn.setEnabled(False)
+        self.ai_review_btn.setText("Reviewing...")
+        self.run_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
+        self.run_progress.setVisible(True)
+
+        self._ai_review_thread = QThread(self)
+        self._ai_review_worker = _AIReviewWorker(not anthropic_key, anthropic_key or gemini_key, context)
+        self._ai_review_worker.moveToThread(self._ai_review_thread)
+        self._ai_review_thread.started.connect(self._ai_review_worker.run)
+        self._ai_review_worker.finished.connect(self._on_ai_review_finished)
+        self._ai_review_worker.failed.connect(self._on_ai_review_failed)
+        for signal in (self._ai_review_worker.finished, self._ai_review_worker.failed):
+            signal.connect(self._ai_review_thread.quit)
+            signal.connect(self._ai_review_worker.deleteLater)
+        self._ai_review_thread.finished.connect(self._ai_review_thread.deleteLater)
+        self._ai_review_thread.start()
+
+    def _build_driver_chain_gaps(self):
+        """Each driver's consecutive job-to-job connections, with the gap
+        available vs. the real drive time between those two places -- for
+        the AI Review context (2026-08-16).
+
+        Reads the travel-time cache ONLY -- never fetches. A connection with
+        no cached route is simply omitted rather than triggering a paid
+        lookup, so turning this on added zero API cost; it gets richer
+        automatically as the Locations/map screen fills the cache.
+        """
+        by_driver = {}
+        for job in self.jobs:
+            if job.start_dt is None or job.end_dt is None or job.assigned_driver_id is None:
+                continue
+            by_driver.setdefault(job.assigned_driver_name or "driver", []).append(job)
+
+        gaps = {}
+        for driver, driver_jobs in sorted(by_driver.items()):
+            driver_jobs.sort(key=lambda j: j.start_dt)
+            legs = []
+            for prev_job, next_job in zip(driver_jobs, driver_jobs[1:]):
+                origin_raw = prev_job.order_location or prev_job.pickup_location
+                destination_raw = next_job.pickup_location or next_job.order_location
+                if not origin_raw or not destination_raw:
+                    continue
+                origin = db.resolve_location(self.conn, origin_raw)["address"]
+                destination = db.resolve_location(self.conn, destination_raw)["address"]
+                gap_minutes = round((next_job.start_dt - prev_job.end_dt).total_seconds() / 60.0, 1)
+                if origin == destination:
+                    drive_minutes = 0.0   # same place, no drive needed
+                else:
+                    cached = db.get_cached_travel_time(
+                        self.conn, origin, destination, prev_job.end_dt.hour
+                    )
+                    if cached is None:
+                        continue          # not cached -> skip, never fetch here
+                    drive_minutes = cached["duration_minutes"]
+                legs.append({
+                    "from_sr": prev_job.sr,
+                    "to_sr": next_job.sr,
+                    "gap_minutes": gap_minutes,
+                    "drive_minutes": drive_minutes,
+                    "feasible": drive_minutes is not None and drive_minutes <= gap_minutes,
+                })
+            if legs:
+                gaps[driver] = legs
+        return gaps
+
+    def _reset_ai_review_controls(self):
+        self.run_progress.setVisible(False)
+        self.ai_review_btn.setText("AI Review (event chains + day notes)")
+        self.ai_review_btn.setEnabled(True)
+        self.run_btn.setEnabled(True)
+        self.upload_btn.setEnabled(True)
+
+    def _on_ai_review_finished(self, suggestions):
+        state = self._pending_ai_review_state
+        self._pending_ai_review_state = None
+        self._reset_ai_review_controls()
+
+        anthropic_key = state["anthropic_key"]
+        maps_warning = state["maps_warning"]
 
         self._clear_suggestions()
+
+        # Provider badge -- which backend actually produced these
+        # suggestions (top-right of the AI Suggestions header).
+        if anthropic_key:
+            self.suggestions_provider_icon.setPixmap(_draw_badge_icon("A", "#d97757"))
+            self.suggestions_provider_icon.setToolTip("Suggestions generated by Anthropic Claude")
+        else:
+            self.suggestions_provider_icon.setPixmap(_draw_badge_icon("G", "#4285f4"))
+            self.suggestions_provider_icon.setToolTip("Suggestions generated by Google Gemini (free/testing provider)")
+        self.suggestions_provider_icon.setVisible(True)
+
+        # Warning triangle -- combines whatever caveats apply into one
+        # hover tooltip instead of permanent full-sentence labels.
+        warning_parts = []
         if maps_warning:
-            warn_label = QLabel(maps_warning)
-            warn_label.setStyleSheet("color: #a08030;")
-            self.suggestions_container.addWidget(warn_label)
+            warning_parts.append(maps_warning.strip())
+        if not anthropic_key:
+            warning_parts.append(
+                "Using the free Google Gemini testing provider, not Anthropic -- suggestion quality "
+                "may be weaker. Add an Anthropic key in Settings for the real thing."
+            )
+        if warning_parts:
+            self.suggestions_warning_icon.setToolTip("\n\n".join(warning_parts))
+            self.suggestions_warning_icon.setVisible(True)
+        else:
+            self.suggestions_warning_icon.setVisible(False)
 
         if not suggestions:
             label = QLabel("No suggestions — the current plan looks fine as is.")
@@ -359,6 +770,11 @@ class PlanDayTab(QWidget):
         plan_date = self.jobs[0].date.isoformat() if self.jobs and self.jobs[0].date else ""
         for s in suggestions:
             self._add_suggestion_widget(s, plan_date)
+
+    def _on_ai_review_failed(self, detail):
+        self._pending_ai_review_state = None
+        self._reset_ai_review_controls()
+        QMessageBox.warning(self, "AI Review failed", detail)
 
     def _clear_suggestions(self):
         while self.suggestions_container.count():
@@ -371,6 +787,10 @@ class PlanDayTab(QWidget):
         frame = QFrame()
         frame.setFrameShape(QFrame.StyledPanel)
         frame_layout = QVBoxLayout(frame)
+        # Tightened from Qt's default (~9px margins, ~11px spacing) so
+        # roughly 3 cards fit in the scroll area at once instead of ~1.
+        frame_layout.setContentsMargins(8, 5, 8, 5)
+        frame_layout.setSpacing(3)
 
         jobs_str = ", ".join(f"SR{j}" for j in suggestion.get("affected_jobs", []))
         header = QLabel(f"[{suggestion.get('type', 'suggestion')}] {jobs_str}")
@@ -382,6 +802,7 @@ class PlanDayTab(QWidget):
         frame_layout.addWidget(reasoning_label)
 
         btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
         accept_btn = QPushButton("Accept")
         reject_btn = QPushButton("Reject")
         status_label = QLabel("")
@@ -467,67 +888,549 @@ class PlanDayTab(QWidget):
                 "start_dt": j.start_dt.isoformat(),
                 "end_dt": j.end_dt.isoformat(),
                 "hours": hours,
+                # Context snapshots for the Schedules tab (2026-08-16) --
+                # captured once, here, so a finalized day's record stays
+                # self-contained/readable even if the driver/vehicle is
+                # later renamed or removed from the roster. Already on the
+                # Job object, no extra query needed.
+                "event_text": j.event_text,
+                "pickup_location": j.pickup_location,
+                "vehicle_type_required": j.vehicle_type_required,
+                "driver_name": j.assigned_driver_name,
+                "vehicle_plate": j.assigned_vehicle_plate,
+                # Caught as a real gap the same day ("for complete reference
+                # of past"): these four (plus charge_code/same_driver_key)
+                # were missed from the first pass above, even though
+                # they're already Job fields shown as optional Plan a Day
+                # columns.
+                "order_no": j.order_no,
+                "contact_person": j.contact_person,
+                "order_location": j.order_location,
+                "additional_info": j.additional_info,
+                "charge_code": j.charge_code,
+                "same_driver_key": j.same_driver_key,
             })
 
         db.save_finalized_jobs(self.conn, plan_date, job_rows)
         QMessageBox.information(self, "Finalized", f"Saved {len(job_rows)} assignments to history for {plan_date}.")
 
+    def _load_reassignment_options(self):
+        """Refreshes the driver/vehicle/supplier lists the reassignment combo
+        boxes are built from. Deliberately unfiltered by excluded_from_planning
+        (confirmed with the project owner: the planner must be able to
+        deliberately pull an off-day driver, or an excluded vehicle, onto a
+        busy day) -- active_only=True (the default) only filters each
+        table's own 'active' (still-on-roster) flag."""
+        self._driver_rows = list(db.list_drivers(self.conn))
+        self._supplier_rows = list(db.list_suppliers(self.conn))
+        self._vehicle_rows = list(db.list_vehicles(self.conn))
+        self._driver_id_by_name = {r["name"]: r["id"] for r in self._driver_rows}
+        self._supplier_id_by_name = {r["name"]: r["id"] for r in self._supplier_rows}
+        self._vehicle_id_by_plate = {r["plate"]: r["id"] for r in self._vehicle_rows}
+        self._vehicle_type_by_id = {r["id"]: r["vehicle_type"] for r in self._vehicle_rows}
+
+    def _driver_supplier_combo_items(self):
+        return (
+            [UNASSIGNED_LABEL]
+            + sorted(self._driver_id_by_name, key=str.upper)
+            + sorted(self._supplier_id_by_name, key=str.upper)
+        )
+
+    def _vehicle_combo_items(self):
+        return [UNASSIGNED_LABEL] + sorted(self._vehicle_id_by_plate, key=str.upper)
+
+    def _make_editable_combo(self, items, current_text):
+        """A type-ahead-filtered, free-text-capable combo box: lists every
+        option with no restriction (the planner can assign anything,
+        including an off-day driver -- confirmed), but also lets typing the
+        first few letters narrow the popup instead of scrolling a long list,
+        and lets the planner type an exact label (e.g. a specific supplier
+        hired-unit number) that isn't in the base list."""
+        combo = _NoScrollComboBox()
+        combo.addItems(items)
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.lineEdit().setAlignment(Qt.AlignLeft)
+        completer = combo.completer()
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        completer.setFilterMode(Qt.MatchStartsWith)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        idx = combo.findText(current_text)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setEditText(current_text)
+        # A long name in a narrow column otherwise scrolls to show the END
+        # of the text (the QLineEdit cursor defaults to the end after
+        # setEditText/setCurrentIndex) -- the planner needs to see the
+        # START of the name (e.g. the supplier) to identify the row at a
+        # glance, so pin the visible scroll position back to the start.
+        combo.lineEdit().setCursorPosition(0)
+        return combo
+
+    def _row_tint(self, job):
+        if job.unresolved:
+            return UNRESOLVED_COLOR
+        if job.assigned_supplier_unit:
+            return SUPPLIER_COLOR
+        return None
+
+    def _note_display(self, job):
+        """(text, is_warning) for the Note column -- ReCheck results take
+        priority when present (in red), otherwise the engine's own
+        assignment_note is shown unchanged. ReCheck never mutates
+        assignment_note itself, only this display."""
+        issues = self._recheck_issues.get(job.sr)
+        if issues:
+            return "; ".join(issues), True
+        return job.assignment_note, False
+
     def _render_results(self):
         self.table.setSortingEnabled(False)  # must be off while populating, or rows scramble mid-insert
         self.table.setRowCount(0)
-        driver_supplier_values = set()
+        self._load_reassignment_options()
+        driver_combo_items = self._driver_supplier_combo_items()
+        vehicle_combo_items = self._vehicle_combo_items()
+
         for job in self.jobs:
             row = self.table.rowCount()
             self.table.insertRow(row)
-
-            time_str = ""
-            if job.start_dt and job.end_dt:
-                time_str = f"{job.start_dt.strftime('%H:%M')} - {job.end_dt.strftime('%H:%M')}"
-
-            driver_or_supplier = ""
-            vehicle_or_unit = ""
-            if job.assigned_driver_id is not None:
-                driver_or_supplier = job.assignment_note.replace("In-house: ", "")
-                vehicle_or_unit = job.assigned_vehicle_plate
-            elif job.assigned_supplier_unit:
-                # "Supplier Name - #1" -> split company from unit label
-                driver_or_supplier = job.assigned_supplier_unit
-                vehicle_or_unit = job.assigned_supplier_unit
-            elif job.unresolved:
-                driver_or_supplier = "UNRESOLVED"
-                vehicle_or_unit = "UNRESOLVED"
-
-            if driver_or_supplier and driver_or_supplier != "UNRESOLVED":
-                # Group "SAME X" with "X" for filtering -- same physical
-                # truck/driver, just reused later in the day.
-                driver_supplier_values.add(driver_or_supplier.removeprefix("SAME "))
-
-            values = [
-                job.sr, time_str, job.event_text, job.vehicle_type_required,
-                job.pickup_location, driver_or_supplier, vehicle_or_unit, job.assignment_note,
-            ]
-            for col, val in enumerate(values):
-                item = QTableWidgetItem(str(val))
-                if job.unresolved:
-                    item.setBackground(UNRESOLVED_COLOR)
-                elif job.assigned_supplier_unit:
-                    item.setBackground(SUPPLIER_COLOR)
-                self.table.setItem(row, col, item)
+            self._populate_row(row, job, driver_combo_items, vehicle_combo_items)
         self.table.setSortingEnabled(True)
+        if self._wrap_text_enabled:
+            self.table.resizeRowsToContents()
 
-        self.filter_combo.blockSignals(True)
-        self.filter_combo.clear()
-        self.filter_combo.addItem("All")
-        for name in sorted(driver_supplier_values):
-            self.filter_combo.addItem(name)
-        self.filter_combo.blockSignals(False)
+        self._refresh_filter_choices()
 
-    def _apply_filter(self, selected_text):
+    def _populate_row(self, row, job, driver_combo_items, vehicle_combo_items):
+        tint = self._row_tint(job)
+
+        time_str = ""
+        if job.start_dt and job.end_dt:
+            time_str = f"{job.start_dt.strftime('%H:%M')} - {job.end_dt.strftime('%H:%M')}"
+
+        driver_or_supplier = UNASSIGNED_LABEL
+        vehicle_or_unit = UNASSIGNED_LABEL
+        if job.assigned_driver_id is not None:
+            driver_or_supplier = job.assigned_driver_name or UNASSIGNED_LABEL
+            vehicle_or_unit = job.assigned_vehicle_plate or UNASSIGNED_LABEL
+        elif job.assigned_supplier_unit:
+            driver_or_supplier = job.assigned_supplier_unit
+            vehicle_or_unit = job.assigned_supplier_unit
+
+        note_text, note_is_warning = self._note_display(job)
+
+        plain_values = {
+            COL_SR: job.sr, COL_TIME: time_str, COL_EVENT: job.event_text,
+            COL_VEHICLE_TYPE: job.vehicle_type_required, COL_PICKUP: job.pickup_location,
+            COL_ORDER_NO: job.order_no, COL_CONTACT: job.contact_person,
+            COL_ORDER_LOCATION: job.order_location, COL_ADDITIONAL_INFO: job.additional_info,
+            COL_CHARGE_CODE: job.charge_code, COL_SAME_DRIVER: job.same_driver_key,
+            COL_NOTE: note_text,
+        }
+        for col, val in plain_values.items():
+            item = _NumericTableWidgetItem(str(val)) if col == COL_SR else QTableWidgetItem(str(val))
+            if col in _CENTERED_COLUMNS:
+                item.setTextAlignment(Qt.AlignCenter)
+            if col == COL_NOTE and note_is_warning:
+                item.setForeground(RECHECK_WARNING_COLOR)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            elif tint is not None:
+                item.setBackground(tint)
+            self.table.setItem(row, col, item)
+
+        driver_combo = self._make_editable_combo(driver_combo_items, driver_or_supplier)
+        driver_combo.currentTextChanged.connect(lambda text, j=job: self._on_driver_combo_changed(j, text))
+        vehicle_combo = self._make_editable_combo(vehicle_combo_items, vehicle_or_unit)
+        vehicle_combo.currentTextChanged.connect(lambda text, j=job: self._on_vehicle_combo_changed(j, text))
+        if tint is not None:
+            for combo in (driver_combo, vehicle_combo):
+                combo.setStyleSheet(f"QComboBox {{ background-color: {tint.name()}; }}")
+        self.table.setCellWidget(row, COL_DRIVER, driver_combo)
+        self.table.setCellWidget(row, COL_VEHICLE, vehicle_combo)
+
+    def _job_by_sr(self, sr):
+        for j in self.jobs:
+            if j.sr == sr:
+                return j
+        return None
+
+    def _on_driver_combo_changed(self, job, text):
+        text = text.strip()
+        if text == "" or text == UNASSIGNED_LABEL:
+            job.assigned_driver_id = None
+            job.assigned_driver_name = ""
+            job.assigned_supplier_id = None
+            job.assigned_supplier_unit = None
+            job.unresolved = True
+        elif text in self._driver_id_by_name:
+            job.assigned_driver_id = self._driver_id_by_name[text]
+            job.assigned_driver_name = text
+            job.assigned_supplier_id = None
+            job.assigned_supplier_unit = None
+            job.unresolved = False
+        else:
+            # A supplier name/label -- either a known base supplier name, or
+            # a hand-typed hired-unit label (e.g. "ABC Rentals 2").
+            job.assigned_driver_id = None
+            job.assigned_driver_name = ""
+            job.assigned_vehicle_id = None
+            job.assigned_vehicle_plate = ""
+            job.assigned_supplier_id = self._supplier_id_by_name.get(
+                text.rstrip("0123456789").strip(), self._supplier_id_by_name.get(text)
+            )
+            job.assigned_supplier_unit = text
+            job.unresolved = False
+            # Convenience sync: mirror the supplier label into the Vehicle/Unit
+            # cell too (matches the existing on-screen convention that a
+            # supplier's name shows in both columns) -- the planner can still
+            # edit it separately afterward.
+            self._set_vehicle_cell_text(job, text)
+        job.assignment_note = "Manually reassigned by planner"
+        self._retint_job_row(job)
+        self._refresh_filter_choices()
+
+    def _on_vehicle_combo_changed(self, job, text):
+        text = text.strip()
+        if text == "" or text == UNASSIGNED_LABEL:
+            job.assigned_vehicle_id = None
+            job.assigned_vehicle_plate = ""
+        elif text in self._vehicle_id_by_plate:
+            job.assigned_vehicle_id = self._vehicle_id_by_plate[text]
+            job.assigned_vehicle_plate = text
+        else:
+            # Free-typed text on a supplier row (vehicle_plate isn't used for
+            # supplier rows -- assigned_supplier_unit already carries the label).
+            job.assigned_vehicle_id = None
+            job.assigned_vehicle_plate = ""
+        job.assignment_note = "Manually reassigned by planner"
+        self._retint_job_row(job)
+
+    def _set_vehicle_cell_text(self, job, text):
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 5)  # Driver / Supplier column
-            cell_text = item.text().removeprefix("SAME ") if item is not None else ""
-            match = selected_text == "All" or cell_text == selected_text
+            sr_item = self.table.item(row, COL_SR)
+            if sr_item is not None and sr_item.text() == job.sr:
+                combo = self.table.cellWidget(row, COL_VEHICLE)
+                if combo is not None:
+                    combo.blockSignals(True)
+                    idx = combo.findText(text)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                    else:
+                        combo.setEditText(text)
+                    combo.lineEdit().setCursorPosition(0)
+                    combo.blockSignals(False)
+                return
+
+    def _retint_job_row(self, job):
+        """Refreshes one row's background tint + Note cell in place after a
+        manual reassignment, without rebuilding the whole table (keeps scroll
+        position/sort order intact -- same reasoning as the Vehicle
+        Maintenance Log's card-refresh, see vehicle_maintenance_dialog.py)."""
+        tint = self._row_tint(job)
+        for row in range(self.table.rowCount()):
+            sr_item = self.table.item(row, COL_SR)
+            if sr_item is None or sr_item.text() != job.sr:
+                continue
+            note_text, note_is_warning = self._note_display(job)
+            for col in range(self.table.columnCount()):
+                if col in (COL_DRIVER, COL_VEHICLE):
+                    combo = self.table.cellWidget(row, col)
+                    if combo is not None:
+                        combo.setStyleSheet(
+                            f"QComboBox {{ background-color: {tint.name()}; }}" if tint is not None else ""
+                        )
+                    continue
+                item = self.table.item(row, col)
+                if item is None:
+                    continue
+                if col == COL_NOTE:
+                    item.setText(note_text)
+                    font = item.font()
+                    if note_is_warning:
+                        item.setForeground(RECHECK_WARNING_COLOR)
+                        font.setBold(True)
+                    else:
+                        item.setData(Qt.ForegroundRole, None)  # back to the default (theme) text color
+                        font.setBold(False)
+                    item.setFont(font)
+                if tint is not None:
+                    item.setBackground(tint)
+                else:
+                    item.setData(Qt.BackgroundRole, None)  # back to the default (theme) background
+            return
+
+    def _rebind_row_widgets(self, *_args):
+        """QTableWidget cell widgets don't automatically follow Qt's built-in
+        row sort -- re-run after every header-click sort so each row's combo
+        boxes stay attached to the correct job (looked up by SR, not by row
+        position).
+
+        Sorting MUST be off for the whole loop, not just the initial
+        population in _render_results: with sortingEnabled still True, each
+        setItem() call inside _populate_row() can trigger Qt to re-sort the
+        table again immediately (it auto-resorts on any data change while
+        sorting is enabled) -- mid-loop, out from under `range(rowCount())`,
+        which was corrupting row/job association (a row's SR cell would show
+        one job's SR while its other cells belonged to a different job)."""
+        self.table.setSortingEnabled(False)
+        driver_combo_items = self._driver_supplier_combo_items()
+        vehicle_combo_items = self._vehicle_combo_items()
+        for row in range(self.table.rowCount()):
+            sr_item = self.table.item(row, COL_SR)
+            if sr_item is None:
+                continue
+            job = self._job_by_sr(sr_item.text())
+            if job is None:
+                continue
+            self._populate_row(row, job, driver_combo_items, vehicle_combo_items)
+        self.table.setSortingEnabled(True)
+        if self._wrap_text_enabled:
+            self.table.resizeRowsToContents()
+
+    def _refresh_filter_choices(self):
+        driver_supplier_values = set()
+        event_values = set()
+        for job in self.jobs:
+            label = ""
+            if job.assigned_driver_id is not None:
+                label = job.assigned_driver_name
+            elif job.assigned_supplier_unit:
+                label = job.assigned_supplier_unit.removeprefix("SAME ")
+            if label:
+                driver_supplier_values.add(label)
+            if job.event_text:
+                event_values.add(job.event_text)
+
+        for combo, values in (
+            (self.filter_combo, driver_supplier_values),
+            (self.event_filter_combo, event_values),
+        ):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("All")
+            for v in sorted(values):
+                combo.addItem(v)
+            combo.setCurrentText(current if combo.findText(current) >= 0 else "All")
+            combo.blockSignals(False)
+
+    def _apply_filters(self, *_args):
+        driver_filter = self.filter_combo.currentText()
+        event_filter = self.event_filter_combo.currentText()
+        for row in range(self.table.rowCount()):
+            driver_combo = self.table.cellWidget(row, COL_DRIVER)
+            driver_text = driver_combo.currentText().removeprefix("SAME ") if driver_combo is not None else ""
+            event_item = self.table.item(row, COL_EVENT)
+            event_text = event_item.text() if event_item is not None else ""
+            match = (driver_filter == "All" or driver_text == driver_filter) and \
+                    (event_filter == "All" or event_text == event_filter)
             self.table.setRowHidden(row, not match)
+
+    def _show_columns_menu(self):
+        menu = QMenu(self)
+        for col, label in enumerate(_COLUMN_HEADERS):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self.table.setColumnHidden(c, not checked))
+        menu.exec(self.columns_btn.mapToGlobal(self.columns_btn.rect().bottomLeft()))
+
+    def _on_wrap_text_toggled(self, checked):
+        """Excel-style Wrap Text toggle: on = every row grows to fit its
+        wrapped (multi-line) cell text, off = back to single-line rows
+        with the usual truncated/elided text. self._wrap_text_enabled is
+        also read by _render_results()/_rebind_row_widgets() so newly
+        (re)built rows pick up whichever state is currently active."""
+        self._wrap_text_enabled = checked
+        self.table.setWordWrap(checked)
+        if checked:
+            self.table.resizeRowsToContents()
+        else:
+            for row in range(self.table.rowCount()):
+                self.table.setRowHeight(row, self._default_row_height)
+
+    def _on_recheck(self):
+        if not self.jobs:
+            return
+        self._recheck_issues = _compute_recheck_issues(self.jobs, self.last_drivers, self._vehicle_type_by_id)
+        for row in range(self.table.rowCount()):
+            sr_item = self.table.item(row, COL_SR)
+            if sr_item is None:
+                continue
+            job = self._job_by_sr(sr_item.text())
+            if job is None:
+                continue
+            note_text, note_is_warning = self._note_display(job)
+            item = self.table.item(row, COL_NOTE)
+            if item is None:
+                continue
+            item.setText(note_text)
+            font = item.font()
+            if note_is_warning:
+                item.setForeground(RECHECK_WARNING_COLOR)
+                font.setBold(True)
+            else:
+                item.setData(Qt.ForegroundRole, None)  # back to the default (theme) text color
+                font.setBold(False)
+            item.setFont(font)
+        flagged = len({sr for sr, issues in self._recheck_issues.items() if issues})
+        if flagged:
+            QMessageBox.warning(
+                self, "ReCheck found issues",
+                f"{flagged} row(s) have a clash or rule break -- see the red Note text in the table."
+            )
+        else:
+            QMessageBox.information(self, "ReCheck", "No clashes or rule breaks found in the current sheet.")
+
+
+# ---------------------------------------------------------------------------
+# ReCheck: clash/rule-break detection over the CURRENT in-memory results,
+# including any manual driver/vehicle reassignment. Pure and Qt-free (same
+# separation-of-concerns pattern as build_summary() below) so it's directly
+# unit-testable, and -- critically -- it never mutates a Job. It only
+# reports; the planner's own assignments are always the final word (Rule 11).
+# ---------------------------------------------------------------------------
+def _overlap(a, b):
+    return a.start_dt < b.end_dt and b.start_dt < a.end_dt
+
+
+def _compute_recheck_issues(jobs, driver_profiles, vehicle_type_by_id):
+    """Returns {job.sr: [warning, ...]} for every row with a detected clash
+    or rule break. driver_profiles: the DriverProfile list from the last Run
+    Planning (self.last_drivers) -- only used for each driver's hour-rule
+    CONFIGURATION (working_hours_per_day, max_working_hours_per_day,
+    max_overtime_hours_per_month, month_overtime_so_far); the actual hours
+    worked are always recomputed fresh from `jobs` here, so a manual
+    reassignment is reflected immediately. vehicle_type_by_id: {vehicle_id:
+    vehicle_type} from the current database state."""
+    issues = defaultdict(list)
+    valid = [j for j in jobs if j.start_dt is not None and j.end_dt is not None]
+
+    # 1. Driver double-booking. Also covers "one driver on two trips with two
+    # different vehicles at the same time" -- same overlap check regardless
+    # of which vehicle each trip used. Same-Driver-grouped rows are exempt,
+    # matching allocation_engine._overlaps_with_buffer's own
+    # ignore_group_key exemption for legitimate back-and-forth rows.
+    by_driver = defaultdict(list)
+    for j in valid:
+        if j.assigned_driver_id is not None:
+            by_driver[j.assigned_driver_id].append(j)
+    for driver_jobs in by_driver.values():
+        for a, b in combinations(driver_jobs, 2):
+            if _group_key_of(a) is not None and _group_key_of(a) == _group_key_of(b):
+                continue
+            if _overlap(a, b):
+                name = a.assigned_driver_name or "This driver"
+                issues[a.sr].append(
+                    f"Clash: {name} is also on SR{b.sr} ({b.start_dt:%H:%M}-{b.end_dt:%H:%M}), an overlapping time."
+                )
+                issues[b.sr].append(
+                    f"Clash: {name} is also on SR{a.sr} ({a.start_dt:%H:%M}-{a.end_dt:%H:%M}), an overlapping time."
+                )
+
+    # 2. Vehicle double-booking: in-house vehicles by id, hired supplier
+    # units by their exact label (same label + overlapping time = the same
+    # physical unit double-booked).
+    by_vehicle = defaultdict(list)
+    for j in valid:
+        if j.assigned_vehicle_id is not None:
+            by_vehicle[j.assigned_vehicle_id].append(j)
+    for vehicle_jobs in by_vehicle.values():
+        for a, b in combinations(vehicle_jobs, 2):
+            if _group_key_of(a) is not None and _group_key_of(a) == _group_key_of(b):
+                continue
+            if _overlap(a, b):
+                plate = a.assigned_vehicle_plate or "This vehicle"
+                issues[a.sr].append(
+                    f"Clash: vehicle {plate} is also on SR{b.sr} ({b.start_dt:%H:%M}-{b.end_dt:%H:%M}), an overlapping time."
+                )
+                issues[b.sr].append(
+                    f"Clash: vehicle {plate} is also on SR{a.sr} ({a.start_dt:%H:%M}-{a.end_dt:%H:%M}), an overlapping time."
+                )
+
+    by_supplier_unit = defaultdict(list)
+    for j in valid:
+        if j.assigned_supplier_unit:
+            by_supplier_unit[j.assigned_supplier_unit].append(j)
+    for unit_jobs in by_supplier_unit.values():
+        for a, b in combinations(unit_jobs, 2):
+            if _group_key_of(a) is not None and _group_key_of(a) == _group_key_of(b):
+                continue
+            if _overlap(a, b):
+                label = a.assigned_supplier_unit
+                issues[a.sr].append(
+                    f"Clash: supplier unit \"{label}\" is also on SR{b.sr} ({b.start_dt:%H:%M}-{b.end_dt:%H:%M}), an overlapping time."
+                )
+                issues[b.sr].append(
+                    f"Clash: supplier unit \"{label}\" is also on SR{a.sr} ({a.start_dt:%H:%M}-{a.end_dt:%H:%M}), an overlapping time."
+                )
+
+    # 3. Driver hard-rule hour violations -- duty SPAN (first job start to
+    # last job end that day), the same measure allocation_engine itself
+    # enforces (see _day_span_hours), re-verified against the planner's
+    # edited output rather than the engine's own original assignment.
+    profile_by_id = {d.id: d for d in (driver_profiles or [])}
+    for driver_id, driver_jobs in by_driver.items():
+        profile = profile_by_id.get(driver_id)
+        if profile is None or profile.working_hours_per_day is None:
+            continue
+        by_date = defaultdict(list)
+        for j in driver_jobs:
+            by_date[j.start_dt.date()].append(j)
+        for the_date, day_jobs in by_date.items():
+            span_hours = _day_span_hours([(j.start_dt, j.end_dt) for j in day_jobs])
+            baseline = profile.working_hours_per_day
+            ceiling = profile.max_working_hours_per_day if profile.max_working_hours_per_day is not None else baseline
+            overtime_today = max(0.0, span_hours - baseline)
+            if span_hours > ceiling + 1e-9:
+                msg = (
+                    f"Hard rule: {profile.name}'s shift on {the_date:%d-%b} spans {span_hours:.1f}h, "
+                    f"over the {ceiling:.1f}h daily limit."
+                )
+                for j in day_jobs:
+                    issues[j.sr].append(msg)
+            if profile.max_overtime_hours_per_month is not None:
+                projected = profile.month_overtime_so_far + overtime_today
+                if projected > profile.max_overtime_hours_per_month + 1e-9:
+                    msg = (
+                        f"Hard rule: {profile.name}'s monthly overtime would reach {projected:.1f}h, "
+                        f"over the {profile.max_overtime_hours_per_month:.1f}h monthly cap."
+                    )
+                    for j in day_jobs:
+                        issues[j.sr].append(msg)
+
+    # NOTE: an earlier version of this function also flagged a Same-Driver
+    # group split across more than one driver as a violation. Removed
+    # 2026-08-15 (Phase 29b) -- confirmed against AI/04_BUSINESS_RULES.md's
+    # "Same Driver Column" section that this is a documented SOFT
+    # preference ("if one driver truly cannot cover the whole flagged
+    # group... the system brings in as few additional drivers as
+    # possible"), not a hard rule. A real run flagged 47 legitimate,
+    # solver-optimal splits as false-positive "clashes" on a fresh,
+    # 0-unresolved, provably-optimal plan the planner hadn't even touched
+    # yet -- there's no reliable way to tell a deliberate/necessary split
+    # from a planner mistake from the data alone, so the check was dropped
+    # rather than kept as a source of noise.
+
+    # 4. Wrong vehicle type -- in-house rows only; a Job doesn't record which
+    # offering/vehicle-type a supplier unit used, so supplier rows aren't
+    # checkable here.
+    for j in valid:
+        if j.assigned_vehicle_id is None:
+            continue
+        if (j.vehicle_type_required or "").strip().lower() == "driver only":
+            continue
+        actual_type = vehicle_type_by_id.get(j.assigned_vehicle_id)
+        if actual_type and j.vehicle_type_required and not _type_matches(j.vehicle_type_required, actual_type):
+            issues[j.sr].append(
+                f"Wrong vehicle type: needs \"{j.vehicle_type_required}\" but "
+                f"{j.assigned_vehicle_plate or 'the assigned vehicle'} is a \"{actual_type}\"."
+            )
+
+    return dict(issues)
 
 
 # ---------------------------------------------------------------------------

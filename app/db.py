@@ -206,17 +206,53 @@ _MIGRATIONS = [
     ("vehicles", "rta_certificate_expiry TEXT"),      # ISO date
     ("vehicles", "ad_certificate TEXT"),
     ("vehicles", "ad_certificate_expiry TEXT"),       # ISO date
+    # --- Schedules tab (2026-08-16) --------------------------------------
+    # finalized_jobs context snapshots + soft-delete flag. Safe to migrate
+    # here (targets a table created earlier in this same function's own
+    # executescript, which now deliberately runs before this loop -- see
+    # the comment on _run_migrations above).
+    ("finalized_jobs", "event_text TEXT"),
+    ("finalized_jobs", "pickup_location TEXT"),
+    ("finalized_jobs", "vehicle_type_required TEXT"),
+    ("finalized_jobs", "driver_name TEXT"),
+    ("finalized_jobs", "vehicle_plate TEXT"),
+    ("finalized_jobs", "cancelled INTEGER NOT NULL DEFAULT 0"),
+    # Added same day -- caught as a real gap in the first pass above
+    # ("for complete reference of past"): order_no/contact_person/
+    # order_location/additional_info/charge_code/same_driver_key are also
+    # already Job fields shown as optional Plan a Day columns, and were
+    # missed from the original context-snapshot set.
+    ("finalized_jobs", "order_no TEXT"),
+    ("finalized_jobs", "contact_person TEXT"),
+    ("finalized_jobs", "order_location TEXT"),
+    ("finalized_jobs", "additional_info TEXT"),
+    ("finalized_jobs", "charge_code TEXT"),
+    ("finalized_jobs", "same_driver_key TEXT"),
+    # --- Map/travel-time screen (2026-08-16) -----------------------------
+    # Coordinates for the predefined location codes, so they can be pinned
+    # on the map. Kept ON the locations table (rather than only in
+    # geocode_cache) deliberately: these are planner-visible and manually
+    # overridable in the Locations panel -- a geocoder can put "CPK" in
+    # roughly the right industrial area but the planner knows exactly which
+    # gate/building it is, and that correction must survive a cache clear.
+    ("locations", "latitude REAL"),
+    ("locations", "longitude REAL"),
+    ("locations", "geocoded_at TEXT"),
 ]
 
 
 def _run_migrations(conn):
-    for table, column_def in _MIGRATIONS:
-        column_name = column_def.split()[0]
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
-        except sqlite3.OperationalError as e:
-            if "duplicate column name" not in str(e).lower():
-                raise
+    # This executescript (CREATE TABLE IF NOT EXISTS for tables added after
+    # the initial release) MUST run before the ALTER TABLE loop below, not
+    # after -- on a brand-new database, `_MIGRATIONS` entries that target
+    # one of these later-added tables (e.g. finalized_jobs) would otherwise
+    # hit "ALTER TABLE finalized_jobs ADD COLUMN ..." before the table
+    # exists at all, raising "no such table" (not "duplicate column name",
+    # so it wouldn't be swallowed below -- it would break fresh-database
+    # init entirely). Every entry in `_MIGRATIONS` until now only targeted
+    # drivers/suppliers/vehicles, which are created even earlier still (in
+    # the top-level `_SCHEMA` executed by init_db() before this function is
+    # ever called) -- reordering here doesn't affect any of those.
     conn.executescript("""
     -- Structured rate/availability offering, one row per vehicle type a
     -- supplier provides. Replaces the old "pre-named unit" model -- the
@@ -235,18 +271,46 @@ def _run_migrations(conn):
     -- monthly overtime caps, monthly hour targets, and giving suppliers
     -- equal business opportunity over time.
     CREATE TABLE IF NOT EXISTS finalized_jobs (
-        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-        plan_date           TEXT NOT NULL,
-        sr                  TEXT,
-        driver_id           INTEGER,
-        vehicle_id          INTEGER,
-        supplier_id         INTEGER,
-        supplier_label      TEXT,   -- e.g. "AL LAITH PASSENGER TRANSPORT 1"
-        start_dt            TEXT,
-        end_dt              TEXT,
-        hours               REAL,
-        finalized_at        TEXT NOT NULL
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_date               TEXT NOT NULL,
+        sr                      TEXT,
+        driver_id               INTEGER,
+        vehicle_id              INTEGER,
+        supplier_id             INTEGER,
+        supplier_label          TEXT,   -- e.g. "AL LAITH PASSENGER TRANSPORT 1"
+        start_dt                TEXT,
+        end_dt                  TEXT,
+        hours                   REAL,
+        finalized_at            TEXT NOT NULL,
+        -- Schedules tab (2026-08-16): context snapshots, captured once at
+        -- Finalize time -- NOT foreign-keyed/re-derived, so a day's record
+        -- still reads correctly even if the driver/vehicle is later
+        -- renamed or removed from the roster. Blank on any row finalized
+        -- before this column existed (accepted, documented tradeoff).
+        event_text              TEXT,
+        pickup_location         TEXT,
+        vehicle_type_required   TEXT,
+        driver_name             TEXT,
+        vehicle_plate           TEXT,
+        -- Added 2026-08-16 (same day, same reason) -- the project owner
+        -- caught that these four (plus charge_code/same_driver_key) were
+        -- missed from the first pass of context snapshots, even though
+        -- they're already Job fields shown as optional Plan a Day columns.
+        -- "For complete reference of past" -- captured for the same
+        -- reason as event_text/pickup_location/vehicle_type_required above.
+        order_no                TEXT,
+        contact_person          TEXT,
+        order_location          TEXT,
+        additional_info         TEXT,
+        charge_code             TEXT,
+        same_driver_key         TEXT,
+        -- Soft "didn't actually happen" flag -- deliberately NOT a row
+        -- delete, matching this project's existing exclude-don't-delete
+        -- convention (drivers/suppliers/vehicles' excluded_from_planning).
+        -- Excluded from every hours/overtime/fairness read below.
+        cancelled                INTEGER NOT NULL DEFAULT 0
     );
+    CREATE INDEX IF NOT EXISTS idx_finalized_jobs_plan_date ON finalized_jobs(plan_date);
 
     -- Vehicle Maintenance Log (2026-08-14): one row per service/repair/
     -- inspection event for one vehicle. Linked by vehicle_id (not plate
@@ -272,7 +336,56 @@ def _run_migrations(conn):
         created_at      TEXT NOT NULL,
         updated_at      TEXT NOT NULL
     );
+
+    -- Map/travel-time screen (2026-08-16). Both tables below exist for ONE
+    -- reason: cost. Google's Routes/Geocoding APIs bill per call, and this
+    -- screen wants a travel time for every trip on an 81-trip day, re-run
+    -- whenever the planner adjusts something. Without caching that is
+    -- hundreds of paid calls a day; with it, the same recurring pairs
+    -- (CPK -> Zabeel runs constantly, day after day) are fetched once and
+    -- reused, which realistically keeps normal use inside the free
+    -- monthly allowance. Nothing here is business data -- both tables are
+    -- pure caches and can be deleted at any time with no loss beyond
+    -- having to re-fetch.
+
+    -- Geocoding results for arbitrary address text -- specifically the long
+    -- tail of raw area names straight out of the Excel file ("ON SITE -
+    -- PALM JUMEIRAH") that aren't predefined location codes. Predefined
+    -- codes keep their own coordinates on the locations table instead
+    -- (planner-visible and manually overridable there).
+    CREATE TABLE IF NOT EXISTS geocode_cache (
+        query_text      TEXT PRIMARY KEY COLLATE NOCASE,
+        latitude        REAL,
+        longitude       REAL,
+        cached_at       TEXT NOT NULL
+    );
+
+    -- Traffic-aware travel times, keyed by (origin, destination, hour of
+    -- day). The hour bucket is what preserves traffic-awareness -- the same
+    -- route at 07:00 and at 23:00 are genuinely different durations, so
+    -- they're cached separately -- while still collapsing the many trips
+    -- that share a route within the same time band into a single call.
+    -- polyline is Google's encoded-polyline string for the actual road
+    -- path, decoded client-side by maps_client.decode_polyline() for
+    -- drawing (stored encoded: far smaller than an expanded point list).
+    CREATE TABLE IF NOT EXISTS travel_time_cache (
+        origin              TEXT NOT NULL,
+        destination         TEXT NOT NULL,
+        hour_bucket         INTEGER NOT NULL,
+        duration_minutes    REAL,
+        distance_km         REAL,
+        polyline            TEXT,
+        cached_at           TEXT NOT NULL,
+        PRIMARY KEY (origin, destination, hour_bucket)
+    );
     """)
+    for table, column_def in _MIGRATIONS:
+        column_name = column_def.split()[0]
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
 
 
 def _now():
@@ -346,7 +459,7 @@ def get_driver_month_to_date_hours(conn, driver_id, year, month):
     prefix = f"{year:04d}-{month:02d}"
     row = conn.execute(
         "SELECT COALESCE(SUM(hours), 0) AS total FROM finalized_jobs "
-        "WHERE driver_id = ? AND plan_date LIKE ?",
+        "WHERE driver_id = ? AND plan_date LIKE ? AND (cancelled IS NULL OR cancelled = 0)",
         (driver_id, f"{prefix}%"),
     ).fetchone()
     return row["total"]
@@ -364,6 +477,7 @@ def _driver_month_daily_span_hours(conn, driver_id, year, month):
     rows = conn.execute(
         "SELECT plan_date, MIN(start_dt) AS day_start, MAX(end_dt) AS day_end "
         "FROM finalized_jobs WHERE driver_id = ? AND plan_date LIKE ? "
+        "AND (cancelled IS NULL OR cancelled = 0) "
         "GROUP BY plan_date",
         (driver_id, f"{prefix}%"),
     ).fetchall()
@@ -530,19 +644,31 @@ def list_all_supplier_offerings(conn):
 def save_finalized_jobs(conn, plan_date, job_rows):
     """
     job_rows: list of dicts with keys sr, driver_id, vehicle_id, supplier_id,
-    supplier_label, start_dt (iso str), end_dt (iso str), hours.
-    Replaces any previously finalized rows for this plan_date (re-finalizing
-    a day overwrites, rather than duplicating).
+    supplier_label, start_dt (iso str), end_dt (iso str), hours, plus the
+    Schedules-tab context snapshots (2026-08-16) event_text, pickup_location,
+    vehicle_type_required, driver_name, vehicle_plate, order_no,
+    contact_person, order_location, additional_info, charge_code,
+    same_driver_key (all optional -- .get() defaults to None so any caller
+    not yet passing them still works). Replaces any previously finalized
+    rows for this plan_date (re-finalizing a day overwrites, rather than
+    duplicating). cancelled always starts 0 here -- corrections to it
+    happen later, via the Schedules tab.
     """
     conn.execute("DELETE FROM finalized_jobs WHERE plan_date = ?", (plan_date,))
     now = _now()
     for r in job_rows:
         conn.execute(
             "INSERT INTO finalized_jobs (plan_date, sr, driver_id, vehicle_id, supplier_id, "
-            "supplier_label, start_dt, end_dt, hours, finalized_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "supplier_label, start_dt, end_dt, hours, finalized_at, event_text, pickup_location, "
+            "vehicle_type_required, driver_name, vehicle_plate, order_no, contact_person, "
+            "order_location, additional_info, charge_code, same_driver_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (plan_date, r.get("sr"), r.get("driver_id"), r.get("vehicle_id"), r.get("supplier_id"),
-             r.get("supplier_label"), r.get("start_dt"), r.get("end_dt"), r.get("hours"), now),
+             r.get("supplier_label"), r.get("start_dt"), r.get("end_dt"), r.get("hours"), now,
+             r.get("event_text"), r.get("pickup_location"), r.get("vehicle_type_required"),
+             r.get("driver_name"), r.get("vehicle_plate"), r.get("order_no"), r.get("contact_person"),
+             r.get("order_location"), r.get("additional_info"), r.get("charge_code"),
+             r.get("same_driver_key")),
         )
     conn.commit()
 
@@ -551,12 +677,104 @@ def get_supplier_cumulative_hours(conn, supplier_id, since_date=None):
     """Total historical hours given to this supplier -- used to prefer
     suppliers with less cumulative business when multiple offer the same
     type/rate, giving everyone a fair long-run opportunity."""
-    q = "SELECT COALESCE(SUM(hours), 0) AS total FROM finalized_jobs WHERE supplier_id = ?"
+    q = ("SELECT COALESCE(SUM(hours), 0) AS total FROM finalized_jobs "
+         "WHERE supplier_id = ? AND (cancelled IS NULL OR cancelled = 0)")
     params = [supplier_id]
     if since_date:
         q += " AND plan_date >= ?"
         params.append(since_date)
     return conn.execute(q, params).fetchone()["total"]
+
+
+# --------------------------------------------------------- Schedules tab
+# (2026-08-16) -- view/edit already-finalized days to correct them against
+# what actually happened, per AI/06_NEXT_SESSION.md Section 7.4.
+
+def list_finalized_jobs(conn, date_from, date_to):
+    """Every finalized_jobs row (any driver/supplier, cancelled or not --
+    the Schedules tab itself decides what to show/grey out) within an
+    inclusive plan_date range, oldest first."""
+    return conn.execute(
+        "SELECT * FROM finalized_jobs WHERE plan_date BETWEEN ? AND ? ORDER BY plan_date, id",
+        (date_from, date_to),
+    ).fetchall()
+
+
+# Sentinel default for update_finalized_job's optional fields below --
+# distinguishes "caller didn't mention this column, leave it alone" from
+# "caller explicitly wants it set to None/NULL" (e.g. clearing driver_id
+# back to unassigned is a real, intentional case, not an omission).
+_UNSET = object()
+
+
+def insert_finalized_job(conn, plan_date, sr=None, driver_id=None, vehicle_id=None,
+                          supplier_id=None, supplier_label=None, start_dt=None, end_dt=None,
+                          hours=None, event_text=None, pickup_location=None,
+                          vehicle_type_required=None, driver_name=None, vehicle_plate=None,
+                          order_no=None, contact_person=None, order_location=None,
+                          additional_info=None, charge_code=None, same_driver_key=None,
+                          cancelled=0):
+    """Adds one new finalized_jobs row directly (Schedules tab's "+ Add
+    Row" -- an unplanned trip that happened anyway, outside the normal Run
+    Planning -> Finalize Day flow). Returns the new row's id. Explicit,
+    named columns -- same style as add_service_record above -- rather than
+    a dynamic **kwargs INSERT, so every real column is spelled out once,
+    here, matching this file's existing convention."""
+    now = _now()
+    cur = conn.execute(
+        "INSERT INTO finalized_jobs (plan_date, sr, driver_id, vehicle_id, supplier_id, "
+        "supplier_label, start_dt, end_dt, hours, finalized_at, event_text, pickup_location, "
+        "vehicle_type_required, driver_name, vehicle_plate, order_no, contact_person, "
+        "order_location, additional_info, charge_code, same_driver_key, cancelled) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (plan_date, sr, driver_id, vehicle_id, supplier_id, supplier_label, start_dt, end_dt,
+         hours, now, event_text, pickup_location, vehicle_type_required, driver_name,
+         vehicle_plate, order_no, contact_person, order_location, additional_info, charge_code,
+         same_driver_key, cancelled),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_finalized_job(conn, row_id, plan_date=_UNSET, sr=_UNSET, driver_id=_UNSET, vehicle_id=_UNSET,
+                          supplier_id=_UNSET, supplier_label=_UNSET, start_dt=_UNSET, end_dt=_UNSET,
+                          hours=_UNSET, event_text=_UNSET, pickup_location=_UNSET,
+                          vehicle_type_required=_UNSET, driver_name=_UNSET, vehicle_plate=_UNSET,
+                          order_no=_UNSET, contact_person=_UNSET, order_location=_UNSET,
+                          additional_info=_UNSET, charge_code=_UNSET, same_driver_key=_UNSET,
+                          cancelled=_UNSET):
+    """Updates only the explicitly-passed columns of one existing
+    finalized_jobs row by id (Schedules tab edits -- every column is
+    editable there: driver/vehicle/supplier reassignment, actual
+    start/end/hours correction, event/pickup/vehicle-type-required text
+    correction, or the cancelled flag). Never a whole-day rewrite (unlike
+    save_finalized_jobs, which deletes/reinserts the entire day) -- only
+    the fields the planner actually changed are touched. Every real column
+    is spelled out as a named parameter (matching this file's existing
+    convention, e.g. update_service_record) rather than an arbitrary
+    **kwargs dict; the SET clause below is only built from these known,
+    fixed names, never from caller-supplied strings."""
+    updates = {
+        name: value for name, value in {
+            "plan_date": plan_date, "sr": sr, "driver_id": driver_id, "vehicle_id": vehicle_id,
+            "supplier_id": supplier_id, "supplier_label": supplier_label,
+            "order_no": order_no, "contact_person": contact_person, "order_location": order_location,
+            "additional_info": additional_info, "charge_code": charge_code,
+            "same_driver_key": same_driver_key,
+            "start_dt": start_dt, "end_dt": end_dt, "hours": hours,
+            "event_text": event_text, "pickup_location": pickup_location,
+            "vehicle_type_required": vehicle_type_required, "driver_name": driver_name,
+            "vehicle_plate": vehicle_plate, "cancelled": cancelled,
+        }.items() if value is not _UNSET
+    }
+    if not updates:
+        return
+    set_clause = ", ".join(f"{name} = ?" for name in updates)
+    conn.execute(
+        f"UPDATE finalized_jobs SET {set_clause} WHERE id = ?",
+        (*updates.values(), row_id),
+    )
+    conn.commit()
 
 
 # ---------------------------------------------------------- supplier rules
@@ -880,3 +1098,112 @@ def resolve_location(conn, raw_text):
     if row:
         return {"address": row["full_address"], "exact": True}
     return {"address": raw_text.strip(), "exact": False}
+
+
+def set_location_coords(conn, short_code, latitude, longitude):
+    """Stores (or corrects) a predefined location's map coordinates.
+    Called both by the Geocode Missing button and by a manual planner
+    edit -- a geocoder puts "CPK" roughly in the right industrial area,
+    the planner knows the exact gate."""
+    conn.execute(
+        "UPDATE locations SET latitude = ?, longitude = ?, geocoded_at = ?, updated_at = ? "
+        "WHERE short_code = ?",
+        (latitude, longitude, _now(), _now(), short_code.strip()),
+    )
+    conn.commit()
+
+
+# ------------------------------------------------- geocode / travel caches
+# Both are PURE CACHES of paid Google API responses -- no business data.
+# Safe to delete wholesale at any time; the only cost is re-fetching. See
+# the schema comments in _run_migrations() for the full cost rationale.
+
+def get_geocode(conn, query_text):
+    """Cached coordinates for arbitrary address text, or None on a miss."""
+    if not query_text:
+        return None
+    row = conn.execute(
+        "SELECT latitude, longitude FROM geocode_cache WHERE query_text = ?",
+        (query_text.strip(),),
+    ).fetchone()
+    if row is None or row["latitude"] is None or row["longitude"] is None:
+        return None
+    return {"lat": row["latitude"], "lon": row["longitude"]}
+
+
+def save_geocode(conn, query_text, latitude, longitude):
+    conn.execute(
+        "INSERT INTO geocode_cache (query_text, latitude, longitude, cached_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(query_text) DO UPDATE SET latitude = excluded.latitude, "
+        "longitude = excluded.longitude, cached_at = excluded.cached_at",
+        (query_text.strip(), latitude, longitude, _now()),
+    )
+    conn.commit()
+
+
+def get_cached_travel_time(conn, origin, destination, hour_bucket):
+    """Cached travel time for this exact origin/destination at this hour of
+    day, or None on a miss. Returns the same shape maps_client.get_travel_time
+    does, plus the stored polyline, so callers can treat a hit and a fresh
+    fetch identically."""
+    row = conn.execute(
+        "SELECT duration_minutes, distance_km, polyline FROM travel_time_cache "
+        "WHERE origin = ? AND destination = ? AND hour_bucket = ?",
+        ((origin or "").strip(), (destination or "").strip(), hour_bucket),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "duration_minutes": row["duration_minutes"],
+        "distance_km": row["distance_km"],
+        "polyline": row["polyline"],
+    }
+
+
+def save_travel_time(conn, origin, destination, hour_bucket, duration_minutes,
+                      distance_km, polyline=None):
+    conn.execute(
+        "INSERT INTO travel_time_cache (origin, destination, hour_bucket, duration_minutes, "
+        "distance_km, polyline, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(origin, destination, hour_bucket) DO UPDATE SET "
+        "duration_minutes = excluded.duration_minutes, distance_km = excluded.distance_km, "
+        "polyline = excluded.polyline, cached_at = excluded.cached_at",
+        ((origin or "").strip(), (destination or "").strip(), hour_bucket,
+         duration_minutes, distance_km, polyline, _now()),
+    )
+    conn.commit()
+
+
+def clear_travel_time_cache(conn):
+    """Manual refresh escape hatch -- e.g. after a major road change makes
+    stored durations stale. Returns how many entries were dropped."""
+    count = conn.execute("SELECT COUNT(*) AS c FROM travel_time_cache").fetchone()["c"]
+    conn.execute("DELETE FROM travel_time_cache")
+    conn.commit()
+    return count
+
+
+def clear_geocode_cache(conn):
+    """Drops cached coordinate lookups. Needed when a batch of them turns
+    out to be WRONG rather than merely stale -- which happened for real
+    (2026-08-16): geocoding raw Excel strings without region biasing
+    resolved "ON SITE - COCA COLA ARENA" to Atlanta and "ON SITE - PALM
+    JUMEIRAH" to North Carolina, and those wrong coordinates then sat in
+    the cache poisoning every travel time derived from them.
+
+    Note this does NOT touch locations.latitude/longitude -- coordinates
+    the planner entered or confirmed by hand are authoritative and must
+    survive any cache clear. Returns how many entries were dropped."""
+    count = conn.execute("SELECT COUNT(*) AS c FROM geocode_cache").fetchone()["c"]
+    conn.execute("DELETE FROM geocode_cache")
+    conn.commit()
+    return count
+
+
+def travel_cache_stats(conn):
+    """(travel_entries, geocode_entries) -- shown in the UI so the planner
+    can see the cache actually working (and thus why they aren't being
+    billed per trip)."""
+    travel = conn.execute("SELECT COUNT(*) AS c FROM travel_time_cache").fetchone()["c"]
+    geo = conn.execute("SELECT COUNT(*) AS c FROM geocode_cache").fetchone()["c"]
+    return travel, geo

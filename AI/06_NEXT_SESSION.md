@@ -50,6 +50,21 @@ Section 3 below).
 
 ## 3. Common mistakes to avoid (each of these actually happened)
 
+- **Nulling out a `QThread` worker reference when a run finishes.** Done
+  once (Phase 32, map tab) and it caused a real **segfault that closed the
+  whole app with no traceback**. A worker moved with `moveToThread()`
+  cannot have a Qt parent, so PYTHON owns its lifetime -- and if
+  `worker.finished` is also connected to `worker.deleteLater` (the normal
+  cleanup pattern), dropping the last Python reference in a `finished`
+  slot makes Python destroy the C++ object while Qt still has a delete
+  queued for it. Double free. **Keep the reference until the next run
+  replaces it** (what `plan_day_tab.py`'s `_SolverWorker`/
+  `_AIReviewWorker` have always done, and why they were never affected),
+  and track "is a run in flight?" with a plain boolean. Reproduced
+  deliberately to confirm: SIGSEGV, exit code 139. Worth remembering
+  because the change that caused it was made purely to make a test
+  tidier -- a test convenience that put a crash into the product.
+
 - **Adding a new structured field to the database and the UI form, but
   forgetting to add it to the corresponding dataclass and actually check
   it inside `allocate()`.** This happened with `shift_start` — it was in
@@ -169,6 +184,46 @@ Section 3 below).
   Phase 6).
 
 ## 5. Current known issues (honest, as of end of last session)
+
+- **STILL OPEN and deliberately deferred, re-confirmed 2026-08-16 (Phase
+  32):** real travel time does NOT feed the deterministic engine.
+  `allocation_engine.py` has zero knowledge of locations/coordinates/drive
+  times, and `DEFAULT_TRAVEL_BUFFER_MINUTES` is still a flat `0` — its
+  standing comment ("once live travel-time lookups are wired in, gaps
+  between jobs at genuinely different locations should be checked against
+  real drive time instead of a flat constant") remains a genuine future
+  item, NOT something Phase 32 completed. Phase 32 built the map/travel-
+  time screen and fed real drive times to the **AI Review layer and the
+  planner's eyes only** — the project owner explicitly chose this scope to
+  keep the validated solver untouched (Rule 10). The data and cache now
+  exist, so wiring it into the engine later is a much smaller job than it
+  was — but it would touch the validated deterministic core and make
+  planning depend on a paid API, so it needs its own careful, tested
+  decision.
+- **Phase 32 caveat worth knowing:** if only an OpenRouteService key is
+  configured (the free fallback), travel times are **not traffic-aware** —
+  they're average OSM road speeds, so tight rush-hour connections will
+  look more feasible than they really are. The UI labels the active
+  provider everywhere, but don't read an ORS-sourced "ok" verdict as
+  equivalent to a Google-sourced one.
+
+- **OPEN, deliberately not fixed yet, 2026-08-15:** the project owner hit
+  their first "Fleet Planner (Not Responding)" Windows freeze during Run
+  Planning. Root-caused (not guessed): `allocate_by_solver()`'s
+  `solver.parameters.num_search_workers = 8` (set 2026-08-10, commit
+  `9718713`) uses all 8 logical threads on the project owner's 4-core/
+  8-thread machine for the CP-SAT solve, leaving no CPU headroom for the
+  GUI thread to keep processing Windows messages -- this is thread/CPU
+  starvation, not a deadlock, GUI-thread blocking bug, or anything
+  related to that day's other UI changes (confirmed unrelated via `git
+  blame` -- this line predates that session entirely). The background-
+  threaded Run Planning itself (Phase 26/`_SolverWorker`) is working
+  exactly as designed; the solver thread is just too CPU-hungry for this
+  specific machine's core count. **Explicit decision: leave
+  `num_search_workers = 8` as-is for now** -- the project owner asked to
+  document this and revisit (drop it to 6, leaving 2 threads free) only
+  if the freeze starts happening more often, rather than changing solver
+  tuning off a single occurrence.
 
 - ~~`shift_start` documentation/code mismatch~~ **RESOLVED this session.**
   The project owner confirmed directly that `shift_start` was NOT being
@@ -724,11 +779,13 @@ rather than deferring to default technical judgment.
 
 Four requests given together in one session, after Phase 22-27. The
 project owner asked for these to be logged and numbered in recommended
-execution order — **recommended order was 4 -> 2 -> 1 -> 3**, reasoning
-under each item. **Item 4 (Section 7.1) was built the same day, Phase
-28.** The other three (7.2/7.3/7.4 below) have not been scoped in detail
-with the project owner yet beyond what's captured here -- treat those as
-"registered," not "designed."
+execution order — recommended order was 4 -> 2 -> 1 -> 3. **Status as of
+2026-08-16: items 4 (Phase 28), 1 (Phase 24), 2 (Phase 29), and 4's
+originally-last-place sibling 7.4 (Phase 31, built out of the recommended
+order at the project owner's direct request once they were ready for it)
+are all BUILT.** Only **7.3 (the app-wide theme change) remains open** --
+see that section for its own still-unresolved design question (top tabs
+vs. a left sidebar).
 
 ### 7.1 (do first) Vehicles tab overhaul + new Vehicle Maintenance Log
 
@@ -746,8 +803,11 @@ the feature was built (their own cleanup, expected) -- the rest of this
 subsection is kept as the historical spec record, not a pointer to files
 that still exist. **This item (the project owner's original request #4,
 built first per the recommended 4 -> 2 -> 1 -> 3 order below) is now
-considered fully complete, PDF export included -- the next session
-should move on to request #2 (Section 7.2 below).**
+considered fully complete, PDF export included.** Request #2 (Section 7.2
+below) was built next, 2026-08-15 (Phase 29). Request #1 (Balance
+Overtime/month fields) was already resolved earlier (Phase 24) -- the only
+item in the original 4 -> 2 -> 1 -> 3 order still open is #3, the
+app-wide theme change (Section 7.3).
 
 **Vehicles tab changes:**
 - Add an Active/Deactive checkbox column, identical in behavior to the
@@ -825,57 +885,57 @@ later; if anything it's a preview of that direction.
 
 ### 7.2 (do second) Plan a Day: full columns, inline driver/vehicle editing, event filter
 
-**START HERE next session.** Item 4 (Section 7.1 above) is now fully
-done, PDF export included -- this is next in the recommended 4 -> 2 -> 1
--> 3 order. Before writing any code for the inline driver/vehicle combo
-boxes specifically, ask the project owner these two scoping questions
-directly (they were about to be asked at the end of the 2026-08-15
-session but the session ended first -- don't rediscover this from
-scratch, just ask):
-1. **Save timing:** does a manual reassignment from the new combo boxes
-   save to the database immediately, or only when the existing
-   "Finalize Day" button is clicked (matching how every other edit to
-   the in-memory plan currently works)?
-2. **Rule checking:** does a manual reassignment get re-checked against
-   hard rules (hours, license, off-day), or is manual override allowed
-   to violate them outright (Rule 3, `PROJECT_RULES.md`: the planner is
-   always the final decision-maker)? If checked, should a violation
-   just warn (not block), or actually block the combo box selection?
+**BUILT 2026-08-15, Phase 29.** The two scoping questions this section
+used to flag were answered directly by the project owner (not inferred):
+save timing stays "only on Finalize Day" (unchanged from every other
+in-memory edit), and manual reassignment is **not** rule-checked at the
+combo-box level at all ("No checking at all" -- the planner can assign
+anything, including an off-duty driver) -- instead a new, separate,
+re-runnable **ReCheck** button was added to catch problems *after* the
+fact without blocking or auto-correcting anything. See `05_WORKFLOWS.md`'s
+"Manual Reassignment + ReCheck" section and `CHANGELOG_AI.md` Phase 29 for
+the full writeup. Summary of what shipped, matching every bullet
+originally listed here:
+- **Every Excel column** now shown (Order#, Contact Person, Order
+  Location, Additional Info, Charge Code, Same Driver added) -- the new 6
+  start hidden, toggleable via a new "Columns" button, alongside the
+  original 8 which stay visible by default.
+- **Every column is now genuinely resizable**, including Event and Note --
+  those two were pinned to `QHeaderView.Stretch`, which silently blocks
+  drag-resize; both now use the default `Interactive` mode, with
+  `stretchLastSection` keeping the rightmost visible column filling
+  leftover width without losing that.
+- **Driver/Supplier and Vehicle/Unit columns are now editable, type-ahead
+  (`QCompleter`, `MatchStartsWith`) combo boxes**, listing every driver/
+  vehicle/supplier with NO filtering -- deliberately including ones
+  currently excluded-from-planning, confirmed directly ("if the planner
+  decided to introduce a driver on offduty to a busy day he can do that").
+  Edits update the `Job`'s clean assignment fields in memory only,
+  unchanged until Finalize Day, exactly as every other in-memory edit
+  already worked.
+- **New filter: by event**, placed on the same line as the existing
+  driver/supplier filter, combined with AND.
+- **New "ReCheck" button** (the project owner's own chosen name, placed
+  right after AI Review): re-scans the current in-memory sheet for driver/
+  vehicle double-booking, hard-rule hour violations, and wrong-vehicle-type
+  assignments, flagging each precisely in red in the Note column -- never
+  mutates any assignment, re-runnable any number of times. See
+  `_compute_recheck_issues()` in `plan_day_tab.py` and
+  `tests/test_recheck.py`. **Correction, same day (Phase 29b):** an
+  initial "Same-Driver-group mismatch" check was removed after real use
+  showed 47 false positives on a fresh, untouched, optimal, 0-unresolved
+  plan -- "Same Driver" is a documented SOFT preference the engine honors
+  "if possible" (`04_BUSINESS_RULES.md`), not a hard rule, so a group
+  legitimately splitting across drivers isn't a rule break.
+- Confirmed (by reading the existing code, no change needed): the Summary
+  popup already rebuilds entirely from the in-memory `self.jobs`/
+  `self.last_drivers` fresh on every open, so it automatically reflects
+  manual reassignments with no caching to invalidate.
 
-- **Show every Excel column**, not just the current curated 8 (SR, Time,
-  Event, Vehicle Type Required, Pick Up, Driver/Supplier, Vehicle/Unit,
-  Note) -- add Order#, Contact Person, Order Location, Additional Info,
-  Charge Code, Same Driver (all already exist as `Job` fields, just not
-  currently shown as table columns).
-- **Column resize** (mostly already works -- `QTableWidget`'s default
-  interactive resize applies to columns not explicitly set to
-  `QHeaderView.Stretch`; confirm this covers what's meant here, or
-  clarify if something more specific is wanted).
-- **Column hide/unhide** -- genuinely new, no such control exists today
-  (e.g. a column-visibility toggle menu/checklist).
-- **Driver and Vehicle columns become combo boxes**, letting the planner
-  directly reassign a job's driver or vehicle from the table, "then save
-  the final version in database." Flagged by the project owner as the
-  more important part of this item. **Open design question, needs a
-  short scoping conversation before building** (similar depth to the
-  trip-count-meter and Balance-fields discussions earlier this session):
-  does an edit save immediately (writes into `self.jobs` and/or
-  `finalized_jobs` right away), or only get persisted when the existing
-  "Finalize Day" button is clicked (matching how every other edit to the
-  in-memory plan currently works)? Does a manual reassignment re-check
-  the driver's hard rules (hours, license, off-day) or is manual
-  override explicitly allowed to violate them, matching Rule 3
-  (`PROJECT_RULES.md`: "the human planner is always the final decision
-  maker... must always be able to override any recommendation")?
-- **New filter: by event** (alongside the existing filter-by-driver/
-  supplier dropdown) -- same UI pattern, filtering on `Job.event_id`/
-  `event_text` instead.
-
-**Why second:** high real planner value (the project owner's own
-framing -- "more important"), well-motivated (matches Rule 3, planner
-overrides), but the persistence-semantics question above needs answering
-before code is written, so it can't just be started blind the way 7.1
-can.
+**Not built, out of scope for this item:** per-driver rule enforcement
+AT the combo box (deliberately rejected in favor of the separate ReCheck
+step); persisting column-visibility choices across app restarts (resets
+to the documented defaults each launch).
 
 ### 7.3 (do third) App-wide theme change
 
@@ -902,26 +962,52 @@ Summary popup," and the top-vs-left question is explicitly still open)
 
 ### 7.4 (do last) Database viewer/editor window
 
-A new screen to directly view and edit raw database tables/rows --
-motivated by correcting schedule changes made during the day (after a
-day's already been Finalized) so month-to-date overtime calculations
-stay accurate. Least specified of the four -- no field list, no target
-tables named, no mockup. Real open questions before this should be
-designed, let alone built: which tables/columns are actually meant to be
-editable (a full raw editor is a very different, much riskier thing than
-a scoped "correct a finalized day's job times" tool)? Does editing a
-`finalized_jobs` row need to re-trigger anything (nothing currently
-recomputes `month_overtime_so_far` retroactively -- it's read fresh
-every time `build_driver_profiles` runs, so a direct edit would just
-take effect the next time planning runs, no cache to invalidate)?
+**BUILT 2026-08-16, Phase 31, as the "Schedules" tab.** The two open
+questions this section used to flag were resolved directly with the
+project owner, describing the real workflow first: the planner finalizes
+a day the day before; a supervisor executes it and makes real-world
+adjustments (a driver worked longer, a driver/vehicle/supplier changed, an
+unplanned trip happened anyway, or a planned one never did); the planner
+needs to correct the saved record afterward to match reality, in the same
+visual format they already work in.
 
-**Why last:** least specified, and touches the most sensitive territory
-(direct edits to historical data bypassing every structured-field
-safeguard this project has built up). There's also real conceptual
-overlap with 7.2 (both are "edit already-assigned schedule data after
-the fact," just current-day vs. historical) -- building 7.2 first will
-likely clarify what safety rails 7.4 actually needs, rather than
-designing both from scratch independently.
+- **Scoped tightly to `finalized_jobs`** (not a general raw
+  multi-table editor, avoiding the risk this section originally warned
+  about) -- a new tab, "Schedules" (the project owner's own chosen name),
+  placed before Settings.
+- **No retrigger needed**, confirmed as suspected: every hours/overtime/
+  fairness reader queries `finalized_jobs` fresh each call, no cache to
+  invalidate.
+- **Every column is editable** (SR, Date, Actual Start/End, Hours, Event,
+  Vehicle Type Required, Pick Up, Driver/Supplier, Vehicle/Unit) -- the
+  project owner explicitly corrected an earlier, narrower draft of this
+  design that only made the assignment/time fields editable.
+- **From/Till date range** (not single-day), Excel-style per-column
+  filter (checklist of distinct values) + sort + resize, matching Plan a
+  Day's interaction language.
+- **A Cancelled checkbox instead of a hard delete** for a planned trip
+  that never happened -- matches this project's existing exclude-don't-
+  delete convention; excluded from every hours/overtime/fairness read.
+- **"+ Add Row"** for an unplanned trip that happened anyway -- stays a
+  local, no-database-writes draft (with its own Save/Discard buttons)
+  until explicitly saved, so changing your mind about a just-added row
+  costs nothing and touches the database zero times.
+- **Every edit to an already-saved row requires a specific confirmation**
+  ("Change Driver for SR 42 (15:00-18:00, Wedding Setup) from 'John Doe'
+  to 'Mary Smith'?", not a generic "are you sure") before it's written --
+  cancelling reverts the field, confirming saves immediately (Continuous
+  Forms style, reusing the pattern already proven in the Vehicle
+  Maintenance Log's service-history grid).
+- **Corrections overwrite in place** -- no separate planned-vs-actual
+  audit columns, a deliberate v1 simplicity call.
+- `finalized_jobs` gained 6 additive columns (context snapshots +
+  `cancelled`) plus a `plan_date` index -- see `AI/03_DATABASE.md` and
+  `CHANGELOG_AI.md` Phase 31 for the full schema/query writeup, including
+  the database-growth analysis (negligible at this project's real scale).
+
+**Not built, explicitly out of scope for v1:** dual planned-vs-actual
+audit columns (corrections just overwrite); hard delete of a saved row
+(the Cancelled checkbox covers this); a general multi-table raw editor.
 
 ## 8. How to work with this specific person
 

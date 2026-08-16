@@ -1,0 +1,30 @@
+# Python build artifacts. These are regenerated automatically on every
+# run, so tracking them just adds noise to every diff and creates
+# pointless merge conflicts.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Packaging / build output (PyInstaller, when that eventually happens --
+# see NEXT_SESSION.md).
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+
+# NOTE: fleetplanner.db is deliberately NOT ignored. It is tracked on
+# purpose -- it doubles as the real-data snapshot used to validate
+# scheduling changes against actual planning days (see NEXT_SESSION.md
+# section 2). Don't add it here without discussing it first.

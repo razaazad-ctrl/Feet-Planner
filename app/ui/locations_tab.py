@@ -1,6 +1,17 @@
 """
 locations_tab.py
 
+*** LEGACY as of 2026-08-16 -- SUPERSEDED BY app/ui/map_tab.py. ***
+
+`main_window.py` no longer imports this module; the "Locations" tab is now
+`MapTab`, which keeps this file's entire short-code/address editor (as its
+left panel) and adds coordinates, a map, and travel times. Kept rather than
+deleted, following the same precedent as `entity_rules_widget.py` -- nothing
+is removed from this project without the owner explicitly asking. Changes
+made here will have NO effect on the running app; edit `map_tab.py` instead.
+
+Original description follows.
+
 Predefined location lookup: maps a short code exactly as it appears in
 the daily Excel file (e.g. "CPK", "BQT STORE", "DICC") to a real, precise
 address Google Maps can resolve exactly.

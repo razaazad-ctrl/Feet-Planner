@@ -1050,6 +1050,15 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
 
     # Runtime registry of hires created so far today, keyed by (supplier_id, vehicle_type)
     hires_by_key = {}
+    # Separate from hires_by_key (which stays scoped by (supplier, vehicle
+    # type) for correct reuse-matching -- a hire tied to one vehicle type
+    # must never be reused for a job needing a different type): this tracks
+    # every hire of a given supplier across ALL vehicle types today, so the
+    # displayed unit numbering ("Name", "Name 1", "Name 2"...) stays unique
+    # per supplier for the whole day. Bug fixed 2026-08-15 (Phase 29d): see
+    # the matching comment in the other three allocation strategies for the
+    # full writeup.
+    hires_by_supplier = {}
 
     # "Same Driver" group registries -- see module docstring for the agreed
     # rules. Keyed by the planner-pasted group text (job.same_driver_key).
@@ -1324,7 +1333,7 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
 
         chosen_offering = min(hireable, key=lambda o: o.cumulative_hours_history)
         key = (chosen_offering.supplier_id, chosen_offering.vehicle_type)
-        instance_number = len(hires_by_key.get(key, [])) + 1
+        instance_number = len(hires_by_supplier.get(chosen_offering.supplier_id, [])) + 1
         new_hire = SupplierHire(
             supplier_id=chosen_offering.supplier_id,
             supplier_name=chosen_offering.supplier_name,
@@ -1334,6 +1343,7 @@ def allocate(jobs, drivers, vehicles, supplier_offerings,
         new_hire.busy_intervals.append((job.start_dt, job.end_dt, group_key))
         new_hire.already_used = True
         hires_by_key.setdefault(key, []).append(new_hire)
+        hires_by_supplier.setdefault(chosen_offering.supplier_id, []).append(new_hire)
         if group_key:
             group_supplier_hires.setdefault(group_key, []).append(new_hire)
 
@@ -1718,6 +1728,20 @@ def allocate_by_merit(jobs, drivers, vehicles, supplier_offerings,
     # applied per leftover unit (both jobs in a merged pair go to the same
     # hire together, same as the in-house side).
     hires_by_key = {}
+    # Separate from hires_by_key (which stays scoped by (supplier, vehicle
+    # type) for correct reuse-matching -- a hire tied to one vehicle type
+    # must never be reused for a job needing a different type): this tracks
+    # every hire of a given supplier across ALL vehicle types today, so the
+    # displayed unit numbering ("Name", "Name 1", "Name 2"...) stays unique
+    # per supplier for the whole day. Bug fixed 2026-08-15 (Phase 29d):
+    # instance_number used to be computed from hires_by_key alone, so hiring
+    # the same supplier for two DIFFERENT vehicle types on the same day gave
+    # both hires the identical unnumbered label (each was "1st" within its
+    # own type bucket) -- two genuinely different physical units displayed
+    # as if they were the same one, confirmed via a real run and reported by
+    # the project owner as a ReCheck-flagged "vehicle clash" that turned out
+    # to be a real label collision, not a false positive.
+    hires_by_supplier = {}
     group_supplier_hires = {}
     for unit in sorted(leftover_units, key=lambda u: u.start_dt):
         group_key = unit.same_driver_key or None
@@ -1776,7 +1800,7 @@ def allocate_by_merit(jobs, drivers, vehicles, supplier_offerings,
 
         chosen_offering = min(hireable, key=lambda o: o.cumulative_hours_history)
         key = (chosen_offering.supplier_id, chosen_offering.vehicle_type)
-        instance_number = len(hires_by_key.get(key, [])) + 1
+        instance_number = len(hires_by_supplier.get(chosen_offering.supplier_id, [])) + 1
         new_hire = SupplierHire(
             supplier_id=chosen_offering.supplier_id, supplier_name=chosen_offering.supplier_name,
             vehicle_type=chosen_offering.vehicle_type, instance_number=instance_number,
@@ -1784,6 +1808,7 @@ def allocate_by_merit(jobs, drivers, vehicles, supplier_offerings,
         new_hire.busy_intervals.append((unit.start_dt, unit.end_dt, group_key))
         new_hire.already_used = True
         hires_by_key.setdefault(key, []).append(new_hire)
+        hires_by_supplier.setdefault(chosen_offering.supplier_id, []).append(new_hire)
         if group_key:
             group_supplier_hires.setdefault(group_key, []).append(new_hire)
         for j in unit.jobs:
@@ -2280,6 +2305,20 @@ def allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings,
 
     # Supplier fallback for whatever's still unresolved after swap repair.
     hires_by_key = {}
+    # Separate from hires_by_key (which stays scoped by (supplier, vehicle
+    # type) for correct reuse-matching -- a hire tied to one vehicle type
+    # must never be reused for a job needing a different type): this tracks
+    # every hire of a given supplier across ALL vehicle types today, so the
+    # displayed unit numbering ("Name", "Name 1", "Name 2"...) stays unique
+    # per supplier for the whole day. Bug fixed 2026-08-15 (Phase 29d):
+    # instance_number used to be computed from hires_by_key alone, so hiring
+    # the same supplier for two DIFFERENT vehicle types on the same day gave
+    # both hires the identical unnumbered label (each was "1st" within its
+    # own type bucket) -- two genuinely different physical units displayed
+    # as if they were the same one, confirmed via a real run and reported by
+    # the project owner as a ReCheck-flagged "vehicle clash" that turned out
+    # to be a real label collision, not a false positive.
+    hires_by_supplier = {}
     group_supplier_hires = {}
     still_unresolved_units = [u for u in units if u.jobs[0].unresolved]
     for unit in sorted(still_unresolved_units, key=lambda u: u.start_dt):
@@ -2336,7 +2375,7 @@ def allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings,
             continue
         chosen_offering = min(hireable, key=lambda o: o.cumulative_hours_history)
         key = (chosen_offering.supplier_id, chosen_offering.vehicle_type)
-        instance_number = len(hires_by_key.get(key, [])) + 1
+        instance_number = len(hires_by_supplier.get(chosen_offering.supplier_id, [])) + 1
         new_hire = SupplierHire(
             supplier_id=chosen_offering.supplier_id, supplier_name=chosen_offering.supplier_name,
             vehicle_type=chosen_offering.vehicle_type, instance_number=instance_number,
@@ -2344,6 +2383,7 @@ def allocate_by_anchor(jobs, drivers, vehicles, supplier_offerings,
         new_hire.busy_intervals.append((unit.start_dt, unit.end_dt, group_key))
         new_hire.already_used = True
         hires_by_key.setdefault(key, []).append(new_hire)
+        hires_by_supplier.setdefault(chosen_offering.supplier_id, []).append(new_hire)
         if group_key:
             group_supplier_hires.setdefault(group_key, []).append(new_hire)
         for j in unit.jobs:
@@ -2965,6 +3005,20 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
     # supplier pass, reused rather than reimplemented (Rule 1).
     leftover_units = [u for u in units if u.jobs[0].unresolved]
     hires_by_key = {}
+    # Separate from hires_by_key (which stays scoped by (supplier, vehicle
+    # type) for correct reuse-matching -- a hire tied to one vehicle type
+    # must never be reused for a job needing a different type): this tracks
+    # every hire of a given supplier across ALL vehicle types today, so the
+    # displayed unit numbering ("Name", "Name 1", "Name 2"...) stays unique
+    # per supplier for the whole day. Bug fixed 2026-08-15 (Phase 29d):
+    # instance_number used to be computed from hires_by_key alone, so hiring
+    # the same supplier for two DIFFERENT vehicle types on the same day gave
+    # both hires the identical unnumbered label (each was "1st" within its
+    # own type bucket) -- two genuinely different physical units displayed
+    # as if they were the same one, confirmed via a real run and reported by
+    # the project owner as a ReCheck-flagged "vehicle clash" that turned out
+    # to be a real label collision, not a false positive.
+    hires_by_supplier = {}
     group_supplier_hires = {}
     for unit in sorted(leftover_units, key=lambda u: u.start_dt):
         group_key = unit.same_driver_key or None
@@ -3024,7 +3078,7 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
 
         chosen_offering = min(hireable, key=lambda o: o.cumulative_hours_history)
         key = (chosen_offering.supplier_id, chosen_offering.vehicle_type)
-        instance_number = len(hires_by_key.get(key, [])) + 1
+        instance_number = len(hires_by_supplier.get(chosen_offering.supplier_id, [])) + 1
         new_hire = SupplierHire(
             supplier_id=chosen_offering.supplier_id, supplier_name=chosen_offering.supplier_name,
             vehicle_type=chosen_offering.vehicle_type, instance_number=instance_number,
@@ -3032,6 +3086,7 @@ def allocate_by_solver(jobs, drivers, vehicles, supplier_offerings,
         new_hire.busy_intervals.append((unit.start_dt, unit.end_dt, group_key))
         new_hire.already_used = True
         hires_by_key.setdefault(key, []).append(new_hire)
+        hires_by_supplier.setdefault(chosen_offering.supplier_id, []).append(new_hire)
         if group_key:
             group_supplier_hires.setdefault(group_key, []).append(new_hire)
         for j in unit.jobs:

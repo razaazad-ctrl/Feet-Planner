@@ -4476,3 +4476,1247 @@ this prompted about keeping changelog entries appended in one place.)*
   `AI_INDEX.json`'s Phase 28hh entries already describe this as
   "PDF export via QPainter/QPdfWriter, filtered by date range," which
   remains accurate; only the exported page's visual layout changed.
+
+## Phase 29 — Plan a Day: full columns, inline driver/vehicle reassignment, ReCheck (2026-08-15)
+
+- **Request #2** from `NEXT_SESSION.md` Section 7.2 (recommended
+  4 -> 2 -> 1 -> 3 order; #4 finished in Phase 28, #1 already done in
+  Phase 24). Before building the inline combo boxes, two open scoping
+  questions were put to the project owner directly rather than guessed:
+  save timing, and whether a manual reassignment gets rule-checked.
+- **Save timing: unchanged, Finalize-Day-only.** Confirmed: combo box
+  edits update the in-memory `Job` only; nothing writes to the database
+  until the existing "Finalize Day" button is clicked, matching every
+  other edit to the in-memory plan.
+- **Rule checking: explicitly NOT enforced at the combo box.** The
+  project owner's own words: the combo boxes should list "all the drivers
+  / supplier available and all the vehicles and suppliers available,"
+  with no restriction, deliberately INCLUDING drivers/vehicles/suppliers
+  currently marked excluded-from-planning -- "if the planner decided to
+  introduce a driver on offduty to a busy day he can do that." Instead of
+  blocking or warning inline, a separate, explicitly-requested **ReCheck**
+  button (the project owner's own chosen name, offered against "Clash
+  Check"/"Conflict Scan"/"Plan Guard" alternatives) re-scans the sheet on
+  demand after edits.
+- **All 14 columns, all resizable, hide/unhide.** Added Order#, Contact
+  Person, Order Location, Additional Info, Charge Code, Same Driver
+  (`Job` fields that already existed but weren't shown) -- hidden by
+  default, toggleable via a new "Columns" menu button, positioned before
+  Note so Note (now also carrying ReCheck warnings) stays rightmost.
+  **Real, separately-reported bug fixed as part of this:** the Event and
+  Note columns were pinned to `QHeaderView.Stretch`, which silently
+  disables manual drag-resize -- the project owner had specifically
+  noticed Event couldn't be resized. Both switched to the default
+  `Interactive` mode; `header.setStretchLastSection(True)` keeps the
+  rightmost visible column filling any leftover width without losing
+  manual resizability.
+- **New event filter**, same line as the existing driver/supplier filter,
+  combined with AND (`_apply_filters`, replacing the old `_apply_filter`).
+- **Driver/Supplier and Vehicle/Unit columns are now `setCellWidget`
+  combo boxes** (`_NoScrollComboBox`, duplicated locally from
+  `vehicle_maintenance_dialog.py`'s existing class of the same name and
+  purpose -- ignores wheel-scroll so scrolling the table can't silently
+  reassign a row). Populated from `db.list_drivers`/`list_suppliers`/
+  `list_vehicles` with `active_only=True` (the default) -- confirmed by
+  reading each function's SQL that this only filters the roster's own
+  `active` flag, never `excluded_from_planning`, so no extra filtering
+  was needed to satisfy the off-day-override request. Made editable with
+  a `QCompleter` (`PopupCompletion`, `MatchStartsWith`, case-insensitive)
+  for type-ahead narrowing of the long list, and to let the planner type
+  an exact hired-unit label (e.g. "ABC Rentals 2") not in the base list.
+  Picking a supplier in Driver/Supplier auto-fills Vehicle/Unit with the
+  same label (matches the existing on-screen convention); still editable
+  afterward.
+- **Combo edits update the clean `Job` fields** (`assigned_driver_id`/
+  `assigned_driver_name`/`assigned_vehicle_id`/`assigned_vehicle_plate`/
+  `assigned_supplier_id`/`assigned_supplier_unit`/`unresolved`) in place.
+  Confirmed by reading `export.py` and `_on_finalize()` that both already
+  key off exactly these fields, never `assignment_note` -- so Finalize
+  Day and Export Filled Excel needed zero changes to correctly pick up a
+  manual reassignment. `assignment_note` is overwritten to "Manually
+  reassigned by planner" on edit (confirmed safe: `export.py`'s own
+  comment says this field is display-only, never parsed) so the Note
+  column doesn't keep showing a stale engine explanation next to a
+  different driver.
+- **Sort-safety:** `QTableWidget` cell widgets don't follow Qt's built-in
+  row sort automatically -- a known Qt limitation. Fixed by connecting
+  `header.sortIndicatorChanged` to `_rebind_row_widgets()`, which re-reads
+  each visual row's SR and re-attaches the correct combo box/value by job
+  identity, not row position, after every header-click sort.
+- **New `_compute_recheck_issues(jobs, driver_profiles, vehicle_type_by_id)`**
+  (module-level, Qt-free, same separation-of-concerns pattern as
+  `build_summary()`) -- purely advisory, NEVER mutates a `Job` (Rule 3/11,
+  planner is always the final authority). Five checks, all against the
+  CURRENT in-memory state so manual edits are seen immediately:
+  1. Driver double-booking (overlapping trips, same driver) -- also
+     covers "one driver, two different vehicles, same time," since it's
+     the same overlap check regardless of which vehicle was used.
+  2. Vehicle double-booking (same in-house `vehicle_id`, or same exact
+     supplier hired-unit label).
+  3. Driver hard-rule hour violations -- duty SPAN (reuses
+     `allocation_engine._day_span_hours` directly for parity with the
+     real engine's own math) against the daily ceiling and the monthly
+     overtime budget.
+  4. Same Driver consistency -- every row sharing a non-blank
+     `same_driver_key` must have the identical `assigned_driver_id`.
+  5. Wrong vehicle type -- in-house rows only; a `Job` doesn't record
+     which offering/type a supplier unit used, so supplier rows aren't
+     checkable here.
+  Rows sharing a Same-Driver group are exempt from checks 1/2, mirroring
+  `allocation_engine._group_key_of`'s own overlap exemption for
+  legitimate back-and-forth rows.
+- **ReCheck button** (`_on_recheck`): stores results in
+  `self._recheck_issues` (reset on every Upload/Run Planning), then
+  repaints only the Note column (by SR lookup, sort-safe) -- rows with an
+  issue show it in bold red, replacing the displayed text only;
+  `job.assignment_note` itself is never touched. Re-runnable any number
+  of times.
+- Confirmed (by reading the code, not assumed): `DriverSupplierSummaryDialog`
+  / `build_summary()` already rebuild entirely from `self.jobs`/
+  `self.last_drivers` fresh on every open, with no caching -- so the
+  Summary popup automatically reflects manual reassignments and ReCheck's
+  advisory-only nature required no change there.
+- **Tested:** new `tests/test_recheck.py` (8 hand-built scenarios covering
+  all 5 checks plus the Same-Driver-group exemption and a fully-clean
+  plan) -- all pass. Full existing suite (10 other `tests/*.py` files)
+  re-run clean, no regressions. App launched via `python -m app.main` and
+  left running several seconds with no exception/traceback in the log
+  (`PlanDayTab` is built eagerly at startup, so this exercises the new
+  column/combo-box/ReCheck construction) -- this environment has no way
+  to screenshot or click through a native Windows Qt window, so the
+  column-toggle menu, event filter placement, live combo-box editing, and
+  ReCheck's visual output still need a manual pass by the project owner.
+- **Not built, explicitly out of scope:** per-driver rule enforcement AT
+  the combo box (deliberately rejected in favor of the separate ReCheck
+  step); persisting column-visibility choices across app restarts.
+- `05_WORKFLOWS.md` updated ("Planning a Day" steps, new "Manual
+  Reassignment + ReCheck" section) and `02_ARCHITECTURE.md`'s file-tree
+  comment for `plan_day_tab.py` updated to reflect the new capabilities.
+
+## Phase 29b — ReCheck's Same-Driver check was a real bug: it enforced a soft preference as a hard rule (2026-08-15, same session)
+
+- **Reported by the project owner immediately after live testing:**
+  clicked Run Planning on `unPlanned_Full.xlsx` (81 jobs), got the
+  expected 48 in-house / 33 supplier / 0 unresolved / "Solved optimally"
+  result, then clicked ReCheck without touching anything -- and got 47
+  rows flagged with "Same Driver rule" warnings on a plan that had just
+  been proven optimal and untouched by the planner.
+- **Root cause, confirmed by reading `AI/04_BUSINESS_RULES.md`'s "Same
+  Driver Column" section directly (not assumed):** "Same Driver" is an
+  explicitly documented SOFT preference -- "one driver should do all of
+  these... if possible... **if one driver truly cannot cover the whole
+  flagged group** (hours run out, or a row needs a vehicle type they're
+  not licensed for), **the system brings in as few additional drivers as
+  possible**." Phase 29's `_compute_recheck_issues()` check #4 instead
+  treated ANY split across drivers as a hard violation -- flagging the
+  solver's own correct, intentional decisions (e.g. a large group needing
+  a specialist vehicle type mid-group, split between two qualifying
+  drivers) as if they were planner mistakes.
+- **Fix: the check was removed, not tuned.** Considered downgrading it to
+  a non-red informational note instead, but there is no reliable way to
+  distinguish a deliberate/necessary split (the common, correct case) from
+  an accidental one caused by a manual reassignment mistake using only the
+  data available -- keeping any version of this check risked continuing to
+  train the planner to ignore ReCheck's red warnings as noise. Presented
+  both options to the project owner directly; they chose removal.
+  `_recheck_label()` (only used by the removed check) deleted as dead
+  code. The other four checks (driver double-booking, vehicle
+  double-booking, hard-rule hour violations, wrong vehicle type) are
+  unaffected and were not the source of the false positives.
+- **Tested:** `tests/test_recheck.py`'s old "Same Driver mismatch is
+  flagged" case was replaced with a regression test asserting the
+  opposite -- a Same-Driver group split across two different drivers must
+  produce ZERO issues. Full suite re-run clean (11/11 files).
+- Also, unrelated one-line cosmetic fix requested in the same report: the
+  "Day notes (optional)..." label above the day-notes box was plain white
+  text, inconsistent with every other secondary/hint label in this tab
+  (e.g. the "Run planning, then click..." placeholder); given the same
+  `color: #888888` grey used elsewhere in this file.
+- Docs corrected to match: `05_WORKFLOWS.md`'s ReCheck bullet list and
+  `06_NEXT_SESSION.md`'s Section 7.2 write-up both had the Same-Driver
+  check removed/annotated; `AI_INDEX.json`'s ReCheck button description
+  updated.
+
+## Phase 29c — Two real bugs in the new results table sorting, found by the project owner while investigating the ReCheck report (2026-08-15, same session)
+
+- **Reported:** while sorting the SR column repeatedly to investigate the
+  ReCheck findings, a given SR number's row started showing a DIFFERENT
+  job's Time/Note/etc. each time the column was re-sorted (e.g. SR 18
+  showed one job's time on one sort, a different job's time on the next)
+  -- making the ReCheck report impossible to trust or investigate.
+  Separately, ascending SR sort produced 1, 10, 11, 12, ... 2, 3 (string
+  order) instead of 1, 2, 3, ... 12 (numeric order).
+- **Bug 1 root cause -- row/job association corruption on sort.**
+  `_rebind_row_widgets()` (added in Phase 29 specifically to keep the
+  Driver/Vehicle combo boxes attached to the right row after a header-click
+  sort, since Qt cell widgets don't follow sort automatically) called
+  `_populate_row()` in a loop while `self.table`'s sorting was still
+  enabled. `_populate_row()` calls `setItem()` for every plain column --
+  and `QTableWidget` with sorting enabled RE-SORTS ITSELF IMMEDIATELY on
+  any item data change. So the very first row repopulated in the loop
+  could trigger an immediate re-sort, reshuffling row positions out from
+  under the `for row in range(rowCount())` loop already in progress --
+  exactly the kind of corruption reported. Fixed by disabling sorting for
+  the whole rebind loop and re-enabling it after, the same discipline
+  `_render_results()` already used (and documents) for its own initial
+  population, which is why the FIRST render was never affected -- only
+  subsequent sorts were.
+- **Bug 2 root cause -- SR sorted as text, not a number.**
+  `QTableWidgetItem`'s default sort compares `Qt.DisplayRole` as a plain
+  string when both are simple text (which "1", "2", ... "70" are), giving
+  lexicographic order. Fixed with a new small `_NumericTableWidgetItem`
+  subclass (`__lt__` overridden to compare `float(self.text())` when both
+  sides parse as a number, falling back to the normal string compare
+  otherwise) used only for the SR column -- display text is unchanged,
+  only the sort comparison.
+- **Tested:** a standalone offscreen-Qt script
+  (`PlanDayTab` built against an in-memory `sqlite3` db, `QT_QPA_PLATFORM=offscreen`)
+  reproduced both bugs against the pre-fix code (row content actually
+  scrambling identically to the report after a second sort click; SR
+  ascending giving `1,10,11,18,2,69,7,70`) and confirmed both fixed
+  post-fix, including across 4 repeated alternating-direction sorts (not
+  just one click) since that's what the project owner was actually doing.
+  Kept as a scratch verification script only (not added to `tests/`,
+  since every other file in that folder is a pure/Qt-free logic test by
+  established convention -- a GUI widget/sort-behavior test is a
+  different shape of test). Full existing suite (11/11 files) re-run
+  clean.
+- **Also fixed in the same report, unrelated one-liner:** the "Day notes
+  (optional)..." label had its ENTIRE text turned grey in Phase 29b's
+  fix -- the project owner clarified only the explanatory part after
+  "Day notes (optional)" itself should be grey, matching the "suggestion"
+  hint-text style elsewhere in this tab, not the label's own name. Fixed
+  with inline rich-text (`<span style="color:#888888">...</span>`) inside
+  the one `QLabel` rather than two separate labels, since Qt renders
+  simple HTML in a `QLabel` natively.
+- **Process note, not a code issue:** while investigating this, a `git
+  stash` triggered mid-session (to reproduce the pre-fix bug for
+  comparison) failed partway through because the project owner's own
+  live `python -m app.main` session had `fleetplanner.db` open, which
+  Windows file locking wouldn't let git replace -- this left the working
+  tree briefly reverted to HEAD for the session's tracked files (code
+  intact and recovered from the stash via per-file `git checkout
+  stash@{0} -- <path>`, `fleetplanner.db` itself never touched by the
+  recovery since it was excluded from that checkout). No data or code
+  was lost; `stash@{0}` was left in place afterward as a redundant safety
+  copy rather than dropped.
+
+## Phase 29d — Real engine bug found via ReCheck: supplier hires of the same supplier for different vehicle types got identical, colliding labels (2026-08-15, same session)
+
+- **Reported:** on a real 81-job run, ReCheck flagged a "vehicle clash" --
+  two overlapping rows both showing the exact same supplier label, "NEW
+  HEIGHTS HEAVY TRUCK", with no distinguishing number. The project owner
+  asked for the engine itself to be investigated before assuming this was
+  a ReCheck false positive, since a similar-looking case (AL LAITH,
+  Section "Same Driver Column") looked correct elsewhere in the same run.
+- **Investigated and confirmed as two SEPARATE things, not one:**
+  1. The AL LAITH case (an overlapping row inside a "Same Driver" flagged
+     group reusing one hire's plain label) is CORRECT, documented
+     behavior -- see Phase 12's finding that simultaneous/overlapping rows
+     within a Same-Driver group are the same trip, not two vehicles
+     needed at once. Not a bug, no change made there.
+  2. The NEW HEIGHTS case was a real bug, found in the supplier-hire
+     "reuse or hire new" block duplicated across all four allocation
+     strategies (`allocate()`, `_allocate_shift()` used by
+     `allocate_by_merit()`, `allocate_by_anchor()`, and
+     `allocate_by_solver()`'s own supplier-fallback pass): the display
+     numbering registry (`instance_number = len(hires_by_key.get(key,
+     [])) + 1`) was keyed by `(supplier_id, vehicle_type)` -- so hiring
+     the SAME supplier for TWO DIFFERENT vehicle types on the same day
+     gave both hires the identical unnumbered label, each being the "1st"
+     hire within its own type-scoped bucket, even though they're
+     genuinely different physical units (never reused for each other's
+     jobs -- the reuse-matching logic was already correctly type-scoped;
+     only the DISPLAY numbering was wrong).
+- **Fix, confirmed with the project owner to apply to all four
+  strategies** (not just `allocate_by_solver()`, the one Run Planning
+  actually uses, for consistency since the other three are kept for
+  comparison per Rule 13): added a new `hires_by_supplier` registry,
+  scoped by `supplier_id` alone, tracking every hire of that supplier
+  across every vehicle type today. `instance_number` for a new hire is
+  now computed from THIS registry, not the type-scoped one --
+  `hires_by_key` itself is unchanged and still correctly used for
+  reuse-matching (a hire tied to one vehicle type must never be reused
+  for a job needing a different type). Applied identically in all four
+  duplicated blocks.
+- **Tested:** new `tests/test_supplier_hire_numbering.py` reproduces the
+  exact reported scenario (one supplier, two offerings of different
+  vehicle types, no in-house resources) against both `allocate()` and
+  `allocate_by_solver()` -- confirms distinct labels
+  ("NEW HEIGHTS HEAVY TRUCK" / "NEW HEIGHTS HEAVY TRUCK 1") post-fix, and
+  separately confirmed (via a throwaway patched copy of the pre-fix line,
+  not committed) that the OLD code genuinely reproduces the reported
+  collision on the same scenario -- proving the test would have caught
+  this regression. Full suite (12/12 files) re-run clean.
+- **Also fixed in the same report:** two small UI issues found while
+  investigating -- the Driver/Vehicle combo boxes showed the END of a
+  long name when narrow instead of the start (a `QLineEdit` cursor
+  defaults to the end after `setEditText`/`setCurrentIndex`; fixed by
+  resetting the cursor to position 0 and explicitly left-aligning after
+  every text-setting call in `plan_day_tab.py`'s `_make_editable_combo()`
+  and `_set_vehicle_cell_text()`).
+
+## Phase 30 — Free/testing AI provider for AI Review (Google Gemini) + AI Suggestions panel hidden until used (2026-08-15, same session)
+
+- **Requested:** try the AI Review flow (and iterate on its UI) without
+  spending on the Anthropic API. Claude Code (this assistant) and the
+  Anthropic API are separate, separately-billed products -- there was no
+  key already configured and no way for the assistant to generate one, so
+  the project owner asked for a free alternative provider instead,
+  explicitly for testing/cosmetic-iteration purposes, not as a production
+  replacement for Anthropic.
+- **Researched current (2026) free-tier LLM APIs** (web search, not
+  memory, since free-tier terms change often): Google Gemini's free tier
+  (no credit card, ~1,500 requests/day on the Flash model, via
+  aistudio.google.com) came out as the strongest genuinely-free option
+  versus alternatives like Groq (faster but a much tighter free quota --
+  30 req/min, 1,000/day). Picked Gemini on that basis.
+- **`app/ai_review.py`:** added `review_plan_gemini(api_key, context)`,
+  a new function alongside (not replacing) the existing `review_plan()` --
+  same `SYSTEM_PROMPT`, same input `context` shape, same
+  `{"suggestions": [...]}` output contract, same `AIReviewError` on
+  failure, just called against Gemini's free `gemini-flash-latest` model
+  (the `-latest` alias always resolves to Google's current Flash release,
+  so it doesn't need manual bumping -- acceptable here specifically
+  because this is a testing-only path, not the stability-sensitive
+  Anthropic one). Uses the new `google-genai` package (Google's current
+  recommended SDK, not the older `google-generativeai`), lazy-imported
+  the same way `ortools` is in `allocation_engine.py` so a missing
+  install doesn't break anything that doesn't use this path.
+- **`app/ui/settings_tab.py`:** new "Free/Testing AI Provider (optional)"
+  section, styled to match the existing API Keys section (same grey note
+  + `QFormLayout` row + Test button pattern), storing the key under a new
+  `gemini_test_api_key` setting. Explicitly noted in the UI: only used
+  when no Anthropic key is set; Anthropic is always preferred when both
+  are configured.
+- **`app/ui/plan_day_tab.py`'s `_on_ai_review()`:** now checks for either
+  key (error only if BOTH are missing), calls `review_plan()` if an
+  Anthropic key is set, else falls back to `review_plan_gemini()`. When
+  running on the Gemini fallback, an explicit amber note is shown above
+  the suggestions ("Using the free Google Gemini testing provider... Add
+  an Anthropic key in Settings for the real thing") so it's never
+  ambiguous which engine produced a given suggestion.
+- **AI Suggestions panel now starts hidden**, freeing a full section of
+  vertical row space for the results table by default -- reveals itself
+  (`self.suggestions_section.setVisible(True)`) the moment AI Review is
+  actually used. Implemented by wrapping the section's label + scroll
+  area in one `QWidget` (`self.suggestions_section`) instead of adding
+  them to the tab's main layout directly, so a single `setVisible()` call
+  shows/hides the whole thing as one unit with no layout gap left behind
+  when hidden (a hidden `QWidget` claims no space in a `QVBoxLayout`).
+- **Not done in this environment:** actually installing/testing against
+  the real `google-genai` package or a live Gemini key -- this sandbox
+  has no outbound network access for `pip install` (confirmed: both the
+  Bash and PowerShell tools failed identically on a real `pip install
+  google-genai` attempt). Code was verified by syntax-checking every
+  changed file, a clean full app launch (no exceptions -- `SettingsTab`
+  and `PlanDayTab` are both built eagerly at startup, so this exercises
+  the new UI construction), and the full existing test suite (12/12
+  files, unaffected since none of this touches the deterministic engine).
+  **The project owner still needs to run `pip install google-genai`,
+  paste a real free-tier key into Settings, and click AI Review once to
+  confirm the live Gemini call itself works end-to-end** -- not yet
+  verified against a real API response.
+- Architecture note: this does NOT touch the deterministic core engine in
+  any way (Rule 10) -- AI Review was already an optional, advisory-only
+  layer before this change, and remains exactly that with a second
+  possible backend.
+- **Confirmed working end-to-end the same day:** the project owner
+  installed `google-genai` (into the correct interpreter --
+  `C:\Users\HP\...\Python314\python.exe -m pip install google-genai`,
+  after an initial mismatch), the Settings "Test" button passed, and a
+  live AI Review call reached Gemini successfully (a transient `503
+  UNAVAILABLE` from Google's own free-tier load, not a bug -- confirmed
+  the error surfaced cleanly via the existing `AIReviewError` handling,
+  no crash).
+
+## Phase 30b — Cosmetic follow-ups: shorter day-notes box, compact AI Suggestion cards, warning text replaced with icons+tooltips (2026-08-15, same session)
+
+- **Day notes box** height reduced from 4 lines (`setMaximumHeight(80)`)
+  to 2 (`setMaximumHeight(48)`).
+- **AI Suggestion cards were only fitting ~1 at a time** in the scroll
+  area due to Qt's default layout margins/spacing (~9px margins, ~11px
+  spacing per card) eating most of the available height. Tightened
+  `_add_suggestion_widget()`'s `frame_layout` to `setContentsMargins(8, 5,
+  8, 5)` / `setSpacing(3)`, tightened the button row's own margins to
+  zero, gave `suggestions_container` (the list of cards) an explicit
+  `setSpacing(6)`, and increased `suggestions_scroll`'s `setMaximumHeight`
+  from 180 to 300 -- together these fit roughly 3 compact cards at once
+  instead of ~1.
+- **The two full-sentence warning labels** ("Using the free Google Gemini
+  testing provider..." and "(No Google Maps key set...)") were
+  permanently eating a full row each even when both applied. Replaced
+  with two small icons on the AI Suggestions header's far right,
+  hand-drawn via `QPainter` (new module-level `_draw_badge_icon()` and
+  `_draw_warning_triangle_icon()` helpers, same lightweight-icon pattern
+  already used elsewhere in this file for the Summary popup's driver/
+  supplier/trip icons -- generic colored-circle-plus-letter badges, not a
+  reproduction of any real company logo):
+  - A provider badge ("A" on a terracotta circle for Anthropic, "G" on a
+    blue circle for Gemini) showing which backend actually produced the
+    current suggestions, with a plain-text tooltip on hover.
+  - An amber warning triangle, shown only when at least one caveat
+    applies (no Maps key and/or the free Gemini fallback was used) --
+    hovering it shows both applicable messages combined in one tooltip;
+    moving the mouse away hides it, standard `QToolTip` behavior, no
+    extra code needed for that part.
+- **Tested:** full existing suite (12/12 files) re-run clean (none of
+  this touches engine logic); app launched cleanly with no exceptions
+  (both `SettingsTab` and `PlanDayTab` build eagerly at startup). The
+  actual on-screen card density/icon hover behavior still needs a visual
+  confirmation pass by the project owner, same visual-testing limitation
+  noted in earlier phases this session (this sandbox can't screenshot a
+  native Windows Qt window).
+
+## Phase 30c — AI Review: automatic retry on transient failure + moved to a background thread + matching "Reviewing..." lock/animation (2026-08-15, same session)
+
+- **Requested:** after the real 503 UNAVAILABLE Gemini error surfaced
+  cleanly (Phase 30's own confirmation), the project owner asked for
+  three related things: (1) the same locked-button + indeterminate
+  progress-bar treatment Run Planning already has, now also for AI
+  Review ("Reviewing..."); (2) automatic retry on a transient failure
+  instead of the planner having to notice and click again; (3) move the
+  call to a background thread if reasonable, since "it gets stuck
+  sometimes" -- a direct symptom of a blocking network call running on
+  the Qt main thread, the exact problem `_SolverWorker` (Phase 14) was
+  originally built to solve for Run Planning.
+- **`app/ai_review.py`:** new `_call_with_retry()` / `_is_transient_error()`
+  helpers, shared by both `review_plan()` (Anthropic) and
+  `review_plan_gemini()` (Gemini) -- wraps just the actual API call.
+  Retries up to `_MAX_ATTEMPTS = 3` total attempts, `_RETRY_DELAY_SECONDS
+  = 3` apart, but ONLY when the failure looks transient (a substring
+  match against `"503"`, `"overloaded"`, `"unavailable"`, `"rate
+  limit"`/`"429"`, `"timeout"`, `"temporarily"`, `"connection"` in the
+  exception text -- matches the real error shown in the project owner's
+  screenshot). A non-transient failure (bad key, invalid request) is
+  raised immediately on the first attempt -- retrying those would only
+  delay showing a real, actionable error for no benefit.
+- **`app/ui/plan_day_tab.py`:** new `_AIReviewWorker(QObject)`, the same
+  `QThread` pattern as `_SolverWorker` (`finished`/`failed` signals,
+  `moveToThread`, cleanup via `quit`/`deleteLater`) -- runs ONLY the
+  actual `review_plan()`/`review_plan_gemini()` call on the background
+  thread. The travel-time lookups that happen before it (`_on_ai_review`)
+  deliberately stay synchronous on the main thread: they call
+  `db.resolve_location(self.conn, ...)`, and a `sqlite3` connection
+  cannot safely be used from a different thread than it was created on --
+  moving those too would have introduced a real crash risk for no benefit,
+  since the AI API call (now potentially 3 attempts, several seconds
+  apart) is by far the dominant source of the reported "gets stuck"
+  symptom.
+- **UI lock, matching Run Planning's existing pattern exactly:**
+  `ai_review_btn` disabled and relabeled "Reviewing..." (restored via new
+  `_reset_ai_review_controls()`, mirroring `_reset_run_controls()`),
+  `run_btn`/`upload_btn` also disabled for the duration (prevents a
+  concurrent Run Planning or a new file upload from mutating `self.jobs`
+  while the review is reading it), and the same `self.run_progress`
+  indeterminate bar reused (not a second bar -- the two operations can
+  never run concurrently, since starting one disables the other's
+  trigger). `_on_ai_review_finished()`/`_on_ai_review_failed()` split out
+  of the old single `_on_ai_review()` body to run as the worker's
+  `finished`/`failed` slots, reading back the anthropic-key/maps-warning
+  state stashed on `self._pending_ai_review_state` (same
+  stash-across-the-async-call pattern as `self._pending_drivers`).
+- **Tested:** retry logic verified directly (transient error retried
+  twice then succeeds; non-transient error fails immediately with zero
+  retries/zero sleep; a persistently-transient error exhausts all 3
+  attempts and raises the last error) with `time.sleep` monkeypatched out
+  so the check runs instantly. Full existing suite (12/12 files)
+  re-run clean (no engine changes). App launched cleanly, no exceptions.
+  **Not verified in this environment:** the actual on-screen "Reviewing..."
+  lock/progress-bar behavior and a live retry-in-action against a real
+  flaky API response -- needs a manual pass by the project owner (same
+  screenshot-limitation as every other UI change this session).
+
+## Phase 30d — Gemini AFC console warning silenced; results table default column widths/alignment, narrower filters, Excel-style Wrap Text toggle (2026-08-15, same session)
+
+- **Console warning fixed:** `google-genai` printed "Direct use of
+  automatic function calling (AFC) in Models.generate_content is not
+  recommended..." on every call. Harmless (this integration never passes
+  `tools=`, so AFC never actually applies) but noisy. Fixed by explicitly
+  setting `automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)`
+  in `review_plan_gemini()`'s `GenerateContentConfig`, declaring the
+  already-true state explicitly instead of leaving it ambiguous.
+- **Default column widths fixed per launch**, from a real screenshot of
+  the live app (approximated, not measured pixel-exact -- the project
+  owner explicitly said to work from the screenshot): new
+  `_DEFAULT_COLUMN_WIDTHS` dict, applied via `header.resizeSection()` in
+  `_build_ui()` for every column (visible and hidden -- Qt preserves a
+  hidden column's configured width for when it's unhidden later, verified
+  directly). Previously the table fell back to Qt's auto-size-from-
+  header-text default, which didn't match the content-driven proportions
+  wanted.
+- **SR, Time, Pick Up, and Order Location columns now center their text**
+  (new `_CENTERED_COLUMNS` set, applied in `_populate_row()` via
+  `item.setTextAlignment(Qt.AlignCenter)`) -- Event and the rest stay
+  left-aligned as before.
+- **Filter combos narrowed**: `filter_combo`/`event_filter_combo` capped
+  at `setMaximumWidth(220)` (previously `stretch=1`, filling all
+  available row width) -- freed the room requested for the new button
+  below, with `filter_row.addStretch(1)` before it so the buttons stay
+  pinned to the far right regardless of window width.
+- **New Excel-style "Wrap Text" toggle button**, placed next to the
+  existing "Columns" button. Hand-drawn icon (new module-level
+  `_draw_wrap_text_icon()`, three horizontal bars -- same lightweight
+  `QPainter` icon pattern as this session's other small icons), a
+  checkable `QPushButton` so its own pressed/checked state shows
+  active/inactive (matching Excel's own toggle-button convention, no
+  separate on/off icon needed). `_on_wrap_text_toggled()`: calls
+  `self.table.setWordWrap(checked)` then either `resizeRowsToContents()`
+  (on) or resets every row to the table's original
+  `verticalHeader().defaultSectionSize()` (off, captured once at build
+  time as `self._default_row_height`). `self._wrap_text_enabled` is
+  re-checked at the end of both `_render_results()` and
+  `_rebind_row_widgets()` so newly (re)built/re-sorted rows pick up
+  whichever wrap state is currently active, not just the rows that
+  existed when the button was clicked.
+- **Tested:** new headless-Qt scratch script (`QT_QPA_PLATFORM=offscreen`,
+  same technique as Phase 29c's sort-fix verification) confirmed: default
+  widths applied correctly for both visible and hidden columns; SR/Time/
+  Pickup/Order Location centered while Event stays left-aligned; filter
+  combo widths capped; wrapping a row with genuinely-overflowing text
+  makes it measurably taller than a short-text row (37px vs 25px in this
+  environment), and un-wrapping restores every row to the exact original
+  uniform height; wrap state survives a `_render_results()` re-render.
+  **One real finding from writing this test, NOT a product bug:** a bare
+  `QTableWidget` with `setSortingEnabled(True)` defaults its sort
+  indicator to column 0/descending under the `offscreen` Qt platform
+  plugin (confirmed with a minimal reproduction outside this project's
+  own code entirely) -- but the project owner's own screenshots show the
+  real Windows app does NOT auto-sort on render (raw solver order is
+  preserved), meaning this default is platform/style-dependent and
+  specific to the headless test environment, not something present in
+  the actual app. The verification script was fixed to look up rows by
+  SR value instead of assuming insertion-order position, rather than
+  changing any product code for what turned out to be a test-environment
+  artifact. Full existing suite (12/12 files) re-run clean; app launched
+  cleanly, no exceptions.
+
+## Phase 30e — First "Not Responding" freeze investigated (root-caused, not fixed yet); column widths shrunk further with SR/Time protected; wrap-text icon made visible (2026-08-15, same session)
+
+- **"Not Responding" during Run Planning, investigated per the project
+  owner's request ("investigate if its from recent edit").** Root cause
+  confirmed via `git blame`: `allocate_by_solver()`'s
+  `solver.parameters.num_search_workers = 8` (commit `9718713`,
+  2026-08-10 -- predates this entire session) uses all 8 logical threads
+  on the project owner's 4-core/8-thread machine for the CP-SAT solve,
+  starving the GUI thread of CPU time to keep processing Windows
+  messages. This is thread/CPU contention, not a deadlock or a
+  main-thread-blocking bug -- `_SolverWorker`'s background threading
+  (Phase 26) is working exactly as designed; the solver thread itself is
+  just too CPU-hungry for this specific machine's core count. **Confirmed
+  unrelated to today's UI changes.** Fix identified (drop
+  `num_search_workers` to 6, leaving 2 threads free) but **explicitly not
+  applied** -- the project owner asked to document this and only act on
+  it if the freeze recurs, rather than retuning solver parallelism off a
+  single occurrence. See `NEXT_SESSION.md` Section 5 for the same note,
+  kept in sync.
+- **SR and Time columns' default width is now computed from real font
+  metrics** (`self.table.fontMetrics().horizontalAdvance(...)`) instead
+  of a fixed guess -- `"999"` for SR, `"23:59 - 23:59"` for Time (the
+  fixed shape every real time-range value takes), plus a small padding
+  margin. This guarantees their text is never clipped regardless of
+  font/DPI, per the project owner's explicit requirement that SR/Time
+  must always stay fully visible even as other columns shrink.
+- **Event, Vehicle Type Required, and Pick Up narrowed further**
+  (330->220, 190->140, 250->160 in `_DEFAULT_COLUMN_WIDTHS`) -- truncation
+  is explicitly acceptable for these per the project owner ("no
+  problem"), freeing more width for Driver/Supplier, Vehicle/Unit, and
+  Note.
+- **Wrap Text icon was invisible** -- the original muted grey
+  (`#d8dde5`) at 1.8px read as essentially blank against this app's dark
+  button chrome. Brightened to near-white (`#f2f4f8`) at 2.4px, pixmap
+  size bumped 18->20, and `setIconSize(QSize(20, 20))` added explicitly
+  (previously relied on the button's default icon size, which may have
+  rendered it even smaller than intended).
+- **Tested:** headless-Qt scratch script extended -- confirmed SR/Time's
+  computed widths exceed their measured worst-case text width (both
+  checked directly against `QFontMetrics`, not assumed), and confirmed
+  the wrap-text icon is actually set and contains real (non-transparent)
+  pixels, not a blank pixmap. Full existing suite (12/12 files) re-run
+  clean (no engine changes -- `num_search_workers` was deliberately left
+  untouched); app launched cleanly, no exceptions.
+
+## Phase 31 — Schedules tab: view/edit already-finalized days to match what actually happened (2026-08-16)
+
+- **Request #4 (Section 7.4 of `NEXT_SESSION.md`)**, the last of the
+  original four-item batch, previously left deliberately least-specified.
+  Real workflow, described directly by the project owner before any
+  design work started: the planner finalizes a day the day before; a
+  supervisor executes it and makes real-world adjustments (a driver
+  worked longer than assigned, a driver/vehicle/supplier got swapped, an
+  unplanned trip happened anyway, or a planned one never did); the
+  planner needs to correct the saved record afterward to match reality,
+  in the same visual format they already work in, editing only what
+  changed.
+- **Investigated `finalized_jobs` directly before designing anything**
+  (not assumed): today it stores only outcome fields (IDs, times, hours)
+  with zero descriptive context and no readable driver name/vehicle
+  plate (only IDs), and `save_finalized_jobs` deletes/reinserts an entire
+  day per Finalize (no stable per-row identity beyond autoincrement
+  `id`). Confirmed editing it needs no downstream retrigger -- every
+  hours/overtime/fairness reader queries it fresh every call.
+- **Schema, additive** (`app/db.py`): 6 new `finalized_jobs` columns --
+  `event_text`, `pickup_location`, `vehicle_type_required`, `driver_name`,
+  `vehicle_plate` (context snapshots, captured once at Finalize time
+  straight off the already-populated `Job` object, no extra query) and
+  `cancelled INTEGER NOT NULL DEFAULT 0` (soft "didn't happen" flag,
+  matching this project's existing exclude-don't-delete convention
+  instead of a hard row delete) -- plus `idx_finalized_jobs_plan_date`,
+  a near-zero-cost index keeping the new date-range query fast regardless
+  of how many years of history accumulate.
+- **Real migration-ordering bug found and fixed while adding this:**
+  `_run_migrations()`'s `ALTER TABLE` loop ran BEFORE the `executescript`
+  that creates `finalized_jobs` (and `supplier_offerings`/
+  `service_records`) via `CREATE TABLE IF NOT EXISTS`. Every `_MIGRATIONS`
+  entry until now only targeted `drivers`/`suppliers`/`vehicles` (created
+  even earlier, in the top-level `_SCHEMA` run by `init_db()` before
+  `_run_migrations` is ever called), so this never surfaced -- but adding
+  `_MIGRATIONS` entries for `finalized_jobs` would have broken
+  fresh-database initialization entirely (`ALTER TABLE finalized_jobs ADD
+  COLUMN ...` raising "no such table", not "duplicate column name", so
+  not swallowed by the existing safety check). Fixed by reordering
+  `_run_migrations()` so its own `executescript` runs first. Verified
+  three ways before trusting it: a from-scratch in-memory DB gets every
+  new column; a simulated pre-migration existing DB (base schema +
+  old-shape `finalized_jobs` with a real row already in it) gets migrated
+  with the existing row intact; and a real *copy* of the project's own
+  `fleetplanner.db` (never the live file directly) migrates cleanly with
+  its row count unchanged (0, before and after -- matches the
+  already-documented fact that no day has ever been finalized yet in the
+  real data).
+- **On database growth, asked directly by the project owner, answered
+  honestly:** negligible. `finalized_jobs` already gains ~40-80 rows every
+  day regardless of this feature; the new columns only widen each row by
+  a few hundred bytes, on the order of 5-10MB/year at that existing
+  growth rate -- not meaningful for SQLite. "+Add Row" adds at most a
+  handful of extra rows/day. Not a real problem "in a few years," let
+  alone sooner.
+- **`db.py`: three new functions**, explicit named parameters matching
+  this file's existing convention (e.g. `add_service_record`/
+  `update_service_record`) rather than an arbitrary `**kwargs` dict --
+  `list_finalized_jobs(conn, date_from, date_to)`,
+  `insert_finalized_job(conn, plan_date, **named fields)`, and
+  `update_finalized_job(conn, row_id, **named fields, all defaulting to
+  a private _UNSET sentinel)` -- the sentinel distinguishes "this column
+  wasn't mentioned, leave it alone" from "explicitly set it to `None`"
+  (clearing an assignment back to unassigned is a real, intended case).
+  `update_finalized_job` only ever touches the exact columns passed in --
+  never a whole-day rewrite like `save_finalized_jobs`.
+- **Cancelled rows excluded from every existing hours/overtime/fairness
+  reader** -- the one behavior change to previously-tuned logic in this
+  feature, called out explicitly: `get_driver_month_to_date_hours`,
+  `_driver_month_daily_span_hours` (feeds both
+  `get_driver_month_overtime_hours` and `get_driver_month_span_hours`),
+  and `get_supplier_cumulative_hours` each gained a `WHERE ... AND
+  (cancelled IS NULL OR cancelled = 0)` clause.
+- **`plan_day_tab.py`'s `_on_finalize`** now populates the 5 new context
+  fields when building `job_rows`, straight from already-available `Job`
+  attributes (`event_text`, `pickup_location`, `vehicle_type_required`,
+  `assigned_driver_name`, `assigned_vehicle_plate`) -- zero new queries.
+- **New `app/ui/schedules_tab.py`**, wired into `main_window.py` as the
+  "Schedules" tab (the project owner's own chosen name), positioned
+  before Settings. Structured like `plan_day_tab.py`/
+  `vehicle_maintenance_dialog.py`, reusing their proven pieces (small
+  local duplicates, matching this project's established preference over
+  new cross-file coupling): `_NoScrollComboBox`, `_NumericTableWidgetItem`
+  for numeric SR sort, the driver/vehicle/supplier reassignment-combo
+  pattern (unfiltered by excluded-from-planning, same as Plan a Day), and
+  the Vehicle Maintenance Log's "Continuous Forms" auto-save-on-edit
+  pattern.
+  - From/Till date range load, **every column editable** (revised from an
+    earlier narrower draft after the project owner's explicit
+    correction -- not just assignment/time fields: SR, Date, Actual
+    Start/End, Hours, Event, Vehicle Type Required, Pick Up are all
+    editable text cells too, Driver/Supplier and Vehicle/Unit stay combo
+    boxes).
+  - Excel-style per-column filter (click a header -> checklist of that
+    column's current distinct values, `Select All`/`Clear All`, plus
+    `Sort Ascending`/`Sort Descending` in the same menu) -- built as a
+    `QMenu` off `header.sectionClicked`, deliberately NOT using Qt's
+    built-in click-to-sort (`setSortingEnabled`), since a single header
+    click can't unambiguously mean both "sort" and "open the filter" at
+    once; manual `sortItems()` + a `_rebind_row_widgets()` pass afterward
+    (cell widgets don't follow a manual sort automatically, the same Qt
+    limitation documented in Phase 29c) keeps driver/vehicle combos
+    correctly paired with their row's actual SR after sorting.
+  - **Every edit to an already-saved row asks a specific confirmation**
+    ("Change {field} for SR {sr} ({event}) from '{old}' to '{new}'?")
+    before writing -- `Cancel` reverts the widget to its prior value
+    (combo/checkbox/text, each via the appropriate Qt revert mechanism),
+    `Yes` saves immediately via `db.update_finalized_job`. Actual
+    Start/End edits recompute Hours automatically as part of the SAME
+    save (no separate confirmation for the derived value) but Hours stays
+    independently hand-editable afterward (e.g. to account for an unpaid
+    break).
+  - **"+ Add Row" stays a local draft** (its own Save/Discard buttons, no
+    database interaction at all) until explicitly saved -- resolves the
+    project owner's own follow-up question ("what if he adds a row and
+    changes his mind") with zero cost to changing your mind, and avoids
+    an awkward half-confirmed state where the first field typed into a
+    brand-new row would otherwise immediately trigger a real INSERT
+    followed by a confirmation prompt on the very next field of the same
+    still-being-drafted row.
+  - Two real Qt bugs found and fixed while building this, both caught by
+    the headless verification script before being reported as done (not
+    after): (1) `QTableWidgetItem.setData()` on ANY role -- background
+    color included, not just text -- re-emits `itemChanged` in Qt (the
+    same gotcha already documented in
+    `vehicle_maintenance_dialog.py`'s `_save_service_row`), so the
+    Cancelled-row tinting helper was spuriously triggering the save path
+    for every other column in that row; fixed by having the tint helper
+    suppress-and-restore (not blindly set/reset) the save-guard flag,
+    since it also runs from inside an already-suppressed row-population
+    loop and a blind reset would have turned suppression off mid-loop.
+    (2) `update_finalized_job` was missing a `plan_date` parameter
+    entirely -- editing the Date column would have raised
+    `TypeError` on every attempt; added.
+- **Tested:** new `tests/test_finalized_jobs_db.py` (pure `sqlite3`, no
+  Qt, 10 checks -- insert/update/list round-trip, explicit-`None`-clears-
+  a-field, no-fields-is-a-safe-no-op, date-range filtering, and the
+  cancelled-exclusion behavior across all four affected reader functions,
+  confirming an otherwise-identical non-cancelled row is unaffected).
+  Full existing suite re-run clean (13/13 files). A headless-Qt scratch
+  script (`QT_QPA_PLATFORM=offscreen`, `QMessageBox.question` monkey-
+  patched to answer deterministically since it's normally modal)
+  exercised the actual UI end-to-end against a real in-memory database:
+  confirmed driver reassignment persists, cancelled reassignment reverts
+  the widget AND leaves the database untouched, the Cancelled checkbox
+  saves and correctly excludes the row from `get_driver_month_to_date_hours`,
+  an Actual Start edit recomputes and persists Hours together with
+  start_dt/end_dt, Add Row causes zero database writes until Save,
+  Discard causes zero database writes ever, and separately that sort +
+  rebind keeps SR/driver correctly paired (numeric order) and per-column
+  filtering correctly hides/restores non-matching rows. App launched
+  cleanly against a real copy of `fleetplanner.db`, no exceptions --
+  including a check that a normal (non-copy) launch during this session
+  applied the migration to the real database file cleanly (0 rows before
+  and after, matching the documented fact that no day has ever actually
+  been finalized in this project's real data yet).
+- **Not built, explicitly out of scope for v1** (confirmed with the
+  project owner): dual planned-vs-actual audit columns (corrections
+  overwrite in place); hard delete of an already-saved row (the
+  Cancelled checkbox covers this); a general multi-table raw database
+  editor (deliberately scoped to `finalized_jobs` only, matching this
+  section's own original caution against that being "a very different,
+  much riskier thing").
+
+## Phase 31b — Real gap caught same day: Order#/Contact Person/Order Location/Additional Info/Charge Code/Same Driver were never captured either (2026-08-16)
+
+- **Reported directly:** "these fields are not being saved in database..
+  it should be for complete reference of past." Phase 31's first pass at
+  context snapshots covered `event_text`/`pickup_location`/
+  `vehicle_type_required`/`driver_name`/`vehicle_plate` but missed
+  `order_no`, `contact_person`, `order_location`, `additional_info`,
+  `charge_code`, and `same_driver_key` -- despite these being the exact
+  same already-populated `Job` fields already shown as optional Plan a
+  Day columns (Phase 29). A genuine oversight in the first pass, not a
+  design change.
+- **Schema, additive** (`app/db.py`): 6 more `finalized_jobs` columns --
+  `order_no`, `contact_person`, `order_location`, `additional_info`,
+  `charge_code`, `same_driver_key` (all TEXT, nullable) -- same
+  `_MIGRATIONS` + `CREATE TABLE IF NOT EXISTS` dual-path pattern as
+  Phase 31's first batch, verified clean the same way (fresh DB, a
+  simulated pre-migration existing DB, and a copy of the real
+  `fleetplanner.db`).
+- `save_finalized_jobs`, `insert_finalized_job`, and `update_finalized_job`
+  all extended with these 6 named parameters, matching the existing
+  explicit-named-parameter convention (not `**kwargs`).
+- `plan_day_tab.py`'s `_on_finalize` now also populates these 6 from the
+  already-available `Job` object (`j.order_no`, `j.contact_person`,
+  `j.order_location`, `j.additional_info`, `j.charge_code`,
+  `j.same_driver_key`) -- zero new queries, same as the first batch.
+- **Schedules tab column order reworked to match the real Excel file's
+  left-to-right header order** (`excel_import.py`'s `_HEADER_MAP`: SR# ->
+  Order -> Start Date -> Time -> Pick Up Location -> Contact Person ->
+  Order Location -> Event -> Vehicle Type -> Additional Info -> Vehicle ->
+  Driver -> Same Driver -> Charge Code), per the project owner's explicit
+  request ("place them in same order as excel file as the eyes are used
+  to that order") -- rather than just appending the 6 new columns at the
+  end. Cancelled/Date/Actual Start/Actual End/Hours are the deliberate
+  exceptions (Schedules-tab-specific correction/tracking fields with no
+  single Excel-column equivalent), kept at the front near SR.
+- **New "Columns ▾" button** (same `QMenu`-of-checkable-actions pattern as
+  Plan a Day's), with the same 6 columns (Order#, Contact Person, Order
+  Location, Additional Info, Same Driver, Charge Code) hidden by default,
+  matching Plan a Day's own precedent exactly -- now an 18-column table.
+- **Tested:** re-ran the full existing headless-Qt Schedules-tab
+  verification script (still all passing after the column renumbering --
+  a good sign nothing was hardcoded to old positions) plus a new
+  dedicated check: all 6 new fields display correctly on load, the 6
+  columns are hidden by default, and editing one (Contact Person) through
+  the normal confirm-and-save path persists to the database correctly.
+  Full existing suite re-run clean (13/13 files). App launched cleanly
+  against the real database, no exceptions.
+
+## Phase 31c — Schedules tab: DD-MM-YYYY date display + From/Till default to today (2026-08-16)
+
+- **Requested:** From/Till and the Date column were showing/accepting
+  ISO (`YYYY-MM-DD`), inconsistent with this project's established
+  planner-facing date convention (`vehicle_maintenance_dialog.py`'s
+  service history grid already displays/accepts `DD-MM-YYYY`, storing
+  ISO underneath) -- and both should default to today's date on open
+  instead of starting blank.
+- **Storage stays ISO** (`finalized_jobs.plan_date`/`start_dt`/`end_dt`
+  are untouched, still `YYYY-MM-DD`/ISO datetime) -- only the *display and
+  input* format changed, matching the same
+  parse-display/format-for-storage split the Maintenance Log already
+  uses. New helpers in `schedules_tab.py`: `_parse_display_date`
+  (`DD-MM-YYYY` -> `date`), `_iso_to_display`, `_display_to_iso` -- same
+  naming/shape as the Maintenance Log's `_parse_display_date`/
+  `_iso_to_display`/`_display_to_iso`, not shared code (small enough to
+  duplicate locally, matching this session's established preference).
+  `_combine_date_time()` (used by both Date/Start/End edits and Add Row)
+  now parses its date argument as `DD-MM-YYYY` instead of ISO.
+- **From/Till default to today's date** (`date.today().strftime("%d-%m-%Y")`)
+  on tab open, instead of blank placeholders -- immediately loads today's
+  records with one click of Load rather than requiring typing first.
+- Every read/write path that touches `plan_date` was updated together
+  (missing even one would have silently written the wrong format or
+  crashed): `_insert_row` (ISO -> display when populating the Date cell),
+  `_on_load` (display -> ISO before querying `db.list_finalized_jobs`),
+  `_save_datetime_field`/`_on_item_changed`'s Date-column path (display ->
+  ISO before `db.update_finalized_job`, and ISO -> display for the
+  confirm-dialog's old-value text), `_collect_row_fields`/
+  `_on_save_draft_row` (display -> ISO before `db.insert_finalized_job`,
+  keeping the in-memory row state ISO-internal like every other row).
+- **Tested:** re-ran the full existing Schedules-tab verification script
+  unchanged except feeding `DD-MM-YYYY` input where the script used to
+  pass ISO -- still all passing. New dedicated checks: From/Till actually
+  default to today in `DD-MM-YYYY`; a `DD-MM-YYYY` range load finds the
+  right rows and displays the Date column in `DD-MM-YYYY`; editing the
+  Date cell in `DD-MM-YYYY` correctly saves `plan_date`/`start_dt`/`end_dt`
+  as ISO in the database; typing the old ISO format into From/Till is
+  rejected cleanly (a message, not a crash). Full existing suite re-run
+  clean (13/13 files). App launched cleanly, no exceptions.
+
+## Phase 31d — From/Till centered; per-column filter dropdown gets a search box to stay usable at high cardinality (2026-08-16)
+
+- **From/Till centered**: `setAlignment(Qt.AlignCenter)` on both.
+- **Raised directly by the project owner, unprompted:** does the
+  per-column filter dropdown deduplicate, and will a high-cardinality
+  column (Date over a year of history is the obvious one, but Event/
+  Driver/Supplier have the same shape of problem) turn into an
+  impractical scroll-forever checklist? Answered honestly: deduplication
+  was already correct (`values = set()`), but the cardinality concern was
+  real -- confirmed, not dismissed.
+- **Fix: a live search box inside the filter dropdown**, the same
+  industry-standard pattern Excel/Google Sheets/Tableau/Airtable/Jira all
+  use for exactly this problem -- type a few characters to narrow the
+  checklist instead of scrolling it, rather than something invented for
+  this project. Implemented via `QWidgetAction` (the standard Qt
+  mechanism for embedding a live-typing widget inside a `QMenu` without
+  it auto-closing on keystrokes, which a plain `QAction` would do) holding
+  a `QLineEdit`; its `textChanged` toggles each value's `QAction.setVisible()`.
+  Helps every filterable column, not just Date.
+- **Refactored `_on_header_clicked()`** to separate menu construction
+  (`_build_filter_menu()`, new) from the blocking `.exec()` call/result
+  dispatch -- not just a style preference: `QMenu.exec()` is a real modal
+  call with no clean way to drive it from an automated test, so splitting
+  the builder out is what made the search-box behavior itself directly
+  testable. (A first attempt at testing this by monkeypatching
+  `QMenu.exec` at the class level silently failed to take effect and hung
+  the test process indefinitely under the offscreen Qt platform -- killed
+  and replaced with this cleaner split rather than fighting the
+  monkeypatch further.)
+- **Tested:** `_build_filter_menu()` called directly (no `.exec()`
+  involved at all) confirms the embedded search box exists, all distinct
+  values start visible, typing narrows to exactly the matching entries,
+  and clearing the search restores every value. Full existing suite
+  re-run clean (13/13 files); both existing Schedules-tab scratch
+  verification scripts re-run clean. App launched cleanly, no exceptions.
+
+## Phase 32 — Locations tab rebuilt as a 3-panel map + travel-time screen; second (free) maps provider (2026-08-16)
+
+- **Requested** with a maritime voyage-planning UI as visual reference:
+  keep the code/address editor, put a big interactive map in the middle,
+  and a right panel listing every trip's travel time, clicking one to draw
+  its route. Plus: "AI suggestions should also link to this."
+- **Two assumptions in the request were wrong, both found by reading the
+  code before designing anything, and reported back before building:**
+  1. **Locations were NOT wired into decision-making.**
+     `allocation_engine.py` (all four strategies including the
+     `allocate_by_solver` the UI actually uses) has *zero* references to
+     locations, travel time or coordinates; `DEFAULT_TRAVEL_BUFFER_MINUTES`
+     is a flat `0` with a standing comment flagging real drive-time
+     integration as a known future item. Only `_on_ai_review` used travel
+     time, and only for consecutive pairs *within multi-stage event
+     chains* -- roughly 10-30 lookups, not all 81 trips.
+  2. **No coordinates existed anywhere.** The `locations` table was
+     `short_code, full_address, created_at, updated_at` only -- the
+     "codes and coordinates" in the request was really "codes and address
+     text". Coordinates had to be added, and are what made pins possible.
+- **Cost drove the whole design** (a documented standing concern for this
+  project owner). Checked current pricing rather than guessing: Google
+  Routes is ~$5-10 per 1,000 calls with 5,000 free Pro events/month, so
+  81 trips x several re-runs/day would leave the free tier within weeks.
+  Answer: cache everything.
+  - New `db.geocode_cache` (query_text PK, COLLATE NOCASE -- addresses
+    don't move, so cached permanently; case/whitespace-insensitive so the
+    same place spelled differently isn't re-charged).
+  - New `db.travel_time_cache`, keyed `(origin, destination, hour_bucket)`.
+    The hour bucket preserves traffic-awareness (08:00 vs 23:00 really are
+    different durations) while collapsing every trip sharing a route in
+    that band into ONE call.
+  - `locations` gained `latitude`/`longitude`/`geocoded_at` -- held there
+    rather than only in the cache **on purpose**: planner-visible and
+    manually correctable, and a correction must survive a cache clear.
+  - Verified by test that a **second run of the same day makes ZERO API
+    calls**, which is the entire cost argument.
+- **Second maps provider, free** (project owner asked for the same
+  dual-provider treatment as Anthropic/Gemini). Researched current options
+  and presented the trade-off rather than picking silently;
+  **OpenRouteService** chosen: 2,500 req/day, 40k/month, no credit card
+  ever, one key covering both geocoding and routing. **Reported honestly
+  and repeated in the UI: ORS is NOT traffic-aware** (average OSM road
+  speeds), so a tight rush-hour connection looks more optimistic than it
+  is -- it's a genuine fallback, not an equal. `maps_client.py` now has
+  both backends behind `geocode()`/`travel_time()` dispatchers;
+  `MapTab._active_provider()` prefers Google when a key exists, else ORS;
+  the active provider is always labeled on screen with a tooltip
+  explaining the difference.
+- **`maps_client.py`** also gained `routes.polyline.encodedPolyline` to
+  Google's field mask (without it a route can only be drawn as a straight
+  line between two pins, implying a road that isn't there) and
+  `decode_polyline()` -- ~20 lines of pure Python, **no new dependency and
+  no JS plugin**, since decoding here means the web page just receives
+  plain points. Verified against Google's own published reference string.
+  The existing `get_travel_time` signature was left untouched so
+  `settings_tab.py`/`plan_day_tab.py` keep working unchanged.
+- **New `app/ui/map_tab.py`** -- `QSplitter` 3-panel layout:
+  - LEFT: the original locations editor, preserved in full, plus Lat/Lon
+    columns and a "Geocode Missing Locations" button.
+  - CENTER: Leaflet + **OpenStreetMap tiles (free, no key, no billing)**
+    in a `QWebEngineView` -- confirmed by import test that QtWebEngine
+    already ships with this PySide6 install, so **no new dependency**.
+    Python drives it one-way via `runJavaScript`; deliberately no
+    JS->Python channel (selection happens in the right-hand list), so
+    `QWebChannel` complexity isn't needed. The map is guarded by a
+    try/except -- if QtWebEngine were ever missing, travel times still
+    work and only the picture is lost.
+  - RIGHT: every trip's pickup->destination time, **plus** a per-driver
+    day-chain view. The chain view was proposed rather than requested:
+    the reference screenshot is a *voyage* (one vessel's sequential
+    itinerary), and the analogous high-value view here is one driver's
+    whole day -- **connections where drive time exceeds the actual gap are
+    flagged red (IMPOSSIBLE), amber under 15 min slack.** That is the real
+    decision tool; 81 routes drawn at once is just spaghetti (hence the
+    "One driver at a time" view mode).
+- **Nothing runs automatically** -- explicit project-owner requirement.
+  Opening the tab costs nothing; lookups happen only on "Run Locations".
+  Threading reuses the proven `_SolverWorker`/`_AIReviewWorker` pattern:
+  `_LookupWorker` gets plain pre-resolved data and returns results,
+  never touching `self.conn` (sqlite3 connections can't cross threads) --
+  all cache reads happen on the main thread before it starts, all writes
+  in the `finished` slot.
+- **AI Review linked in**: its lookups now read/write the SAME cache
+  (so the two features never pay twice for one route), and a new
+  `_build_driver_chain_gaps()` feeds per-driver connection feasibility
+  into `ai_review.build_review_context`. That helper reads **cached routes
+  only and never fetches**, so enabling it cost zero API calls -- it just
+  gets richer as the map screen fills the cache. `SYSTEM_PROMPT` gained a
+  matching instruction, including the explicit caution that an unlisted
+  connection is UNKNOWN, not verified-good.
+- **Two real issues found and fixed while testing, before reporting done:**
+  1. Stale `QThread`/worker references survived a completed run, so a
+     future `if self._thread.isRunning()` guard would have raised
+     "Internal C++ object already deleted". Now cleared in
+     `_reset_controls()` (safe -- the QThread is parented to the tab, so
+     Qt owns its lifetime).
+  2. A driver finishing and starting in the *same* place displayed `--`
+     ("unknown") when the truthful answer is a real **0 min / ok** --
+     `--` would wrongly make a perfectly fine back-to-back connection look
+     unverified. Costs no API call either, since same-place pairs are
+     skipped before any lookup.
+- **`locations_tab.py` marked LEGACY, not deleted** (Rule 26, same
+  precedent as `entity_rules_widget.py`) with a header pointing at
+  `map_tab.py`.
+- **Tested:** new `tests/test_travel_cache_db.py` (12 checks: cache
+  hit/miss, case-insensitivity, hour-bucket separation, direction
+  separation, overwrite-not-duplicate, clear-travel-but-keep-geocodes,
+  coordinate save + manual override) and `tests/test_polyline.py` (Google's
+  published reference string, empty/None, single point, valid ranges).
+  Full suite now **15/15 clean**. A headless-Qt script (9 checks) verified
+  the real UI end to end: zero lookups on open, first run fetches, **second
+  run makes zero API calls**, IMPOSSIBLE flagged red, same-place reads 0
+  min/ok, single-job driver has no connections, coordinates back-filled
+  onto location rows, and ORS fallback engages with no Google key.
+  Migration verified against a copy of the real `fleetplanner.db` and then
+  on a real launch -- all 11 existing locations preserved, no exceptions.
+- **Still needs a manual pass from the project owner** (not screenshot-able
+  from this environment): the actual map rendering, pin/route drawing, and
+  the three-panel proportions.
+- **Deliberately NOT done (Rule 10), confirmed with the project owner:**
+  real drive time does **not** feed the deterministic engine.
+  `allocation_engine.py` is untouched, `DEFAULT_TRAVEL_BUFFER_MINUTES`
+  stays `0`, and its standing "once live travel-time lookups are wired
+  in..." comment remains an open future item -- recorded so it isn't
+  later mistaken for done.
+
+## Phase 32b — Map switched from Leaflet/OSM raster to MapLibre + OpenFreeMap, labels forced to English (2026-08-16)
+
+- **Reported on first visual inspection** (before any API key was even
+  entered): the map rendered in **Arabic**, while every location in this
+  app is written in English. Cause: the standard OpenStreetMap raster tile
+  server renders each region's labels in its LOCAL language, and those
+  tiles have no language switch -- so this could not be fixed by a
+  parameter, only by changing tile source.
+- **Provider chosen on licensing, not looks.** Checked the obvious
+  alternatives first and ruled two out: **CARTO**'s hosted basemap tiles
+  are restricted to enterprise customers/non-profit grants (not free for a
+  commercial fleet business), and **Esri**'s are a commercial offering with
+  restrictive terms. **OpenFreeMap** was picked instead: genuinely free --
+  no API key, no usage limits, no registration, commercial use explicitly
+  permitted.
+- **Labels forced to English explicitly**, not left to chance. OpenFreeMap
+  serves vector tiles on the OpenMapTiles schema, so a `map.on('load')`
+  hook rewrites every label layer's `text-field` to
+  `['coalesce', ['get','name:en'], ['get','name:latin'], ['get','name']]`
+  -- English name first, Latin-script transliteration next, raw local name
+  only as a last resort (so a place with no English name still isn't left
+  in Arabic script). **Verified: all 23 label layers in the style were
+  rewritten.**
+- Vector tiles mean MapLibre GL JS replaces Leaflet. `_MAP_HTML` was
+  rewritten accordingly: routes are now a GeoJSON source + line layer,
+  pins are `maplibregl.Marker`s, and the lat/lon -> lon/lat flip MapLibre
+  requires is done in ONE place in the JS rather than scattered through
+  Python. The Python-facing `draw(points, lines, hint)` entry point is
+  unchanged, so `map_tab.py`'s Python side needed no edits at all.
+- **New robustness:** vector tiles need WebGL, which an embedded browser
+  can lack. `draw()` now queues any call arriving before the style
+  finishes loading (an early call would otherwise throw on the
+  not-yet-created `routes` source), and a WebGL/startup failure shows a
+  plain explanatory banner -- "travel times still work, only the map
+  picture is missing" -- instead of a silent blank rectangle.
+- **Tested in a REAL QWebEngineView** (not just headless), which is the
+  only way to get a genuine GL context: confirmed `webgl: true`,
+  MapLibre loaded, map constructed, **style fully loaded**, `draw()`
+  present, and no error banner. Also confirmed all 23 label layers carry
+  the English-first expression.
+- **One honest finding worth recording:** the JS console logs a handful of
+  `"Expected value to be of type number, but found null instead."`
+  warnings. These were **isolated to the upstream OpenFreeMap Liberty
+  style, not this change** -- a control page loading the same style with
+  the label rewrite REMOVED produces the identical warnings. Benign
+  (warnings, not errors; the style loads and renders fine), and left
+  alone rather than papered over.
+- Full suite re-run clean (15/15) and the 9-check Schedules/map headless
+  script still passes -- the Python side was untouched by this swap.
+
+## Phase 32c — HARD CRASH fixed (double free in the map tab's worker thread) + JS console noise silenced (2026-08-16)
+
+- **Reported:** "i was adding the coordinance and run the location button
+  after i updated all the coordinances and the whole software crashed and
+  closed." No Python traceback -- which is itself the clue: a Python
+  exception in a Qt slot prints and continues, so a silent process death
+  means a C++-level crash.
+- **Root cause -- a bug introduced in Phase 32, in code added the previous
+  day for a purely cosmetic reason.** `_LookupWorker` has NO Qt parent,
+  because `moveToThread()` requires a parentless object -- so **Python**
+  owns its lifetime. But `worker.finished` was connected to BOTH:
+  1. `_on_lookups_finished` -> `_reset_controls()`, which I had made set
+     `self._worker = None`, dropping the last Python reference and letting
+     Python destroy the C++ object; and
+  2. `worker.deleteLater`, which had Qt queue a SECOND delete of that same
+     object.
+  Double free -> segfault. That `self._worker = None` line existed only
+  because a verification script wanted a tidy "is it finished?" signal --
+  a test convenience that introduced a real crash into the product.
+  `plan_day_tab.py`'s `_SolverWorker`/`_AIReviewWorker` never null their
+  references, which is exactly why Run Planning and AI Review were never
+  affected.
+- **Fix:** stop nulling the references (they're now kept until the next
+  `_start_worker()` replaces them -- plan_day_tab's proven pattern), and
+  answer "is a run in flight?" with a plain `self._lookup_running` boolean
+  instead. Added a re-entrancy guard to `_start_worker()` too: starting a
+  second run while one is live would reassign `self._worker` mid-flight
+  and drop a running worker's last reference -- the same class of
+  double-free by another route. The buttons are disabled during a run so
+  it shouldn't be reachable, but it's cheap insurance.
+- **PROVEN, not assumed.** A stress script runs 25 full Geocode+Run cycles
+  with `gc.collect()` forced between each (forcing collection is what
+  actually triggers the Python-side destruction, and is why a double free
+  doesn't necessarily fault on cycle 1):
+  - With the bug deliberately re-introduced: **Segmentation fault, exit
+    code 139**, output lost mid-buffer -- reproducing the reported symptom
+    exactly.
+  - With the fix: 25 cycles, 575 simulated API calls, **exit code 0**,
+    references verified still intact, re-entrancy guard verified.
+- **JS console noise silenced.** The repeated `"Expected value to be of
+  type number, but found null instead."` lines were traced (Phase 32b) to
+  the upstream OpenFreeMap Liberty style, NOT this app's code -- confirmed
+  by loading the same style with all of our own JS removed and getting the
+  identical warnings. Rather than leave them spamming the terminal, the
+  map now uses a small `_QuietPage(QWebEnginePage)` that filters that ONE
+  known-benign message and passes everything else through, so a genuine
+  map error is never hidden. Real launch console is now completely empty.
+- Full suite re-run clean (15/15); the 9-check map-tab script and the
+  crash stress script both pass; real app launch produces zero console
+  output and no exceptions.
+
+## Phase 32d — Coordinates can be pasted directly (and the ones already entered are recovered automatically) (2026-08-16)
+
+- **Reported:** "i insert all the coodenance againt the code still its not
+  reading it... i just right clicked it from google maps?" -- plus a fair
+  question about what the Geocode button actually does.
+- **Investigated the real database rather than guessing.** All 13
+  locations had `latitude`/`longitude` NULL, and their `full_address`
+  fields contained coordinate pairs like
+  `"25.223732780272687, 55.28831280699118"`. So the coordinates were
+  perfectly valid (correct Google Maps format, correct for Dubai at
+  ~25.2N/55.3E) -- they had simply gone into the Address box, **because
+  the Lat/Lon columns were read-only and there was nowhere else to put
+  them.** A UI gap on this side, not a user error.
+- **Pasting coordinates is genuinely BETTER than geocoding**, so the fix
+  embraces it rather than redirecting people to the geocoder: it's exact
+  (the planner knows the precise gate; a geocoder only finds the general
+  area), and it costs zero API calls.
+- **Changes:**
+  - New `_parse_latlon()` -- recognizes exactly what Google Maps puts on
+    the clipboard, plus space/semicolon separated and padded variants.
+    Deliberately strict on ranges so a real address containing two numbers
+    ("Unit 12, 45 Sheikh Zayed Road") is never misread as coordinates.
+  - **`_backfill_coords_from_addresses()`, run on tab open:** any location
+    whose address field already holds a coordinate pair gets real
+    coordinates filled in. This recovered all 13 of the project owner's
+    existing locations with **no re-entry and no API calls** -- verified
+    against a copy of the real `fleetplanner.db` before touching the live
+    one, then confirmed on a real launch (13/13 filled). Never overwrites
+    coordinates that are already set, and is a no-op once everything has
+    them.
+  - **Lat/Lon columns are now editable.** Pasting the whole
+    `"25.223732, 55.288312"` string into EITHER cell fills both, since
+    that's how the value actually arrives. Out-of-range values are
+    rejected with a message that points at the Google Maps right-click
+    trick. Code/Address stay read-only in the grid (still edited via the
+    boxes below) so the columns don't become ambiguous.
+  - `_on_add_location()` also captures coordinates immediately if the
+    "address" typed in is a coordinate pair.
+  - `_resolve_point()` now falls back to reading the address as
+    coordinates, so even an un-backfilled row resolves without a lookup.
+  - Added a visible tip under the locations table explaining the
+    right-click-in-Google-Maps flow.
+- **Clarified what "Geocode Missing Locations" is for** (the question that
+  prompted this): it sends the *address text* of any location lacking
+  coordinates to Google/OpenRouteService and stores the coordinates it
+  gets back. It needs an API key and costs one call per location. It is
+  purely the automatic alternative to pasting coordinates yourself --
+  with coordinates already pasted, it has nothing to do.
+- **Tested:** new `tests/test_latlon_parse.py` (Google clipboard format at
+  full precision, separator/padding variants, negative hemispheres, and
+  the rejections that matter: real addresses, two-number addresses,
+  blanks, single values, three values, out-of-range). Full suite now
+  **16/16**. Map-tab (9 checks) and crash-stress (25 cycles) scripts both
+  still pass; real launch console clean.
+
+## Phase 32e — "Search Place" added, and a REAL DATA-QUALITY BUG found: automatic geocoding was resolving to the wrong continent (2026-08-16)
+
+- **Asked:** "there is a location (Dubai - COCA COLA ARENA) it is not
+  searching coca cola arena in dubai can we make it to search". Before
+  building anything, inspected what the automatic geocoding had actually
+  cached -- and found it was **badly, silently wrong**:
+
+  | Excel string | Resolved to | Actually |
+  |---|---|---|
+  | `ON SITE - COCA COLA ARENA` | 33.77, -84.39 | **Atlanta, USA** (Coca-Cola HQ) |
+  | `ON SITE - PALM JUMEIRAH` | 35.98, -78.53 | **North Carolina** |
+  | `Dubai - MENA PORT RASHID` | -25.36, -57.49 | **Paraguay** |
+  | `DWTC - FLEET OFFICE` | 44.66, -63.58 | **Halifax, Canada** |
+  | `CPK/LPK` | 52.69, 39.53 | **Russia** |
+
+  **13 of 22 cached coordinates were more than 500 km away** (several
+  >10,000 km), and 6 more shared one identical generic "Dubai" fallback
+  point rather than the real place. Every travel time and map pin derived
+  from those was meaningless -- and looked perfectly plausible on screen.
+- **Three compounding causes, all now addressed:**
+  1. **Noise prefixes.** `_clean_place_text()` strips `"ON SITE - "` /
+     `"ONSITE - "` and reorders `"Dubai - X"` into `"X, Dubai"`, which
+     geocoders parse far more reliably (the city prefix is real context,
+     so it's kept, not discarded).
+  2. **No geographic bias.** All lookups are now biased to the fleet's
+     real operating centre -- computed by averaging the coordinates of
+     the predefined locations themselves (`_operating_focus()`), so it is
+     **self-configuring and self-correcting** with zero setup -- AND hard
+     restricted to `OPERATING_COUNTRY = "AE"` at the project owner's
+     explicit request ("restrict it to united arab emirates not just
+     dubai"). Google gets `components=country:`, ORS gets
+     `boundary.country=`.
+  3. **No sanity check.** `maps_client.geocode()` now REJECTS a result
+     further than `MAX_GEOCODE_DISTANCE_KM` (500) from the operating
+     centre instead of caching it, with a message telling the planner to
+     use Search Place or paste coordinates. A wrong coordinate is far
+     worse than a missing one: it persists and poisons everything
+     downstream while looking fine.
+- **New "Search Place..." button + `_PlaceSearchDialog`** -- the actual
+  feature requested. Type a name, see the real candidates with their full
+  addresses AND their distance from the operating area (anything >500 km
+  shown in red), pick the right one, and it's saved against the code with
+  coordinates. For a name that genuinely exists in several countries
+  there is no algorithm that reliably picks correctly -- but a planner
+  glancing at "Coca-Cola Arena, City Walk, Dubai" vs "World of
+  Coca-Cola, Atlanta" gets it right instantly. The chosen result is also
+  cached under the ORIGINAL raw Excel string, so the same text resolves
+  free next time.
+- **Purged the poisoned caches** from the real database: 22 geocodes and
+  7 travel times (the latter were computed FROM the wrong coordinates, so
+  equally suspect). Verified before/after that the project owner's **own
+  19 hand-entered location coordinates were untouched** -- those are
+  authoritative and must survive any cache clear.
+- **New `db.clear_geocode_cache()`**, and the tab's "Clear Cache" button
+  now clears both caches (with the dialog stating plainly that the
+  planner's own coordinates are not affected), so this is self-service in
+  future rather than needing a script.
+- **Tested:** new `tests/test_geocode_quality.py` -- prefix cleanup,
+  city-prefix reordering, pass-through of plain names, blank handling,
+  and the distance guard measured against the REAL wrong answers
+  (12,199 / 11,665 / 13,332 km) versus real local ones (CPK 8 km, a
+  genuine Abu Dhabi job 111 km, comfortably inside the guard), plus a
+  haversine sanity check against London-Paris. Full suite now **17/17**.
+  Map-tab (9 checks) and crash-stress (25 cycles) scripts both re-run
+  clean after updating their fakes for the new `geocode()` signature.
+- **One honest caveat recorded in the code:** the hard `"AE"` country
+  restriction means a genuine cross-border job (Oman/Saudi are a
+  realistic day trip from Dubai) would fail to resolve. It's a single
+  named constant specifically so widening it stays a one-line change.
+
+## Phase 32f — Selecting a driver now draws their whole day, not just dots (2026-08-16)
+
+- **Reported:** "its only showing dots like deepaks 4 trips shows 4 dots
+  instead of location path as it shows in single location. is it maps
+  restriction or we can do something about it" -- not a maps restriction
+  at all, two real bugs of mine compounding:
+  1. **The driver view drew only the CONNECTIONS BETWEEN trips, never the
+     trips themselves.** Four trips have three connections, so the four
+     routes the driver actually drives were never drawn.
+  2. **Same-place connections have no route to draw.** When a driver
+     finishes at CPK and their next job also starts at CPK, the drive is
+     genuinely zero and `polyline` is `None` (that's the correct
+     same-place shortcut from Phase 32). With every connection
+     same-place -- which is the common real pattern -- there were zero
+     lines and nothing but disconnected dots. Exactly the report.
+- **`_draw_driver_day()` (new)** draws the day as a proper sequential
+  itinerary, the view the reference voyage screen is actually built
+  around:
+  * every TRIP the driver runs (pickup -> destination) as a solid blue
+    routed line -- the work itself, previously invisible;
+  * every REPOSITIONING leg between trips (deadhead) as a dashed amber
+    line, visually distinct so it's never confused with paid work;
+  * every stop **numbered in running order** (1..N) with a
+    "3. SR12 start — CPK" style label, so the day reads start to end.
+- **`_route_line()` (new)** also removes the last way to end up with bare
+  dots: when no polyline is available for a pair it falls back to a
+  straight line between the two points, drawn DASHED so it is never
+  mistaken for a real routed path. Same-place pairs still correctly draw
+  nothing.
+- **Map JS:** `line-dasharray` cannot be data-driven in MapLibre (it must
+  be a paint constant), so dashed lines are a SECOND layer filtered on a
+  `dashed` property rather than an expression on the existing one.
+  Markers grew a `seq` field rendering the number inside the dot.
+- **Tested** against the exact reported scenario -- a 4-trip driver whose
+  connections are all same-place: now **8 numbered stops and 4 solid trip
+  routes** (previously 0 routes). Separately verified a driver who
+  genuinely repositions (SR1 ends ZLC, SR2 starts PALM) gets 2 solid trip
+  lines + 1 dashed repositioning line; that an uncached pair falls back
+  to a dashed straight line rather than nothing; and that a same-place
+  pair still draws nothing. Confirmed in a REAL WebGL map that both line
+  layers initialise, the dashed flag routes features to the right layer,
+  and numbered markers place correctly. Full suite 17/17.
